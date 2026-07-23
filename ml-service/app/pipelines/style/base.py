@@ -21,6 +21,8 @@ class StyleOptions:
     grain: float = 0.7
     sharpness: float = 0.6
     margin: float = 1.8  # во сколько раз расширяем bbox лица под рабочий кроп
+    art_style: str = ""  # стиль обложки для промпта диффузии; classical игнорирует
+    intensity: float = 1.0  # множитель силы запроса, сохраняется для диффузии
 
     def scaled(self, factor: float) -> StyleOptions:
         """Общий множитель силы для одного запроса."""
@@ -31,17 +33,27 @@ class StyleOptions:
             grain=min(1.0, self.grain * factor),
             sharpness=min(1.0, self.sharpness * factor),
             margin=self.margin,
+            art_style=self.art_style,
+            intensity=factor,
         )
 
 
 class BaseStylizer:
     name = "base"
 
-    def stylize(self, image: Any, face: Any, options: StyleOptions) -> Any:
+    def stylize(
+        self,
+        image: Any,
+        face: Any,
+        options: StyleOptions,
+        identity_embedding: Any = None,
+    ) -> Any:
         """
         :param image: BGR-изображение целиком (после переноса лица)
         :param face: лицо insightface на этом изображении — bbox и лендмарки
         :param options: сила стадий
+        :param identity_embedding: ArcFace-эмбеддинг донора для диффузии;
+            classical его игнорирует, diffusion — использует для IP-Adapter FaceID
         :return: новое BGR-изображение того же размера
         """
         raise NotImplementedError(f"{self.name}: stylize() не реализован")

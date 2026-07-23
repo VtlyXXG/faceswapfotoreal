@@ -39,7 +39,14 @@ cd ml-service
 .\.venv\Scripts\python.exe -m bench
 .\.venv\Scripts\python.exe -m bench --strengths 0.6,1.0,1.4
 .\.venv\Scripts\python.exe -m bench --input bench/samples --out bench/out
+
+# Сравнить classical и diffusion бок о бок (нужны веса SD 1.5, медленно на CPU):
+.\.venv\Scripts\python.exe -m bench --diffusion --art-style "oil painting" --strengths 1.0
 ```
+
+Без `--diffusion` стенд гоняет только classical. С `--diffusion`, но без весов
+SD 1.5, диффузионные колонки молча пропускаются с предупреждением — стенд
+остаётся полезным.
 
 Результат:
 

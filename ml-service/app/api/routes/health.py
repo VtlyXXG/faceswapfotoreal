@@ -42,6 +42,10 @@ async def readiness(response: Response) -> ReadinessResponse:
         missing.append(f"нет весов детектора {state['detector']['name']}")
     if not state["swapper"]["available"]:
         missing.append(f"нет весов {state['swapper']['name']}")
+    # Стилизатор critical, только если оператор явно выбрал его и весов нет:
+    # classical/noop всегда available, поэтому это бьёт лишь diffusion без весов
+    if not state["stylizer"]["available"]:
+        missing.append(f"стилизатор {state['stylizer']['name']} без весов")
 
     ready = not missing
     response.status_code = 200 if ready else 503

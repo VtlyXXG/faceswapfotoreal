@@ -15,8 +15,9 @@ import numpy as np
 from app.config import settings
 from app.core.logging import get_logger
 from app.pipelines.face_swap import detector, swapper
-from app.pipelines.style.base import StyleOptions
+from app.pipelines.style.base import BaseStylizer, StyleOptions
 from app.pipelines.style.classical import ClassicalStylizer
+from app.pipelines.style.diffusion import DiffusionStylizer, weights_present
 from app.pipelines.style.masking import build_masks
 from app.pipelines.style.metrics import IDENTITY_THRESHOLD, identity_similarity, texture_distance
 from app.utils.image import decode_image
@@ -27,20 +28,33 @@ from bench.pairs import Pair, discover_pairs
 log = get_logger("bench")
 
 
-def default_variants(strengths: list[float]) -> list[Variant]:
+def default_variants(strengths: list[float], diffusion: bool = False) -> list[Variant]:
     variants = [Variant(name="plain", enhance=False)]
     for strength in strengths:
-        variants.append(Variant(name=f"s{strength:g}", enhance=True, strength=strength))
+        variants.append(
+            Variant(name=f"c{strength:g}", enhance=True, strength=strength, provider="classical")
+        )
+    if diffusion:
+        for strength in strengths:
+            variants.append(
+                Variant(
+                    name=f"d{strength:g}",
+                    enhance=True,
+                    strength=strength,
+                    provider="diffusion",
+                )
+            )
     return variants
 
 
-def _style_options() -> StyleOptions:
+def _style_options(art_style: str = "") -> StyleOptions:
     return StyleOptions(
         color=settings.style_color,
         smooth=settings.style_smooth,
         grain=settings.style_grain,
         sharpness=settings.style_sharpness,
         margin=settings.style_margin,
+        art_style=art_style,
     )
 
 
@@ -68,7 +82,12 @@ def _measure(
     return identity, texture, to_data_uri(crop), note
 
 
-def run_pair(pair: Pair, variants: list[Variant], stylizer: ClassicalStylizer) -> PairResult | None:
+def run_pair(
+    pair: Pair,
+    variants: list[Variant],
+    stylizers: dict[str, BaseStylizer],
+    art_style: str = "",
+) -> PairResult | None:
     source_image = decode_image(pair.source.read_bytes())
     target_image = decode_image(pair.target.read_bytes())
 
@@ -91,10 +110,16 @@ def run_pair(pair: Pair, variants: list[Variant], stylizer: ClassicalStylizer) -
     source_uri = to_data_uri(source_image[sy0:sy1, sx0:sx1])
     result = PairResult(pair_id=pair.pair_id, source_uri=source_uri)
 
-    options = _style_options()
+    options = _style_options(art_style)
     for variant in variants:
         if variant.enhance:
-            image = stylizer.stylize(swapped, target_face, options.scaled(variant.strength))
+            stylizer = stylizers[variant.provider]
+            image = stylizer.stylize(
+                swapped,
+                target_face,
+                options.scaled(variant.strength),
+                identity_embedding=source_embedding,
+            )
         else:
             image = swapped
         identity, texture, crop_uri, note = _measure(image, source_embedding, target_face)
@@ -112,18 +137,29 @@ def run_pair(pair: Pair, variants: list[Variant], stylizer: ClassicalStylizer) -
     return result
 
 
-def run_bench(input_dir: str, strengths: list[float]) -> dict:
+def run_bench(
+    input_dir: str, strengths: list[float], diffusion: bool = False, art_style: str = ""
+) -> dict:
     """Возвращает данные отчёта; запись файлов — на стороне CLI."""
-    variants = default_variants(strengths)
+    # Диффузия без весов молча пропускается, стенд остаётся полезным
+    if diffusion and not weights_present():
+        log.warning("веса диффузии не найдены — сравниваю только classical")
+        diffusion = False
+
+    variants = default_variants(strengths, diffusion=diffusion)
     pairs = discover_pairs(input_dir)
 
     if not pairs:
         return {"results": [], "variants": variants, "summaries": [], "pairs_found": 0}
 
     log.info("найдено пар: %d, вариантов: %d", len(pairs), len(variants))
-    stylizer = ClassicalStylizer()
+    stylizers: dict[str, BaseStylizer] = {"classical": ClassicalStylizer()}
+    if diffusion:
+        stylizers["diffusion"] = DiffusionStylizer()
 
-    results = [r for p in pairs if (r := run_pair(p, variants, stylizer)) is not None]
+    results = [
+        r for p in pairs if (r := run_pair(p, variants, stylizers, art_style)) is not None
+    ]
     summaries = summarize(results, variants, IDENTITY_THRESHOLD)
 
     return {

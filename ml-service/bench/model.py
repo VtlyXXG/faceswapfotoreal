@@ -12,12 +12,14 @@ class Variant:
     name: str
     enhance: bool
     strength: float = 1.0
+    provider: str = "classical"
 
     @property
     def label(self) -> str:
         if not self.enhance:
             return "без обработки"
-        return f"strength {self.strength:g}"
+        prefix = "" if self.provider == "classical" else f"{self.provider} "
+        return f"{prefix}strength {self.strength:g}"
 
 
 @dataclass

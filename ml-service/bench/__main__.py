@@ -36,11 +36,17 @@ def main() -> int:
         default=[0.6, 1.0, 1.4],
         help="значения style_strength через запятую",
     )
+    parser.add_argument(
+        "--diffusion",
+        action="store_true",
+        help="добавить колонки SD 1.5 (нужны веса; медленно на CPU)",
+    )
+    parser.add_argument("--art-style", default="", help="стиль обложки для промпта диффузии")
     args = parser.parse_args()
 
     setup_logging()
 
-    data = run_bench(args.input, args.strengths)
+    data = run_bench(args.input, args.strengths, diffusion=args.diffusion, art_style=args.art_style)
     if data["pairs_found"] == 0:
         print(
             f"Пары не найдены в {args.input}.\n"

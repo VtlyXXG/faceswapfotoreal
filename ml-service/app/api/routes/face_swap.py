@@ -44,6 +44,7 @@ async def swap(
     swap_all_faces: bool = Form(False),
     enhance: bool = Form(False, description="Согласовать лицо с иллюстрацией"),
     style_strength: float = Form(1.0, ge=0.0, le=2.0, description="Множитель силы постобработки"),
+    art_style: str = Form("", description="Стиль обложки для промпта диффузии"),
     output_format: str = Form("png"),
 ) -> Response:
     """
@@ -58,6 +59,7 @@ async def swap(
             swap_all_faces=swap_all_faces,
             enhance=enhance,
             style_strength=style_strength,
+            art_style=art_style,
             output_format=output_format,
         )
     )

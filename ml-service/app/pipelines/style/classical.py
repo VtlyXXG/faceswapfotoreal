@@ -24,7 +24,13 @@ log = get_logger(__name__)
 class ClassicalStylizer(BaseStylizer):
     name = "classical"
 
-    def stylize(self, image: Any, face: Any, options: StyleOptions) -> np.ndarray:
+    def stylize(
+        self,
+        image: Any,
+        face: Any,
+        options: StyleOptions,
+        identity_embedding: Any = None,  # noqa: ARG002 — нужен только диффузии
+    ) -> np.ndarray:
         masks = build_masks(face, image.shape, margin=options.margin)
         x0, y0, x1, y1 = masks.box
 
@@ -60,7 +66,13 @@ class NoopStylizer(BaseStylizer):
 
     name = "noop"
 
-    def stylize(self, image: Any, face: Any, options: StyleOptions) -> Any:  # noqa: ARG002
+    def stylize(  # noqa: ARG002
+        self,
+        image: Any,
+        face: Any,
+        options: StyleOptions,
+        identity_embedding: Any = None,
+    ) -> Any:
         return image
 
     def is_available(self) -> bool:

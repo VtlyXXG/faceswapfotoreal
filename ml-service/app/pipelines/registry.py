@@ -109,8 +109,13 @@ def get_stylizer():
 
         from app.pipelines.style.base import StyleOptions
         from app.pipelines.style.classical import ClassicalStylizer, NoopStylizer
+        from app.pipelines.style.diffusion import DiffusionStylizer
 
-        providers = {"classical": ClassicalStylizer, "noop": NoopStylizer}
+        providers = {
+            "classical": ClassicalStylizer,
+            "diffusion": DiffusionStylizer,
+            "noop": NoopStylizer,
+        }
         provider = providers.get(settings.style_provider)
         if provider is None:
             log.warning(
@@ -156,6 +161,18 @@ def runtime_status() -> dict:
     }
 
 
+def _stylizer_available() -> bool:
+    """Готовность стилизатора без его загрузки — для /health/ready."""
+    provider = settings.style_provider
+    if provider in ("classical", "noop"):
+        return True
+    if provider == "diffusion":
+        from app.pipelines.style.diffusion import weights_present
+
+        return weights_present()
+    return False
+
+
 def status() -> dict:
     """Состояние моделей для /health — без загрузки весов."""
     detector_dir = models_dir() / "models" / settings.face_detector
@@ -176,6 +193,6 @@ def status() -> dict:
         "stylizer": {
             "name": settings.style_provider,
             "loaded": _stylizer is not None,
-            "available": settings.style_provider in ("classical", "noop"),
+            "available": _stylizer_available(),
         },
     }

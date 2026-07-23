@@ -25,6 +25,7 @@ class SwapRequest:
     swap_all_faces: bool = False
     enhance: bool = False
     style_strength: float = 1.0
+    art_style: str = ""
     output_format: str = "png"
 
 
@@ -52,7 +53,12 @@ def run(request: SwapRequest) -> SwapResult:
         result = swapper.swap_face(target_image, selected[0], source_face)
 
     result = enhancer.enhance(
-        result, selected, enabled=request.enhance, strength=request.style_strength
+        result,
+        selected,
+        enabled=request.enhance,
+        strength=request.style_strength,
+        identity_embedding=source_face.normed_embedding,
+        art_style=request.art_style,
     )
     payload, mime_type = encode_image(result, request.output_format)
 
