@@ -1,0 +1,12 @@
+# GPU-вариант (CUDA 12.1). Устанавливать ВМЕСТО requirements.txt:
+#   pip install -r requirements-gpu.txt --extra-index-url https://download.pytorch.org/whl/cu121
+
+-r requirements.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+
+# onnxruntime-gpu ставится вместо onnxruntime — удалите CPU-пакет перед установкой:
+#   pip uninstall -y onnxruntime
+onnxruntime-gpu==1.19.2

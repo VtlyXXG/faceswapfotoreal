@@ -1,0 +1,23 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+
+# Веса моделей
+models/*
+!models/.gitkeep
+checkpoints/
+weights/
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+outputs/
+tmp/
+logs/
+*.log

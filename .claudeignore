@@ -1,0 +1,71 @@
+# Что не нужно сканировать ассистенту — экономия токенов.
+
+# --- Python: виртуальные окружения ---
+ml-service/.venv/
+ml-service/venv/
+ml-service/env/
+**/.venv/
+**/venv/
+**/site-packages/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Веса моделей (текущие и будущие) ---
+ml-service/models/
+ml-service/**/models/
+ml-service/checkpoints/
+ml-service/weights/
+models/
+checkpoints/
+weights/
+**/.insightface/
+**/huggingface/
+**/.cache/huggingface/
+**/torch/hub/
+
+# Форматы весов и датасетов
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.gguf
+*.bin
+*.h5
+*.pkl
+*.npz
+*.tflite
+
+# --- Node.js ---
+node_modules/
+package-lock.json
+
+# --- Артефакты генерации ---
+storage/output/
+storage/tmp/
+ml-service/outputs/
+ml-service/tmp/
+
+# --- Медиа и архивы ---
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.zip
+*.tar.gz
+*.7z
+
+# --- Сборки, логи, покрытие ---
+dist/
+build/
+coverage/
+htmlcov/
+logs/
+ml-service/logs/
+*.log
+*.log.[0-9]

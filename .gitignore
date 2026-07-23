@@ -1,0 +1,34 @@
+node_modules/
+.env
+.env.local
+*.log
+logs/
+coverage/
+dist/
+build/
+
+# Артефакты генерации и локальные веса моделей
+storage/output/
+storage/tmp/
+# Только корневой каталог: веса ml-service закрыты ml-service/.gitignore,
+# который оставляет в репозитории models/.gitkeep
+/models/
+*.gguf
+*.safetensors
+*.bin
+
+# Python-кэши (ml-service имеет свой .gitignore, но кэш появляется и в корне)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Локальные настройки Claude Code — машинозависимы
+.claude/settings.local.json
+
+# ОС / редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

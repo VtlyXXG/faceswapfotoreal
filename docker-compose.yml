@@ -1,0 +1,33 @@
+services:
+  api:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      AI_TEXT_PROVIDER: ollama
+      AI_TEXT_BASE_URL: http://ollama:11434
+      AI_TEXT_MODEL: llama3.1:8b
+      STORAGE_ROOT: /data
+    volumes:
+      - book-output:/data
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - '11434:11434'
+    volumes:
+      - ollama-models:/root/.ollama
+    # Для GPU раскомментируйте (нужен nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  book-output:
+  ollama-models:
