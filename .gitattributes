@@ -1,0 +1,42 @@
+# В репозитории всё хранится с LF; в рабочем каталоге — тоже,
+# независимо от core.autocrlf на конкретной машине.
+* text=auto eol=lf
+
+# --- Явные исключения по переводам строк ---
+# PowerShell 5.1 надёжнее работает со скриптами в CRLF
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Shell-скрипты обязаны быть в LF: CRLF ломает shebang
+*.sh    text eol=lf
+Dockerfile text eol=lf
+
+# --- Бинарные файлы: без нормализации и без diff ---
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.webp  binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.7z    binary
+*.gz    binary
+
+# Веса моделей (в .gitignore, но правило страхует от случайного add)
+*.onnx  binary
+*.pt    binary
+*.pth   binary
+*.ckpt  binary
+*.safetensors binary
+*.gguf  binary
+*.bin   binary
+*.pkl   binary
+*.npz   binary
+
+# --- Поведение diff ---
+*.md       diff=markdown
+*.py       diff=python
+package-lock.json  -diff linguist-generated
