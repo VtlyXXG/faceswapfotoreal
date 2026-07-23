@@ -27,6 +27,13 @@ __pycache__/
 # Локальные настройки Claude Code — машинозависимы
 .claude/settings.local.json
 
+# Локальные изображения для ручных прогонов face-swap: это персональные
+# данные заказчиков книг, им не место в репозитории
+/source.jpg
+/target.png
+/result.jpg
+/samples/
+
 # ОС / редакторы
 .DS_Store
 Thumbs.db

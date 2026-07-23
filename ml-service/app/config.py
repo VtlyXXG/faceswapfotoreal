@@ -40,7 +40,8 @@ class Settings(BaseSettings):
     det_size: int = 640
     lazy_load: bool = True
 
-    max_upload_mb: int = 15
+    # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
+    max_upload_mb: int = 40
     max_faces: int = 10
 
     allowed_origins: str = "http://localhost:3000"
