@@ -21,3 +21,8 @@ outputs/
 tmp/
 logs/
 *.log
+
+# A/B-стенд: входные фото и отчёты содержат лица — только структура каталогов
+bench/samples/*
+!bench/samples/.gitkeep
+bench/out/
