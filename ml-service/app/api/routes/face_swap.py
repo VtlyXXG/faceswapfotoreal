@@ -42,7 +42,8 @@ async def swap(
     target: UploadFile = File(..., description="Иллюстрация, куда переносим"),
     target_face_index: int | None = Form(None),
     swap_all_faces: bool = Form(False),
-    enhance: bool = Form(False),
+    enhance: bool = Form(False, description="Согласовать лицо с иллюстрацией"),
+    style_strength: float = Form(1.0, ge=0.0, le=2.0, description="Множитель силы постобработки"),
     output_format: str = Form("png"),
 ) -> Response:
     """
@@ -56,6 +57,7 @@ async def swap(
             target_face_index=target_face_index,
             swap_all_faces=swap_all_faces,
             enhance=enhance,
+            style_strength=style_strength,
             output_format=output_format,
         )
     )

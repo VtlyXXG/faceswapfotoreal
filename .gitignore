@@ -31,7 +31,8 @@ __pycache__/
 # данные заказчиков книг, им не место в репозитории
 /source.jpg
 /target.png
-/result.jpg
+/result*.jpg
+/result*.png
 /samples/
 
 # ОС / редакторы

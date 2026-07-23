@@ -53,5 +53,6 @@ async def readiness(response: Response) -> ReadinessResponse:
         runtime=state["runtime"],
         detector=state["detector"],
         swapper=state["swapper"],
+        stylizer=state["stylizer"],
         reason="; ".join(missing) or None,
     )

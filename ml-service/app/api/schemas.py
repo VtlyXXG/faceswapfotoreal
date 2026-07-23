@@ -45,6 +45,7 @@ class ReadinessResponse(BaseModel):
     runtime: RuntimeStatus
     detector: ModelStatus
     swapper: ModelStatus
+    stylizer: ModelStatus
     reason: str | None = Field(default=None, description="Почему degraded")
 
 

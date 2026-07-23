@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     lazy_load: bool = True
 
     # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
+    # --- Постобработка (согласование лица с иллюстрацией) ---
+    # classical | noop; диффузионный стилизатор встанет сюда же
+    style_provider: str = "classical"
+    style_color: float = 0.6
+    style_smooth: float = 0.5
+    style_grain: float = 0.7
+    style_sharpness: float = 0.6
+    style_margin: float = 1.8
+
+    # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
     max_upload_mb: int = 40
     max_faces: int = 10
 

@@ -20,6 +20,7 @@ log = get_logger(__name__)
 _lock = threading.Lock()
 _face_analyser = None
 _face_swapper = None
+_stylizer = None
 
 
 def models_dir() -> Path:
@@ -96,6 +97,39 @@ def get_face_swapper():
         return _face_swapper
 
 
+def get_stylizer():
+    """Стилизатор постобработки. Весов не требует, но синглтон — для единообразия."""
+    global _stylizer
+    if _stylizer is not None:
+        return _stylizer
+
+    with _lock:
+        if _stylizer is not None:
+            return _stylizer
+
+        from app.pipelines.style.base import StyleOptions
+        from app.pipelines.style.classical import ClassicalStylizer, NoopStylizer
+
+        providers = {"classical": ClassicalStylizer, "noop": NoopStylizer}
+        provider = providers.get(settings.style_provider)
+        if provider is None:
+            log.warning(
+                "неизвестный стилизатор %s, постобработка отключена", settings.style_provider
+            )
+            provider = NoopStylizer
+
+        _stylizer = provider()
+        _stylizer.default_options = StyleOptions(
+            color=settings.style_color,
+            smooth=settings.style_smooth,
+            grain=settings.style_grain,
+            sharpness=settings.style_sharpness,
+            margin=settings.style_margin,
+        )
+        log.info("стилизатор %s инициализирован", _stylizer.name)
+        return _stylizer
+
+
 def warmup() -> None:
     """Прогрев на старте при ML_LAZY_LOAD=false."""
     get_face_analyser()
@@ -104,10 +138,11 @@ def warmup() -> None:
 
 def reset() -> None:
     """Сброс кэша моделей (тесты, горячая замена весов)."""
-    global _face_analyser, _face_swapper
+    global _face_analyser, _face_swapper, _stylizer
     with _lock:
         _face_analyser = None
         _face_swapper = None
+        _stylizer = None
 
 
 def runtime_status() -> dict:
@@ -137,5 +172,10 @@ def status() -> dict:
             "name": settings.face_swapper,
             "loaded": _face_swapper is not None,
             "available": swapper_path().exists(),
+        },
+        "stylizer": {
+            "name": settings.style_provider,
+            "loaded": _stylizer is not None,
+            "available": settings.style_provider in ("classical", "noop"),
         },
     }
