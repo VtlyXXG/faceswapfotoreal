@@ -81,12 +81,16 @@ export class BullMqDriver {
     if (!job) return null;
 
     const state = await job.getState();
+    const status = this.#mapState(state);
     const envelope = job.data;
+    // Завершённая задача — всегда 100%, как у memory-драйвера (BullMQ хранит
+    // последнее переданное значение прогресса, которое может быть меньше)
+    const reported = typeof job.progress === 'number' ? job.progress : envelope.progress;
     return {
       ...envelope,
-      status: this.#mapState(state),
+      status,
       attempts: job.attemptsMade,
-      progress: typeof job.progress === 'number' ? job.progress : envelope.progress,
+      progress: status === TaskStatus.COMPLETED ? 100 : reported,
       result: job.returnvalue ?? null,
       error: job.failedReason ? { message: job.failedReason, code: 'TASK_ERROR' } : null,
       updatedAt: new Date(job.finishedOn ?? job.processedOn ?? job.timestamp).toISOString(),

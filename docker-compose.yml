@@ -8,10 +8,71 @@ services:
       AI_TEXT_BASE_URL: http://ollama:11434
       AI_TEXT_MODEL: llama3.1:8b
       STORAGE_ROOT: /data
+      # Полная автономность: заказы в Postgres, задачи в Redis
+      DB_DRIVER: postgres
+      DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
+      QUEUE_DRIVER: redis
+      REDIS_URL: redis://redis:6379
+      ML_SERVICE_URL: http://ml-service:8000
     volumes:
       - book-output:/data
     depends_on:
-      - ollama
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+  # Воркер: те же образ и переменные, но выполняет задачи, а не принимает HTTP.
+  # Масштабируется независимо: docker compose up --scale worker=3
+  worker:
+    build: .
+    command: ['node', 'src/worker.js']
+    environment:
+      STORAGE_ROOT: /data
+      DB_DRIVER: postgres
+      DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
+      QUEUE_DRIVER: redis
+      REDIS_URL: redis://redis:6379
+      AI_TEXT_PROVIDER: ollama
+      AI_TEXT_BASE_URL: http://ollama:11434
+      ML_SERVICE_URL: http://ml-service:8000
+    volumes:
+      - book-output:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: projectx
+      POSTGRES_PASSWORD: projectx
+      POSTGRES_DB: projectx
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U projectx -d projectx']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   ollama:
     image: ollama/ollama:latest
@@ -30,4 +91,6 @@ services:
 
 volumes:
   book-output:
+  postgres-data:
+  redis-data:
   ollama-models:

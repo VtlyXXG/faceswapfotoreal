@@ -12,6 +12,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "worker": "node src/worker.js",
+    "check:infra": "node scripts/check-infra.mjs",
     "test": "node --test tests/**/*.test.js",
     "lint": "eslint src tests",
     "format": "prettier --write \"**/*.{js,json,md}\""

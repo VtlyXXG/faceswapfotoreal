@@ -20,6 +20,24 @@ ollama serve
 ollama pull llama3.1:8b
 ```
 
+### Локальная инфраструктура (Postgres + Redis)
+
+Для запуска в автономном режиме `docker-compose.yml` поднимает Postgres и Redis:
+
+```bash
+docker compose up -d postgres redis   # только базы (без сборки образов)
+cp .env.example .env                  # .env уже указывает на localhost:5432 / :6379
+npm run check:infra                   # прогнать драйверы БД и очереди на живых базах
+npm start                             # API + воркер против Postgres и Redis
+```
+
+`npm run check:infra` (`scripts/check-infra.mjs`) гоняет `PostgresBookStore`
+(полный контракт хранилища) и `BullMqDriver` (жизненный цикл задачи, повторы,
+stats) против контейнеров и печатает PASS/FAIL по шагам.
+
+`docker compose up` целиком поднимает и `api`, и `worker` (масштабируется
+`--scale worker=3`), и `postgres`/`redis` — API стартует после их healthcheck.
+
 ## Структура
 
 ```
