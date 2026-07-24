@@ -30,6 +30,51 @@ export const mlFetch = async (pathname, { method = 'GET', body, headers = {}, ti
   return response;
 };
 
+/**
+ * Face-swap на Python ML-сервисе. Долгая операция (диффузия — минуты),
+ * поэтому вызывается только из фоновой задачи, а не из HTTP-обработчика.
+ *
+ * @param {{ source: Buffer, target: Buffer, options?: object }} input
+ * @returns {Promise<{ image: Buffer, meta: object, mimeType: string }>}
+ */
+export const faceSwap = async ({ source, target, options = {} }) => {
+  const form = new FormData();
+  form.append('source', new Blob([source]), 'source.jpg');
+  form.append('target', new Blob([target]), 'target.png');
+  for (const [key, value] of Object.entries(options)) {
+    if (value !== undefined && value !== null) form.append(key, String(value));
+  }
+
+  const response = await mlFetch('/face-swap', {
+    method: 'POST',
+    body: form,
+    // Постобработка диффузией долгая — таймаут щедрый, но он на стороне воркера,
+    // клиент API его не ждёт
+    timeoutMs: config.mlService.faceSwapTimeoutMs,
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    const err = new Error(`ml-service вернул ${response.status}`);
+    err.code = 'ML_FACE_SWAP_FAILED';
+    err.details = detail.slice(0, 500);
+    throw err;
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const meta = safeJson(response.headers.get('x-swap-meta'));
+  return { image: buffer, meta, mimeType: response.headers.get('content-type') ?? 'image/png' };
+};
+
+const safeJson = (value) => {
+  if (!value) return {};
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+};
+
 /** Готовность ML-сервиса для /health/ready. Никогда не бросает. */
 export const checkMlService = async () => {
   try {

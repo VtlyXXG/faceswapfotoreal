@@ -40,6 +40,8 @@ export const config = {
   mlService: {
     baseUrl: process.env.ML_SERVICE_URL ?? 'http://127.0.0.1:8000',
     timeoutMs: int(process.env.ML_SERVICE_TIMEOUT_MS, 180_000),
+    // face-swap с диффузией может идти минутами; ждёт воркер, не клиент
+    faceSwapTimeoutMs: int(process.env.ML_FACE_SWAP_TIMEOUT_MS, 600_000),
   },
 
   storage: {
@@ -48,8 +50,16 @@ export const config = {
   },
 
   queue: {
+    // memory — in-process, без инфраструктуры; redis — BullMQ, durable/распределённо
     driver: process.env.QUEUE_DRIVER ?? 'memory',
     concurrency: int(process.env.QUEUE_CONCURRENCY, 2),
+    maxAttempts: int(process.env.QUEUE_MAX_ATTEMPTS, 3),
+    backoffMs: int(process.env.QUEUE_BACKOFF_MS, 2000),
+    redis: {
+      url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
+      prefix: process.env.QUEUE_PREFIX ?? 'projectx',
+      queue: process.env.QUEUE_NAME ?? 'tasks',
+    },
   },
 
   ai: {

@@ -1,5 +1,5 @@
 import { checkProviders } from '../../ai/registry.js';
-import { jobQueue } from '../../queue/jobQueue.js';
+import { queueStats } from '../../queue/taskQueue.js';
 import { checkMlService } from '../../services/mlClient.js';
 
 export const liveness = (_req, res) => res.json({ status: 'ok', uptime: process.uptime() });
@@ -16,4 +16,4 @@ export const readiness = async (_req, res) => {
   });
 };
 
-export const stats = (_req, res) => res.json({ queue: jobQueue.stats() });
+export const stats = async (_req, res) => res.json({ queue: await queueStats() });

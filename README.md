@@ -41,14 +41,20 @@ src/
     generationService.js шаги генерации: структура → главы → иллюстрации
     renderService.js    сборка md/html (pdf/epub — точка расширения)
   storage/              репозиторий заказов + файловые артефакты
-  queue/                очередь задач с ограничением параллелизма
+  queue/                асинхронная очередь задач
+    task.js             модель задачи + статусы
+    taskQueue.js        фасад: выбор драйвера, регистрация обработчиков
+    drivers/memoryDriver.js  in-process: параллелизм, повторы, backoff
+    drivers/bullmqDriver.js  BullMQ + Redis: durable, распределённо
+  services/personalizeService.js  фоновый вызов ML face-swap (задача ml.faceSwap)
   utils/
     logger.js           pino: pretty в консоль, JSON в logs/ с ротацией
     requestContext.js   AsyncLocalStorage с request_id
     errors.js, id.js
   config/index.js       вся конфигурация из ENV в одном месте
   app.js                сборка Express-приложения
-  server.js             точка входа, graceful shutdown
+  server.js             API + воркер в одном процессе (memory)
+  worker.js             автономный воркер (для QUEUE_DRIVER=redis)
 tests/                  node:test
 ```
 
@@ -56,12 +62,15 @@ tests/                  node:test
 
 | Метод | Путь | Назначение |
 | --- | --- | --- |
-| `POST` | `/api/v1/books` | создать заказ, возвращает `202` и `id` |
+| `POST` | `/api/v1/books` | создать заказ, `202` + `taskId` |
 | `GET` | `/api/v1/books` | список заказов |
 | `GET` | `/api/v1/books/:id` | полное состояние заказа |
 | `GET` | `/api/v1/books/:id/status` | краткий статус и прогресс |
 | `GET` | `/api/v1/books/:id/files` | список готовых файлов |
 | `GET` | `/api/v1/books/:id/files/:filename` | скачать файл |
+| `POST` | `/api/v1/personalize` | face-swap на ML-сервисе, `202` + `taskId` |
+| `GET` | `/api/v1/tasks/:id` | полное состояние задачи |
+| `GET` | `/api/v1/tasks/:id/status` | краткий статус задачи (для опроса) |
 | `GET` | `/api/v1/health` | liveness |
 | `GET` | `/api/v1/health/ready` | readiness + доступность моделей |
 | `GET` | `/api/v1/stats` | состояние очереди |
@@ -74,14 +83,71 @@ curl -X POST http://localhost:3000/api/v1/books \
   -d '{
     "title": "Путешествие к звёздам",
     "chapterCount": 5,
-    "withIllustrations": false,
     "recipient": { "name": "Аня", "age": 8, "interests": ["космос", "динозавры"] },
-    "style": { "genre": "приключения", "tone": "тёплый и добрый", "language": "ru" },
     "output": { "formats": ["md", "html"] }
   }'
+# → 202 { "id": "book_…", "taskId": "task_…", "status": "pending",
+#         "statusUrl": "/api/v1/tasks/task_…/status" }
 ```
 
-Генерация асинхронная: заказ ставится в очередь, прогресс опрашивается через `/status`.
+## Асинхронная очередь задач
+
+Сервис **никогда не держит клиента на долгой операции**: тяжёлая работа
+(генерация книги, face-swap на Python ML-сервисе) уходит в фоновую задачу, а
+API сразу отвечает `202 Accepted` + `taskId`. Клиент опрашивает
+`GET /tasks/:id/status`.
+
+### Драйверы
+
+Очередь скрыта за фасадом `src/queue/taskQueue.js`; драйвер выбирается
+`QUEUE_DRIVER`:
+
+| Драйвер | Когда | Свойства |
+| --- | --- | --- |
+| `memory` (по умолчанию) | один узел, разработка | in-process, без инфраструктуры; параллелизм, повторы с экспоненциальным backoff. Очередь теряется при перезапуске |
+| `redis` (BullMQ) | автономность, большие нагрузки | задачи переживают перезапуск; воркеры масштабируются **отдельно** от API. `bullmq`/`ioredis` подгружаются лениво |
+
+Тот же приём, что у ИИ-провайдеров и хранилища: контракт один, реализации
+подключаются конфигом. Перейти на Redis — это `QUEUE_DRIVER=redis` без правок
+кода.
+
+### Масштабирование
+
+```bash
+QUEUE_DRIVER=redis npm start      # приём запросов (можно несколько инстансов за LB)
+QUEUE_DRIVER=redis npm run worker # выполнение задач (масштабируется отдельно)
+```
+
+С `memory` API и воркер живут в одном процессе (`npm start`), отдельный воркер
+не нужен. С `redis` API только ставит задачи, а `npm run worker` их выполняет —
+столько воркеров, сколько нужно под нагрузку.
+
+### Обращение к ML-сервису — в фоне
+
+`POST /api/v1/personalize` ставит задачу `ml.faceSwap` и сразу отвечает `202`.
+Долгий вызов Python-сервиса (диффузия — минуты) идёт в воркере: его таймаут
+(`ML_FACE_SWAP_TIMEOUT_MS`) ждёт воркер, а не HTTP-клиент.
+
+```bash
+curl -X POST http://localhost:3000/api/v1/personalize \
+  -H 'content-type: application/json' \
+  -d '{ "source": "uploads/face.jpg", "target": "uploads/cover.png",
+        "options": { "enhance": true, "style_strength": 1.0 } }'
+# → 202 { "taskId": "task_…", "status": "pending" }
+```
+
+Пути `source`/`target` — ссылки на файлы под `STORAGE_ROOT` (выход за его
+пределы отклоняется). Результат сохраняется в артефакты задачи.
+
+### Надёжность
+
+- **Повторы.** Упавшая задача повторяется до `QUEUE_MAX_ATTEMPTS` раз с
+  экспоненциальным backoff (`QUEUE_BACKOFF_MS · 2^попытка`). У `redis` то же
+  делает BullMQ.
+- **Трассировка.** `request_id` едет в задаче (`meta`) и восстанавливается в
+  воркере — фоновые логи остаются в трассе исходного запроса даже в другом
+  процессе через Redis.
+- **Graceful shutdown.** По SIGTERM/SIGINT воркер и соединения закрываются.
 
 ## Логирование и трассировка
 
@@ -165,7 +231,9 @@ registerTextProvider('vllm', VllmProvider);
 
 - Хранилище заказов — in-memory (`src/storage/bookRepository.js`); интерфейс async,
   замена на БД не затрагивает вызывающий код.
-- Очередь — in-process (`src/queue/jobQueue.js`); при горизонтальном масштабировании
-  заменяется на BullMQ/Redis с теми же методами.
 - Рендеры `pdf` и `epub` пока не реализованы — формат тихо пропускается с записью в лог.
+- Приём файлов для `/personalize` — по ссылкам под `STORAGE_ROOT`; загрузка
+  multipart (upload) не реализована.
+- При `QUEUE_DRIVER=redis` статус задач durable в Redis, но доменная запись
+  книги пока живёт в памяти — для полной автономности её тоже выносят в БД.
 - Аутентификации и rate limiting нет.

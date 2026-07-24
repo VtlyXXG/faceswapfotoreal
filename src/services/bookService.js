@@ -2,9 +2,8 @@ import { createBookJob, JobStatus } from '../domain/book.js';
 import { parseBookSpec } from '../domain/bookSpec.js';
 import { bookRepository } from '../storage/bookRepository.js';
 import { saveArtifact } from '../storage/fileStorage.js';
-import { jobQueue } from '../queue/jobQueue.js';
+import { buildTask, submit, registerHandler } from '../queue/taskQueue.js';
 import { createLogger } from '../utils/logger.js';
-import { bindContext } from '../utils/requestContext.js';
 import {
   generateOutline,
   generateChapter,
@@ -14,25 +13,35 @@ import { renderBook } from './renderService.js';
 
 const log = createLogger('book');
 
+export const BOOK_TASK = 'book.generate';
+
+// Генерация книги — фоновая задача. Обработчик регистрируется при импорте
+// модуля, поэтому доступен воркеру любого драйвера очереди.
+registerHandler(BOOK_TASK, (payload, ctx) => runPipeline(payload.bookId, ctx));
+
 /** Принимает заказ, ставит его в очередь и сразу возвращает id (генерация асинхронна). */
 export const createBook = async (input) => {
   const spec = parseBookSpec(input);
-  const job = await bookRepository.save(createBookJob(spec));
+  const bookJob = createBookJob(spec);
 
-  // bindContext переносит request_id в фоновую задачу: генерация переживает
-  // HTTP-ответ, но её логи остаются в той же трассе, что и запрос клиента
-  jobQueue
-    .enqueue(job.id, bindContext(() => runPipeline(job.id)))
-    .catch((err) => log.error({ jobId: job.id, err }, 'пайплайн генерации упал'));
+  // Связываем книгу с задачей ДО постановки в очередь: воркер memory-драйвера
+  // может начать выполнение сразу, и taskId должен быть уже сохранён
+  const task = buildTask(BOOK_TASK, { bookId: bookJob.id });
+  bookJob.taskId = task.id;
+  const saved = await bookRepository.save(bookJob);
 
-  return job;
+  await submit(task);
+  return saved;
 };
 
 export const getBook = (id) => bookRepository.getById(id);
 export const listBooks = (options) => bookRepository.list(options);
 
-/** Полный пайплайн: структура → главы → иллюстрации → рендер файлов. */
-export const runPipeline = async (jobId) => {
+/**
+ * Полный пайплайн: структура → главы → иллюстрации → рендер файлов.
+ * Запускается воркером очереди; ctx позволяет отражать прогресс в задаче.
+ */
+export const runPipeline = async (jobId, ctx = null) => {
   const job = await bookRepository.getById(jobId);
   const { spec } = job;
 
@@ -59,6 +68,7 @@ export const runPipeline = async (jobId) => {
       chapters.push(written);
       const progress = 5 + Math.round((chapters.length / outline.chapters.length) * 85);
       await bookRepository.update(jobId, { chapters, progress });
+      ctx?.updateProgress(progress);
       log.info({ jobId, chapter: written.index }, 'глава готова');
     }
 
@@ -73,12 +83,14 @@ export const runPipeline = async (jobId) => {
       artifacts.push(await saveArtifact(jobId, rendered.filename, rendered.content));
     }
 
-    return bookRepository.update(jobId, {
+    await bookRepository.update(jobId, {
       status: JobStatus.COMPLETED,
       progress: 100,
       chapters,
       artifacts,
     });
+    // Компактный результат задачи; полные данные книги — по GET /books/:id
+    return { bookId: jobId, title: book.title, artifacts: artifacts.map((a) => a.filename) };
   } catch (err) {
     await bookRepository.update(jobId, {
       status: JobStatus.FAILED,

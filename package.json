@@ -11,13 +11,16 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
+    "worker": "node src/worker.js",
     "test": "node --test tests/**/*.test.js",
     "lint": "eslint src tests",
     "format": "prettier --write \"**/*.{js,json,md}\""
   },
   "dependencies": {
+    "bullmq": "^5.13.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "ioredis": "^5.4.1",
     "pino": "^9.3.2",
     "pino-http": "^10.2.0",
     "pino-roll": "^4.0.0",

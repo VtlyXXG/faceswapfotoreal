@@ -4,7 +4,15 @@ import { NotFoundError } from '../../utils/errors.js';
 
 export const create = async (req, res) => {
   const job = await bookService.createBook(req.body);
-  res.status(202).json({ id: job.id, status: job.status, createdAt: job.createdAt });
+  // 202: заказ принят, генерация в фоне. Клиент опрашивает статус по taskId
+  // (общий для всех задач) или по id книги (доменный ресурс).
+  res.status(202).json({
+    id: job.id,
+    taskId: job.taskId,
+    status: job.status,
+    statusUrl: `/api/v1/tasks/${job.taskId}/status`,
+    createdAt: job.createdAt,
+  });
 };
 
 export const list = async (req, res) => {

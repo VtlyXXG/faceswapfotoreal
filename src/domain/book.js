@@ -10,6 +10,7 @@ export const JobStatus = Object.freeze({
 /** Заказ на генерацию: спецификация + состояние выполнения. */
 export const createBookJob = (spec) => ({
   id: newId('book'),
+  taskId: null, // задача очереди, выполняющая генерацию
   status: JobStatus.PENDING,
   progress: 0,
   spec,
