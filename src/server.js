@@ -1,6 +1,7 @@
 import { createApp } from './app.js';
 import { config } from './config/index.js';
 import { ensureStorage } from './storage/fileStorage.js';
+import { initBookStore, closeBookStore } from './storage/bookRepository.js';
 import { checkProviders } from './ai/registry.js';
 import { startWorker, closeQueue } from './queue/taskQueue.js';
 // Импорт ради побочного эффекта — регистрации обработчиков задач в очереди
@@ -10,6 +11,7 @@ import { logger } from './utils/logger.js';
 
 const start = async () => {
   await ensureStorage();
+  await initBookStore();
 
   // memory-драйвер обрабатывает задачи в этом же процессе. Для redis это
   // поднимает воркер рядом с API; в проде воркеры выносят в отдельные процессы
@@ -35,6 +37,7 @@ const start = async () => {
     logger.info({ signal }, 'остановка сервиса');
     server.close(async () => {
       await closeQueue();
+      await closeBookStore();
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000).unref();

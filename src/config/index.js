@@ -49,6 +49,17 @@ export const config = {
     root: path.resolve(process.cwd(), process.env.STORAGE_ROOT ?? './storage'),
   },
 
+  db: {
+    // memory — in-process (по умолчанию); postgres — общее состояние заказов
+    // между процессами API и воркеров, переживает перезапуск
+    driver: process.env.DB_DRIVER ?? 'memory',
+    postgres: {
+      url: process.env.DATABASE_URL ?? 'postgres://127.0.0.1:5432/projectx',
+      table: process.env.DB_TABLE ?? 'books',
+      ssl: (process.env.DB_SSL ?? 'false') === 'true',
+    },
+  },
+
   queue: {
     // memory — in-process, без инфраструктуры; redis — BullMQ, durable/распределённо
     driver: process.env.QUEUE_DRIVER ?? 'memory',

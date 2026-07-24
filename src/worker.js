@@ -8,6 +8,7 @@
  */
 import { config } from './config/index.js';
 import { startWorker, closeQueue } from './queue/taskQueue.js';
+import { initBookStore, closeBookStore } from './storage/bookRepository.js';
 // Регистрация обработчиков задач
 import './services/bookService.js';
 import './services/personalizeService.js';
@@ -21,12 +22,17 @@ const start = async () => {
     );
   }
 
+  // Воркер пишет статусы заказов, поэтому ему нужно то же хранилище, что и API.
+  // С DB_DRIVER=memory у отдельного процесса будет своя пустая память —
+  // общее состояние требует DB_DRIVER=postgres
+  await initBookStore();
   await startWorker();
   logger.info({ queue: config.queue.driver, concurrency: config.queue.concurrency }, 'воркер запущен');
 
   const shutdown = async (signal) => {
     logger.info({ signal }, 'остановка воркера');
     await closeQueue();
+    await closeBookStore();
     process.exit(0);
   };
 
