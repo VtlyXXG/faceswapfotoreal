@@ -48,15 +48,21 @@ def weights_present() -> bool:
 class DiffusionStylizer(BaseStylizer):
     name = "diffusion"
 
-    def __init__(self) -> None:
+    def __init__(self, use_lora: bool | None = None) -> None:
         self._pipe = None
         self._torch = None
+        self._use_lora = use_lora  # None → берём из конфигурации
         self.default_options = StyleOptions()
 
     # --- загрузка ----------------------------------------------------------
 
     def is_available(self) -> bool:
         return weights_present()
+
+    def _resolve_use_lora(self) -> bool:
+        if self._use_lora is not None:
+            return self._use_lora
+        return settings.style_diffusion_use_lora
 
     def _load(self):
         if self._pipe is not None:
@@ -100,10 +106,17 @@ class DiffusionStylizer(BaseStylizer):
         )
 
         lora = _ip_adapter_dir() / settings.style_diffusion_ip_lora
-        if lora.exists():
-            pipe.load_lora_weights(str(_ip_adapter_dir()), weight_name=lora.name)
-            pipe.fuse_lora()
-            log.info("LoRA FaceID подключена")
+        if self._resolve_use_lora() and lora.exists():
+            # LoRA-загрузка версионно капризна: при сбое продолжаем на одном
+            # адаптере (чуть ниже сходство), а не роняем весь пайплайн
+            try:
+                pipe.load_lora_weights(str(_ip_adapter_dir()), weight_name=lora.name)
+                pipe.fuse_lora()
+                log.info("LoRA FaceID подключена")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("LoRA FaceID не подхватилась, продолжаю без неё: %s", exc)
+        elif not self._resolve_use_lora():
+            log.info("LoRA FaceID отключена (--no-lora)")
 
         pipe.set_ip_adapter_scale(settings.style_diffusion_ip_scale)
         pipe = pipe.to(device)

@@ -138,7 +138,11 @@ def run_pair(
 
 
 def run_bench(
-    input_dir: str, strengths: list[float], diffusion: bool = False, art_style: str = ""
+    input_dir: str,
+    strengths: list[float],
+    diffusion: bool = False,
+    art_style: str = "",
+    use_lora: bool = True,
 ) -> dict:
     """Возвращает данные отчёта; запись файлов — на стороне CLI."""
     # Диффузия без весов молча пропускается, стенд остаётся полезным
@@ -155,7 +159,7 @@ def run_bench(
     log.info("найдено пар: %d, вариантов: %d", len(pairs), len(variants))
     stylizers: dict[str, BaseStylizer] = {"classical": ClassicalStylizer()}
     if diffusion:
-        stylizers["diffusion"] = DiffusionStylizer()
+        stylizers["diffusion"] = DiffusionStylizer(use_lora=use_lora)
 
     results = [
         r for p in pairs if (r := run_pair(p, variants, stylizers, art_style)) is not None

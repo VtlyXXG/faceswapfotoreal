@@ -167,6 +167,10 @@ curl -X POST http://localhost:8000/face-swap \
   перенесённого лица (`photograph, plastic skin, waxy...`), а не за стиль с нуля.
 - Веса и torch грузятся лениво: как и swapper, сервис поднимается без них,
   а `/health/ready` сообщает `degraded` с причиной `стилизатор diffusion без весов`.
+- **LoRA FaceID необязательна.** Она повышает сходство, но версионно капризна к
+  diffusers/peft. Сбой её загрузки не роняет пайплайн — стилизатор продолжает на
+  одном адаптере с предупреждением в логе. Отключить заранее:
+  `ML_STYLE_DIFFUSION_USE_LORA=false` (или `python -m bench --diffusion --no-lora`).
 
 Веса (~5 ГБ, **не в репозитории**):
 

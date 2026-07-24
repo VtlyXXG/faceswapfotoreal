@@ -85,6 +85,27 @@ def test_stylize_raises_when_weights_missing(tmp_path, monkeypatch):
         DiffusionStylizer().stylize(image, FakeFace(), StyleOptions())
 
 
+# --- переключатель LoRA --------------------------------------------------
+
+
+def test_use_lora_override_wins_over_config(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "style_diffusion_use_lora", True)
+    assert DiffusionStylizer(use_lora=False)._resolve_use_lora() is False
+    assert DiffusionStylizer(use_lora=True)._resolve_use_lora() is True
+
+
+def test_use_lora_falls_back_to_config_when_unset(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "style_diffusion_use_lora", False)
+    assert DiffusionStylizer()._resolve_use_lora() is False
+
+    monkeypatch.setattr(settings, "style_diffusion_use_lora", True)
+    assert DiffusionStylizer()._resolve_use_lora() is True
+
+
 # --- реестр --------------------------------------------------------------
 
 

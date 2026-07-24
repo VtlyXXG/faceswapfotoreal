@@ -42,11 +42,22 @@ def main() -> int:
         help="добавить колонки SD 1.5 (нужны веса; медленно на CPU)",
     )
     parser.add_argument("--art-style", default="", help="стиль обложки для промпта диффузии")
+    parser.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="не грузить LoRA FaceID (если она не подхватывается на этой сборке)",
+    )
     args = parser.parse_args()
 
     setup_logging()
 
-    data = run_bench(args.input, args.strengths, diffusion=args.diffusion, art_style=args.art_style)
+    data = run_bench(
+        args.input,
+        args.strengths,
+        diffusion=args.diffusion,
+        art_style=args.art_style,
+        use_lora=not args.no_lora,
+    )
     if data["pairs_found"] == 0:
         print(
             f"Пары не найдены в {args.input}.\n"

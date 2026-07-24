@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     style_diffusion_ip_adapter: str = "ip-adapter-faceid"
     style_diffusion_ip_weight: str = "ip-adapter-faceid_sd15.bin"
     style_diffusion_ip_lora: str = "ip-adapter-faceid_sd15_lora.safetensors"
+    style_diffusion_use_lora: bool = True  # LoRA капризна к версии; можно отключить
     style_diffusion_ip_scale: float = 0.8
     style_diffusion_texture_strength: float = 0.42
     style_diffusion_identity_keep: float = 0.6  # доля исходной геометрии в зоне глаз/носа/рта
