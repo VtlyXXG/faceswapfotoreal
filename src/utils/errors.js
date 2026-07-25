@@ -20,10 +20,3 @@ export class NotFoundError extends AppError {
     super(`${resource} не найден`, { status: 404, code: 'NOT_FOUND' });
   }
 }
-
-/** Ошибка на стороне локальной ИИ-модели (недоступна, таймаут, некорректный ответ). */
-export class AIProviderError extends AppError {
-  constructor(message, details) {
-    super(message, { status: 502, code: 'AI_PROVIDER_ERROR', details });
-  }
-}

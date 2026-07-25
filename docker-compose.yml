@@ -6,10 +6,6 @@ services:
     ports:
       - '3000:3000'
     environment:
-      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-mock}
-      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
-      AI_TEXT_BASE_URL: ${AI_TEXT_BASE_URL:-http://host.docker.internal:8080}
-      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-local-model}
       STORAGE_ROOT: /data
       # Полная автономность: заказы в Postgres, задачи в Redis
       DB_DRIVER: postgres
@@ -19,7 +15,7 @@ services:
       WORKER_IN_API: 'false'
       ML_SERVICE_URL: http://ml-service:8000
     volumes:
-      - book-output:/data
+      - cover-output:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -32,10 +28,6 @@ services:
     build: .
     command: ['node', 'src/worker.js']
     environment:
-      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-mock}
-      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
-      AI_TEXT_BASE_URL: ${AI_TEXT_BASE_URL:-http://host.docker.internal:8080}
-      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-local-model}
       STORAGE_ROOT: /data
       DB_DRIVER: postgres
       DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
@@ -43,7 +35,7 @@ services:
       REDIS_URL: redis://redis:6379
       ML_SERVICE_URL: http://ml-service:8000
     volumes:
-      - book-output:/data
+      - cover-output:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,6 +71,6 @@ services:
       retries: 10
 
 volumes:
-  book-output:
+  cover-output:
   postgres-data:
   redis-data:

@@ -8,10 +8,10 @@
  */
 import { config } from './config/index.js';
 import { startWorker, closeQueue } from './queue/taskQueue.js';
-import { initBookStore, closeBookStore } from './storage/bookRepository.js';
+import { initCoverStore, closeCoverStore } from './storage/coverRepository.js';
 // Регистрация обработчиков задач
-import './services/bookService.js';
-import './services/personalizeService.js';
+import './services/coverService.js';
+import './services/faceSwapService.js';
 import { logger } from './utils/logger.js';
 
 const start = async () => {
@@ -25,14 +25,14 @@ const start = async () => {
   // Воркер пишет статусы заказов, поэтому ему нужно то же хранилище, что и API.
   // С DB_DRIVER=memory у отдельного процесса будет своя пустая память —
   // общее состояние требует DB_DRIVER=postgres
-  await initBookStore();
+  await initCoverStore();
   await startWorker();
   logger.info({ queue: config.queue.driver, concurrency: config.queue.concurrency }, 'воркер запущен');
 
   const shutdown = async (signal) => {
     logger.info({ signal }, 'остановка воркера');
     await closeQueue();
-    await closeBookStore();
+    await closeCoverStore();
     process.exit(0);
   };
 

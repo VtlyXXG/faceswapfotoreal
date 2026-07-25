@@ -1,7 +1,7 @@
 import { getTask } from '../../queue/taskQueue.js';
 import { toPublicTask } from '../../queue/task.js';
 import { NotFoundError } from '../../utils/errors.js';
-import { createPersonalization } from '../../services/personalizeService.js';
+import { createPersonalization } from '../../services/faceSwapService.js';
 
 /** Полное состояние задачи. */
 export const getOne = async (req, res) => {

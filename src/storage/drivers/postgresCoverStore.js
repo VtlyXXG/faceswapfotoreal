@@ -8,20 +8,20 @@ const log = createLogger('db:postgres');
 const SAFE_IDENT = /^[a-z_][a-z0-9_]*$/;
 
 /**
- * Хранилище заказов в PostgreSQL.
+ * Хранилище заказов обложек в PostgreSQL.
  *
- * Заказ — вложенный документ (спецификация, оглавление, главы, артефакты),
- * поэтому целиком лежит в колонке data (jsonb), а id/status/created_at
- * продублированы отдельными колонками для выборок и сортировки. Это даёт
- * общее состояние между процессами API и воркеров без ORM и миграций схемы.
+ * Заказ — вложенный документ (спецификация, результат, артефакты), поэтому
+ * целиком лежит в колонке data (jsonb), а id/status/created_at продублированы
+ * отдельными колонками для выборок и сортировки. Это даёт общее состояние
+ * между процессами API и воркеров без ORM и миграций схемы.
  *
  * pg подгружается лениво: узлы на memory-драйвере не тянут драйвер БД.
  */
-export class PostgresBookStore {
+export class PostgresCoverStore {
   #pool = null;
   #client = null; // инъекция для тестов
 
-  constructor({ url, table = 'books', ssl = false, client = null } = {}) {
+  constructor({ url, table = 'covers', ssl = false, client = null } = {}) {
     if (!SAFE_IDENT.test(table)) {
       throw new Error(`недопустимое имя таблицы: ${table}`);
     }
@@ -115,4 +115,4 @@ export class PostgresBookStore {
   }
 }
 
-export default PostgresBookStore;
+export default PostgresCoverStore;

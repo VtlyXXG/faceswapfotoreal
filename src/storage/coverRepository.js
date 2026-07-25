@@ -1,7 +1,7 @@
 import { config } from '../config/index.js';
 import { createLogger } from '../utils/logger.js';
-import { MemoryBookStore } from './drivers/memoryBookStore.js';
-import { PostgresBookStore } from './drivers/postgresBookStore.js';
+import { MemoryCoverStore } from './drivers/memoryCoverStore.js';
+import { PostgresCoverStore } from './drivers/postgresCoverStore.js';
 
 const log = createLogger('db');
 
@@ -10,20 +10,20 @@ let store;
 const buildStore = () => {
   if (config.db.driver === 'postgres') {
     log.info({ table: config.db.postgres.table }, 'хранилище заказов: postgres');
-    return new PostgresBookStore(config.db.postgres);
+    return new PostgresCoverStore(config.db.postgres);
   }
   log.info('хранилище заказов: memory (in-process)');
-  return new MemoryBookStore();
+  return new MemoryCoverStore();
 };
 
 const getStore = () => (store ??= buildStore());
 
 /**
- * Репозиторий заказов за контрактом драйвера. Вызывающий код (bookService,
+ * Репозиторий заказов за контрактом драйвера. Вызывающий код (coverService,
  * контроллеры) не знает, память под ним или БД — переход на postgres это
  * DB_DRIVER=postgres без правок кода.
  */
-export const bookRepository = {
+export const coverRepository = {
   save: (job) => getStore().save(job),
   findById: (id) => getStore().findById(id),
   getById: (id) => getStore().getById(id),
@@ -33,16 +33,16 @@ export const bookRepository = {
 };
 
 /** Готовит хранилище (для postgres — создаёт схему). Вызывается на старте. */
-export const initBookStore = () => getStore().init();
+export const initCoverStore = () => getStore().init();
 
-export const closeBookStore = async () => {
+export const closeCoverStore = async () => {
   if (store) await store.close();
   store = undefined;
 };
 
 /** Сброс синглтона — для тестов. */
-export const resetBookStore = async () => {
-  await closeBookStore();
+export const resetCoverStore = async () => {
+  await closeCoverStore();
 };
 
-export default bookRepository;
+export default coverRepository;

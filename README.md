@@ -1,7 +1,11 @@
-# projectx — сервис генерации кастомизированных книг
+# projectx — сервис персонализации обложек
 
-Node.js (ESM) + Express. Текст и иллюстрации генерируются **локальными** моделями
-(llama.cpp / Stable Diffusion WebUI) через слой абстракции — внешние API не используются.
+Node.js (ESM) + Express. Единственная содержательная операция — **замена лица
+на обложке**: заказчик присылает своё фото и обложку, сервис возвращает обложку
+с его лицом. Вся тяжёлая работа (детекция, свап, постобработка, стилизация)
+живёт в **локальном** Python ML-сервисе (`ml-service/`) — внешние API не
+используются. Node ничего не генерирует сам: он принимает заказы, ведёт их
+состояние и оркестрирует вызовы ML.
 
 ## Быстрый старт
 
@@ -11,15 +15,8 @@ npm install
 npm run dev
 ```
 
-По умолчанию `AI_TEXT_PROVIDER=mock` — весь пайплайн отрабатывает на заглушках,
-никакие модели поднимать не нужно.
-
-С llama.cpp (OpenAI-совместимый сервер):
-
-```bash
-llama-server --host 127.0.0.1 --port 8080 -m model.gguf
-# AI_TEXT_PROVIDER=llamacpp AI_TEXT_BASE_URL=http://127.0.0.1:8080
-```
+Node-части нужен только запущенный ML-сервис (`ML_SERVICE_URL`); как поднять
+его — см. `ml-service/README.md`.
 
 ### Локальная инфраструктура (Postgres + Redis)
 
@@ -32,7 +29,7 @@ npm run check:infra                   # прогнать драйверы БД �
 npm start                             # API + воркер против Postgres и Redis
 ```
 
-`npm run check:infra` (`scripts/check-infra.mjs`) гоняет `PostgresBookStore`
+`npm run check:infra` (`scripts/check-infra.mjs`) гоняет `PostgresCoverStore`
 (полный контракт хранилища) и `BullMqDriver` (жизненный цикл задачи, повторы,
 stats) против контейнеров и печатает PASS/FAIL по шагам.
 
@@ -44,8 +41,7 @@ docker compose up -d --scale worker=3               # три воркера
 ```
 
 `api` и `worker` — один образ, разные команды; оба ждут healthcheck
-`postgres`/`redis`. Провайдер ИИ переопределяется из окружения
-(`AI_TEXT_PROVIDER`, по умолчанию `mock`).
+`postgres`/`redis`. Адрес ML-сервиса задаётся `ML_SERVICE_URL`.
 
 **Роли жёстко разделены:** контейнер `api` поднимается с `WORKER_IN_API=false`
 и только принимает запросы, отдавая `202`. Все задачи выполняют контейнеры
@@ -56,33 +52,27 @@ docker compose up -d --scale worker=3               # три воркера
 
 ```
 src/
-  ai/                   слой ИИ — единственное место, знающее про модели
-    providers/          реализации: llama.cpp, Automatic1111, mock
-      BaseTextProvider.js    контракт: generate() / stream() / healthCheck()
-      BaseImageProvider.js
-    prompts/            шаблоны промптов (версионируемые артефакты)
-    registry.js         выбор провайдера по конфигу + регистрация своих
   api/
     routes/             маршруты /api/v1
     controllers/        HTTP-слой, без бизнес-логики
     middleware/         requestId, asyncHandler, errorHandler
-  domain/               модели предметной области + zod-схема заказа
+  domain/
+    cover.js            заказ обложки: спецификация + состояние выполнения
+    coverSpec.js        zod-схема заказа — единственный источник правды
   services/
     mlClient.js         клиент ML-сервиса, пробрасывает X-Request-ID
-    bookService.js      приём заказа и оркестрация пайплайна
-    generationService.js шаги генерации: структура → главы → иллюстрации
-    renderService.js    сборка md/html (pdf/epub — точка расширения)
+    faceSwapService.js  сама замена лица: пути, вызов ML, задача ml.faceSwap
+    coverService.js     приём заказа и его пайплайн (задача cover.faceSwap)
   storage/
-    bookRepository.js   репозиторий заказов за контрактом драйвера
-    drivers/memoryBookStore.js   in-process (Map)
-    drivers/postgresBookStore.js БД: jsonb-документ + индексированные колонки
+    coverRepository.js  репозиторий заказов за контрактом драйвера
+    drivers/memoryCoverStore.js   in-process (Map)
+    drivers/postgresCoverStore.js БД: jsonb-документ + индексированные колонки
     fileStorage.js      файловые артефакты
   queue/                асинхронная очередь задач
     task.js             модель задачи + статусы
     taskQueue.js        фасад: выбор драйвера, регистрация обработчиков
     drivers/memoryDriver.js  in-process: параллелизм, повторы, backoff
     drivers/bullmqDriver.js  BullMQ + Redis: durable, распределённо
-  services/personalizeService.js  фоновый вызов ML face-swap (задача ml.faceSwap)
   utils/
     logger.js           pino: pretty в консоль, JSON в logs/ с ротацией
     requestContext.js   AsyncLocalStorage с request_id
@@ -91,6 +81,7 @@ src/
   app.js                сборка Express-приложения
   server.js             API; воркер в этом же процессе — только при WORKER_IN_API=true
   worker.js             автономный воркер (для QUEUE_DRIVER=redis)
+ml-service/             Python (FastAPI): детекция, face-swap, стилизация
 tests/                  node:test
 ```
 
@@ -98,40 +89,55 @@ tests/                  node:test
 
 | Метод | Путь | Назначение |
 | --- | --- | --- |
-| `POST` | `/api/v1/books` | создать заказ, `202` + `taskId` |
-| `GET` | `/api/v1/books` | список заказов |
-| `GET` | `/api/v1/books/:id` | полное состояние заказа |
-| `GET` | `/api/v1/books/:id/status` | краткий статус и прогресс |
-| `GET` | `/api/v1/books/:id/files` | список готовых файлов |
-| `GET` | `/api/v1/books/:id/files/:filename` | скачать файл |
-| `POST` | `/api/v1/personalize` | face-swap на ML-сервисе, `202` + `taskId` |
+| `POST` | `/api/v1/covers` | создать заказ обложки, `202` + `taskId` |
+| `GET` | `/api/v1/covers` | список заказов |
+| `GET` | `/api/v1/covers/:id` | полное состояние заказа |
+| `GET` | `/api/v1/covers/:id/status` | краткий статус и прогресс |
+| `GET` | `/api/v1/covers/:id/files` | список готовых файлов |
+| `GET` | `/api/v1/covers/:id/files/:filename` | скачать файл |
+| `POST` | `/api/v1/personalize` | разовый face-swap без заказа, `202` + `taskId` |
 | `GET` | `/api/v1/tasks/:id` | полное состояние задачи |
 | `GET` | `/api/v1/tasks/:id/status` | краткий статус задачи (для опроса) |
 | `GET` | `/api/v1/health` | liveness |
-| `GET` | `/api/v1/health/ready` | readiness + доступность моделей |
+| `GET` | `/api/v1/health/ready` | readiness + доступность ML-сервиса |
 | `GET` | `/api/v1/stats` | состояние очереди |
 
 Пример заказа:
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/books \
+curl -X POST http://localhost:3000/api/v1/covers \
   -H 'content-type: application/json' \
   -d '{
     "title": "Путешествие к звёздам",
-    "chapterCount": 5,
-    "recipient": { "name": "Аня", "age": 8, "interests": ["космос", "динозавры"] },
-    "output": { "formats": ["md", "html"] }
+    "source": "uploads/face.jpg",
+    "target": "uploads/cover.png",
+    "options": { "enhance": true, "style_strength": 1.0, "art_style": "watercolor" }
   }'
-# → 202 { "id": "book_…", "taskId": "task_…", "status": "pending",
+# → 202 { "id": "cover_…", "taskId": "task_…", "status": "pending",
 #         "statusUrl": "/api/v1/tasks/task_…/status" }
 ```
 
+`source` — фото с лицом, `target` — обложка. Оба поля это ссылки на файлы под
+`STORAGE_ROOT` (выход за его пределы отклоняется). `options` уходят в ML-сервис
+как есть. Готовая обложка ложится в артефакты заказа:
+`GET /api/v1/covers/:id/files/cover.png`.
+
+### Два входа, одна работа
+
+`POST /covers` и `POST /personalize` делают одно и то же — замену лица; общий код
+живёт в `faceSwapService.js`. Разница в учёте:
+
+| | `/covers` | `/personalize` |
+| --- | --- | --- |
+| Доменный заказ в БД | да (`cover_…`, статус, прогресс, история) | нет |
+| Результат | артефакт заказа | артефакт задачи |
+| Когда | обычный путь: заказ надо потом найти и отдать | разовый прогон, отладка |
+
 ## Асинхронная очередь задач
 
-Сервис **никогда не держит клиента на долгой операции**: тяжёлая работа
-(генерация книги, face-swap на Python ML-сервисе) уходит в фоновую задачу, а
-API сразу отвечает `202 Accepted` + `taskId`. Клиент опрашивает
-`GET /tasks/:id/status`.
+Сервис **никогда не держит клиента на долгой операции**: face-swap на Python
+ML-сервисе уходит в фоновую задачу, а API сразу отвечает `202 Accepted` +
+`taskId`. Клиент опрашивает `GET /tasks/:id/status`.
 
 ### Драйверы
 
@@ -143,9 +149,8 @@ API сразу отвечает `202 Accepted` + `taskId`. Клиент опра
 | `memory` (по умолчанию) | один узел, разработка | in-process, без инфраструктуры; параллелизм, повторы с экспоненциальным backoff. Очередь теряется при перезапуске |
 | `redis` (BullMQ) | автономность, большие нагрузки | задачи переживают перезапуск; воркеры масштабируются **отдельно** от API. `bullmq`/`ioredis` подгружаются лениво |
 
-Тот же приём, что у ИИ-провайдеров и хранилища: контракт один, реализации
-подключаются конфигом. Перейти на Redis — это `QUEUE_DRIVER=redis` без правок
-кода.
+Тот же приём, что у хранилища: контракт один, реализации подключаются конфигом.
+Перейти на Redis — это `QUEUE_DRIVER=redis` без правок кода.
 
 ### Разделение ролей и масштабирование
 
@@ -173,7 +178,8 @@ QUEUE_DRIVER=redis npm run worker                  # масштабируетс�
 
 ### Обращение к ML-сервису — в фоне
 
-`POST /api/v1/personalize` ставит задачу `ml.faceSwap` и сразу отвечает `202`.
+`POST /api/v1/personalize` ставит задачу `ml.faceSwap` и сразу отвечает `202`
+(заказ обложки ставит `cover.faceSwap` — та же работа, но с записью в БД).
 Долгий вызов Python-сервиса (диффузия — минуты) идёт в воркере: его таймаут
 (`ML_FACE_SWAP_TIMEOUT_MS`) ждёт воркер, а не HTTP-клиент.
 
@@ -185,8 +191,7 @@ curl -X POST http://localhost:3000/api/v1/personalize \
 # → 202 { "taskId": "task_…", "status": "pending" }
 ```
 
-Пути `source`/`target` — ссылки на файлы под `STORAGE_ROOT` (выход за его
-пределы отклоняется). Результат сохраняется в артефакты задачи.
+Результат сохраняется в артефакты задачи.
 
 ### Надёжность
 
@@ -200,7 +205,7 @@ curl -X POST http://localhost:3000/api/v1/personalize \
 
 ## Хранилище заказов
 
-Состояние заказов скрыто за контрактом драйвера (`src/storage/bookRepository.js`),
+Состояние заказов скрыто за контрактом драйвера (`src/storage/coverRepository.js`),
 драйвер выбирается `DB_DRIVER`:
 
 | Драйвер | Когда | Свойства |
@@ -208,8 +213,8 @@ curl -X POST http://localhost:3000/api/v1/personalize \
 | `memory` (по умолчанию) | один узел, разработка | in-process (Map); теряется при перезапуске, не разделяется между процессами |
 | `postgres` | полная автономность | общее состояние между процессами API и воркеров, переживает перезапуск |
 
-Заказ — вложенный документ (спецификация, оглавление, главы, артефакты),
-поэтому целиком лежит в колонке `data` (`jsonb`), а `id`/`status`/`created_at`
+Заказ — вложенный документ (спецификация, результат, артефакты), поэтому
+целиком лежит в колонке `data` (`jsonb`), а `id`/`status`/`created_at`
 продублированы отдельными колонками под выборки и сортировку — без ORM и
 миграций. Схема создаётся на старте (`CREATE TABLE IF NOT EXISTS`).
 
@@ -258,7 +263,7 @@ DB_DRIVER=postgres DATABASE_URL=postgres://user:pass@host:5432/projectx npm star
 JSON, что и в файле. Формат записи общий с ml-service:
 
 ```json
-{"level":"info","time":"2026-07-23T03:49:04.385Z","service":"book-service",
+{"level":"info","time":"2026-07-23T03:49:04.385Z","service":"cover-service",
  "request_id":"trace-e2e-1784778544","res":{"status_code":200},
  "message":"GET /health/ready → 200"}
 ```
@@ -272,8 +277,8 @@ JSON, что и в файле. Формат записи общий с ml-servic
 
 - Некорректный входящий id (не `[A-Za-z0-9_.:-]{8,128}`) заменяется на свой —
   иначе переносы строк в заголовке ломали бы построчный разбор логов.
-- `bindContext()` переносит трассу в фоновую задачу генерации: она переживает
-  HTTP-ответ, но её логи остаются в той же трассе.
+- `bindContext()` переносит трассу в фоновую задачу: она переживает HTTP-ответ,
+  но её логи остаются в той же трассе.
 - `src/services/mlClient.js` пробрасывает id в ML-сервис, поэтому одна цепочка
   видна в логах обоих сервисов:
 
@@ -281,31 +286,22 @@ JSON, что и в файле. Формат записи общий с ml-servic
 grep -h "$TRACE" logs/app.*.log ml-service/logs/app.log
 ```
 
-## Архитектура ИИ-слоя
+## Где живут модели
 
-Доменный код никогда не обращается к модели напрямую — только к контракту
-`BaseTextProvider` / `BaseImageProvider`. Провайдер выбирается в `registry.js` по
-переменным `AI_TEXT_PROVIDER` / `AI_IMAGE_PROVIDER`.
+В Node-части моделей нет вообще: она не грузит веса и ничего не генерирует.
+Единственная точка выхода наружу — `src/services/mlClient.js`, который ходит в
+Python ML-сервис по HTTP и пробрасывает `X-Request-ID`. Всё, что касается
+детекции лиц, свапа, апскейла и стилизации, настраивается на стороне
+`ml-service/` (см. его README и `ml-service/.env.example`).
 
-Добавление своей локальной модели:
-
-```js
-import { BaseTextProvider } from './src/ai/providers/BaseTextProvider.js';
-import { registerTextProvider } from './src/ai/registry.js';
-
-class VllmProvider extends BaseTextProvider {
-  async generate({ prompt }) { /* ... */ }
-  async healthCheck() { return true; }
-}
-
-registerTextProvider('vllm', VllmProvider);
-```
+Практическое следствие: заменить модель свапа или добавить стиль — правка в
+Python-сервисе, Node пересобирать не нужно. Обратное тоже верно — очередь,
+хранилище и трассировка ничего не знают про ML, кроме таймаута.
 
 ## Что осознанно оставлено заглушками
 
-- Рендеры `pdf` и `epub` пока не реализованы — формат тихо пропускается с записью в лог.
-- Приём файлов для `/personalize` — по ссылкам под `STORAGE_ROOT`; загрузка
-  multipart (upload) не реализована.
+- Приём файлов — по ссылкам под `STORAGE_ROOT`; загрузка multipart (upload) не
+  реализована, файлы кладутся в хранилище вне сервиса.
 - Файловые артефакты (`storage/output/`) — на локальном диске; при нескольких
   узлах их выносят в общий том или объектное хранилище (S3).
 - Аутентификации и rate limiting нет.

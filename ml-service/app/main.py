@@ -49,7 +49,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="projectx ML Service",
-    description="Face-swap и вспомогательные ML-операции для сервиса генерации книг",
+    description="Face-swap и вспомогательные ML-операции для сервиса персонализации обложек",
     version=__version__,
     lifespan=lifespan,
 )

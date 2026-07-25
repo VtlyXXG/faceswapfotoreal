@@ -10,7 +10,7 @@ export const notFoundHandler = (req, res) => {
 export const errorHandler = (err, req, res, next) => {
   if (err instanceof ZodError) {
     return res.status(422).json({
-      error: { code: 'VALIDATION_ERROR', message: 'Некорректная спецификация книги', details: err.issues },
+      error: { code: 'VALIDATION_ERROR', message: 'Некорректная спецификация заказа', details: err.issues },
     });
   }
 

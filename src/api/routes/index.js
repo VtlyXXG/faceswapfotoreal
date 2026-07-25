@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { bookRoutes } from './bookRoutes.js';
+import { coverRoutes } from './coverRoutes.js';
 import { taskRoutes } from './taskRoutes.js';
 import * as health from '../controllers/healthController.js';
 import * as tasks from '../controllers/taskController.js';
@@ -11,7 +11,7 @@ apiRoutes.get('/health', health.liveness);
 apiRoutes.get('/health/ready', asyncHandler(health.readiness));
 apiRoutes.get('/stats', asyncHandler(health.stats));
 
-apiRoutes.use('/books', bookRoutes);
+apiRoutes.use('/covers', coverRoutes);
 apiRoutes.use('/tasks', taskRoutes);
 apiRoutes.post('/personalize', asyncHandler(tasks.createPersonalize));
 

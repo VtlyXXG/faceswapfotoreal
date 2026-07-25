@@ -3,9 +3,9 @@ import { NotFoundError } from '../../utils/errors.js';
 /**
  * In-process хранилище заказов (Map). По умолчанию — для одного узла и
  * разработки. Состояние теряется при перезапуске и не разделяется между
- * процессами: для полной автономности используется postgresBookStore.
+ * процессами: для полной автономности используется postgresCoverStore.
  */
-export class MemoryBookStore {
+export class MemoryCoverStore {
   #jobs = new Map();
 
   async save(job) {
@@ -46,4 +46,4 @@ export class MemoryBookStore {
   async close() {}
 }
 
-export default MemoryBookStore;
+export default MemoryCoverStore;

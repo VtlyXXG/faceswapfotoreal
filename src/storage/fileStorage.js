@@ -6,7 +6,7 @@ const OUTPUT_DIR = path.join(config.storage.root, 'output');
 
 const jobDir = (jobId) => path.join(OUTPUT_DIR, jobId);
 
-/** Сохраняет артефакт генерации (текст, изображение, готовый файл книги). */
+/** Сохраняет артефакт заказа (готовая обложка). */
 export const saveArtifact = async (jobId, filename, data) => {
   const dir = jobDir(jobId);
   await fs.mkdir(dir, { recursive: true });

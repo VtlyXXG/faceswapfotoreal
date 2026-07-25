@@ -1,9 +1,9 @@
 {
-  "name": "projectx-book-service",
+  "name": "projectx-cover-service",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Сервис генерации кастомизированных книг с использованием локальных ИИ-моделей",
+  "description": "Сервис персонализации обложек: замена лица на локальном ML-сервисе",
   "main": "src/server.js",
   "engines": {
     "node": ">=20.0.0"

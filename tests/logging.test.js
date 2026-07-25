@@ -5,6 +5,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { createApp } from '../src/app.js';
 import { config } from '../src/config/index.js';
+import { initCoverStore, closeCoverStore } from '../src/storage/coverRepository.js';
 import { latestLogFile } from '../src/utils/logger.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 200));
@@ -33,12 +34,19 @@ describe('структурированное логирование', () => {
   let baseUrl;
 
   before(async () => {
+    // Тест ниже дёргает /covers/:id, а значит и хранилище: с DB_DRIVER=postgres
+    // таблицы может ещё не быть, и вместо ожидаемого 404 вернулась бы 500
+    await initCoverStore();
     server = createApp().listen(0);
     await new Promise((resolve) => server.once('listening', resolve));
     baseUrl = `http://127.0.0.1:${server.address().port}`;
   });
 
-  after(() => server.close());
+  // Пул pg — открытый хендл: без закрытия процесс не завершится после тестов
+  after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await closeCoverStore();
+  });
 
   test('входящий X-Request-ID возвращается и попадает в лог', async () => {
     const activeFile = latestLogFile();
@@ -55,7 +63,7 @@ describe('структурированное логирование', () => {
     const entry = lines.find((l) => l.request_id === incoming);
 
     assert.ok(entry, 'запись с request_id не найдена в файле лога');
-    assert.equal(entry.service, 'book-service');
+    assert.equal(entry.service, 'cover-service');
     assert.equal(entry.level, 'info');
     assert.ok(entry.time.endsWith('Z'));
     assert.equal(entry.res.status_code, 200);
@@ -81,7 +89,7 @@ describe('структурированное логирование', () => {
     const errorFile = latestLogFile(config.logger.errorFile);
     const before = errorFile ? sizeOf(errorFile) : 0;
 
-    await fetch(`${baseUrl}/api/v1/books/does-not-exist`);
+    await fetch(`${baseUrl}/api/v1/covers/does-not-exist`);
     await flush();
 
     const after = latestLogFile(config.logger.errorFile);

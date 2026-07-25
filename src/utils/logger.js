@@ -56,7 +56,7 @@ const streams = [
 export const logger = pino(
   {
     level: config.logger.level,
-    base: { service: 'book-service', pid: process.pid },
+    base: { service: 'cover-service', pid: process.pid },
     messageKey: 'message',
     timestamp: pino.stdTimeFunctions.isoTime,
     // Уровень словом, а не числом — так логи читаются одинаково с ml-service

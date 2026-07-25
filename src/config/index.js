@@ -6,11 +6,6 @@ const int = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
-const float = (value, fallback) => {
-  const parsed = Number.parseFloat(value ?? '');
-  return Number.isFinite(parsed) ? parsed : fallback;
-};
-
 const bool = (value, fallback) => {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
@@ -60,7 +55,7 @@ export const config = {
     driver: process.env.DB_DRIVER ?? 'memory',
     postgres: {
       url: process.env.DATABASE_URL ?? 'postgres://127.0.0.1:5432/projectx',
-      table: process.env.DB_TABLE ?? 'books',
+      table: process.env.DB_TABLE ?? 'covers',
       ssl: (process.env.DB_SSL ?? 'false') === 'true',
     },
   },
@@ -78,25 +73,6 @@ export const config = {
       url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
       prefix: process.env.QUEUE_PREFIX ?? 'projectx',
       queue: process.env.QUEUE_NAME ?? 'tasks',
-    },
-  },
-
-  ai: {
-    text: {
-      provider: process.env.AI_TEXT_PROVIDER ?? 'mock',
-      baseUrl: process.env.AI_TEXT_BASE_URL ?? 'http://127.0.0.1:8080',
-      model: process.env.AI_TEXT_MODEL ?? 'local-model',
-      timeoutMs: int(process.env.AI_TEXT_TIMEOUT_MS, 120_000),
-      maxTokens: int(process.env.AI_TEXT_MAX_TOKENS, 2048),
-      temperature: float(process.env.AI_TEXT_TEMPERATURE, 0.8),
-    },
-    image: {
-      provider: process.env.AI_IMAGE_PROVIDER ?? 'mock',
-      baseUrl: process.env.AI_IMAGE_BASE_URL ?? 'http://127.0.0.1:7860',
-      model: process.env.AI_IMAGE_MODEL ?? 'sd-xl-base-1.0',
-      timeoutMs: int(process.env.AI_IMAGE_TIMEOUT_MS, 180_000),
-      width: int(process.env.AI_IMAGE_WIDTH, 1024),
-      height: int(process.env.AI_IMAGE_HEIGHT, 1024),
     },
   },
 };

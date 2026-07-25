@@ -3,12 +3,12 @@
  *
  *   DB_DRIVER=postgres QUEUE_DRIVER=redis node scripts/check-infra.mjs
  *
- * Гоняет PostgresBookStore (полный контракт хранилища заказов) и BullMqDriver
+ * Гоняет PostgresCoverStore (полный контракт хранилища заказов) и BullMqDriver
  * (жизненный цикл задачи, повторы, stats) против баз из docker-compose.
  * Печатает PASS/FAIL по шагам и завершается ненулевым кодом при ошибке.
  */
 import { config } from '../src/config/index.js';
-import { PostgresBookStore } from '../src/storage/drivers/postgresBookStore.js';
+import { PostgresCoverStore } from '../src/storage/drivers/postgresCoverStore.js';
 import { BullMqDriver } from '../src/queue/drivers/bullmqDriver.js';
 import { createTask, TaskStatus } from '../src/queue/task.js';
 
@@ -34,25 +34,25 @@ const sampleJob = (id, createdAt) => ({
   taskId: `task_${id}`,
   status: 'pending',
   progress: 0,
-  spec: { chapterCount: 3, recipient: { name: 'Аня' } },
-  chapters: [],
+  spec: { source: 'uploads/face.jpg', target: 'uploads/cover.png', options: {} },
+  result: null,
   createdAt,
   updatedAt: createdAt,
 });
 
 async function checkPostgres() {
   console.log(`\n== PostgreSQL (${config.db.postgres.url}) ==`);
-  const store = new PostgresBookStore(config.db.postgres);
+  const store = new PostgresCoverStore(config.db.postgres);
 
   await store.init();
   check('init(): CREATE TABLE/INDEX', true);
   await store.clear();
 
-  const saved = await store.save(sampleJob('book_pg_1', '2026-07-24T10:00:00.000Z'));
-  check('save() вернул документ', saved.id === 'book_pg_1');
+  const saved = await store.save(sampleJob('cover_pg_1', '2026-07-24T10:00:00.000Z'));
+  check('save() вернул документ', saved.id === 'cover_pg_1');
 
-  const found = await store.findById('book_pg_1');
-  check('findById() маппит jsonb → объект', found?.spec?.recipient?.name === 'Аня');
+  const found = await store.findById('cover_pg_1');
+  check('findById() маппит jsonb → объект', found?.spec?.target === 'uploads/cover.png');
   check('findById() отсутствующего → null', (await store.findById('нет')) === null);
 
   let threw = false;
@@ -63,16 +63,16 @@ async function checkPostgres() {
   }
   check('getById() отсутствующего → NotFoundError', threw);
 
-  const updated = await store.update('book_pg_1', { status: 'completed', progress: 100 });
-  const reread = await store.findById('book_pg_1');
+  const updated = await store.update('cover_pg_1', { status: 'completed', progress: 100 });
+  const reread = await store.findById('cover_pg_1');
   check('update() смержил и сохранил', updated.status === 'completed' && reread.progress === 100);
 
-  await store.save(sampleJob('book_pg_2', '2026-07-24T12:00:00.000Z'));
-  await store.save(sampleJob('book_pg_3', '2026-07-24T11:00:00.000Z'));
+  await store.save(sampleJob('cover_pg_2', '2026-07-24T12:00:00.000Z'));
+  await store.save(sampleJob('cover_pg_3', '2026-07-24T11:00:00.000Z'));
   const page = await store.list({ limit: 2, offset: 0 });
   check(
     'list() сортирует по created_at DESC',
-    page.length === 2 && page[0].id === 'book_pg_2' && page[1].id === 'book_pg_3',
+    page.length === 2 && page[0].id === 'cover_pg_2' && page[1].id === 'cover_pg_3',
   );
 
   await store.clear();
