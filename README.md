@@ -1,7 +1,7 @@
 # projectx — сервис генерации кастомизированных книг
 
 Node.js (ESM) + Express. Текст и иллюстрации генерируются **локальными** моделями
-(Ollama / llama.cpp / Stable Diffusion WebUI) через слой абстракции — внешние API не используются.
+(llama.cpp / Stable Diffusion WebUI) через слой абстракции — внешние API не используются.
 
 ## Быстрый старт
 
@@ -11,13 +11,14 @@ npm install
 npm run dev
 ```
 
-Без запущенной модели поставьте `AI_TEXT_PROVIDER=mock` — весь пайплайн отработает на заглушках.
+По умолчанию `AI_TEXT_PROVIDER=mock` — весь пайплайн отрабатывает на заглушках,
+никакие модели поднимать не нужно.
 
-С Ollama:
+С llama.cpp (OpenAI-совместимый сервер):
 
 ```bash
-ollama serve
-ollama pull llama3.1:8b
+llama-server --host 127.0.0.1 --port 8080 -m model.gguf
+# AI_TEXT_PROVIDER=llamacpp AI_TEXT_BASE_URL=http://127.0.0.1:8080
 ```
 
 ### Локальная инфраструктура (Postgres + Redis)
@@ -35,27 +36,28 @@ npm start                             # API + воркер против Postgres
 (полный контракт хранилища) и `BullMqDriver` (жизненный цикл задачи, повторы,
 stats) против контейнеров и печатает PASS/FAIL по шагам.
 
-Полный стек (сборка образов + все сервисы, включая ollama):
+Полный стек (сборка образов + все сервисы):
 
 ```bash
-docker compose up -d --build                       # ollama — реальный провайдер
-AI_TEXT_PROVIDER=mock docker compose up -d --build # демо без модели (мок-текст)
+docker compose up -d --build                        # api, worker, postgres, redis
+docker compose up -d --scale worker=3               # три воркера
 ```
 
 `api` и `worker` — один образ, разные команды; оба ждут healthcheck
 `postgres`/`redis`. Провайдер ИИ переопределяется из окружения
-(`AI_TEXT_PROVIDER`), поэтому стек поднимается и без скачанной модели.
+(`AI_TEXT_PROVIDER`, по умолчанию `mock`).
 
-Воркер масштабируется независимо: `docker compose up -d --scale worker=3`.
-BullMQ раздаёт задачи между всеми процессами (api тоже обрабатывает) через
-Redis, состояние заказов общее в Postgres, артефакты — на общем томе.
+**Роли жёстко разделены:** контейнер `api` поднимается с `WORKER_IN_API=false`
+и только принимает запросы, отдавая `202`. Все задачи выполняют контейнеры
+`worker` — их и масштабируют под нагрузку. Состояние заказов общее в Postgres,
+очередь в Redis, артефакты — на общем томе.
 
 ## Структура
 
 ```
 src/
   ai/                   слой ИИ — единственное место, знающее про модели
-    providers/          реализации: Ollama, llama.cpp, Automatic1111, mock
+    providers/          реализации: llama.cpp, Automatic1111, mock
       BaseTextProvider.js    контракт: generate() / stream() / healthCheck()
       BaseImageProvider.js
     prompts/            шаблоны промптов (версионируемые артефакты)
@@ -87,7 +89,7 @@ src/
     errors.js, id.js
   config/index.js       вся конфигурация из ENV в одном месте
   app.js                сборка Express-приложения
-  server.js             API + воркер в одном процессе (memory)
+  server.js             API; воркер в этом же процессе — только при WORKER_IN_API=true
   worker.js             автономный воркер (для QUEUE_DRIVER=redis)
 tests/                  node:test
 ```
@@ -145,16 +147,29 @@ API сразу отвечает `202 Accepted` + `taskId`. Клиент опра
 подключаются конфигом. Перейти на Redis — это `QUEUE_DRIVER=redis` без правок
 кода.
 
-### Масштабирование
+### Разделение ролей и масштабирование
+
+`WORKER_IN_API` определяет, выполняет ли процесс API задачи:
+
+| Значение | Поведение |
+| --- | --- |
+| `true` (по умолчанию) | API сам обрабатывает задачи — удобно в разработке: `npm start` делает всё |
+| `false` | **Жёсткое разделение:** API только принимает запросы и отдаёт `202`, ни одна задача в его процессе не выполняется |
 
 ```bash
-QUEUE_DRIVER=redis npm start      # приём запросов (можно несколько инстансов за LB)
-QUEUE_DRIVER=redis npm run worker # выполнение задач (масштабируется отдельно)
+# Продакшен: приём и выполнение — разные процессы
+QUEUE_DRIVER=redis WORKER_IN_API=false npm start   # несколько инстансов за LB
+QUEUE_DRIVER=redis npm run worker                  # масштабируется отдельно
 ```
 
-С `memory` API и воркер живут в одном процессе (`npm start`), отдельный воркер
-не нужен. С `redis` API только ставит задачи, а `npm run worker` их выполняет —
-столько воркеров, сколько нужно под нагрузку.
+Гарантия не декларативная: воркер запускается только явным `startWorker()`, а
+драйвер `memory` без него задачи не разбирает — они остаются `pending`. Поэтому
+`WORKER_IN_API=false` не может «случайно» обработать задачу inline.
+
+Отсюда следствие: `WORKER_IN_API=false` осмысленно только с
+`QUEUE_DRIVER=redis` — у процессов с `memory` очередь своя, и отдельный воркер
+до задач API не доберётся. Такую конфигурацию сервис принимает, но пишет
+предупреждение при старте.
 
 ### Обращение к ML-сервису — в фоне
 

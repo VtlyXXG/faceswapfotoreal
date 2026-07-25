@@ -1,7 +1,6 @@
 import { config } from '../config/index.js';
 import { AppError } from '../utils/errors.js';
 import { createLogger } from '../utils/logger.js';
-import { OllamaTextProvider } from './providers/OllamaTextProvider.js';
 import { LlamaCppTextProvider } from './providers/LlamaCppTextProvider.js';
 import { MockTextProvider } from './providers/MockTextProvider.js';
 import { Automatic1111ImageProvider } from './providers/Automatic1111ImageProvider.js';
@@ -10,7 +9,6 @@ import { MockImageProvider } from './providers/MockImageProvider.js';
 const log = createLogger('ai:registry');
 
 const TEXT_PROVIDERS = {
-  ollama: OllamaTextProvider,
   llamacpp: LlamaCppTextProvider,
   mock: MockTextProvider,
 };

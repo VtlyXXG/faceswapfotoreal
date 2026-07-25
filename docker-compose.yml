@@ -1,21 +1,22 @@
 services:
+  # API: только принимает запросы и отдаёт 202. Воркер внутри этого процесса
+  # запрещён (WORKER_IN_API=false) — задачи выполняет сервис worker.
   api:
     build: .
     ports:
       - '3000:3000'
     environment:
-      # ИИ-провайдер переопределяется из окружения: по умолчанию ollama,
-      # для демо без модели — AI_TEXT_PROVIDER=mock docker compose up
-      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-ollama}
+      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-mock}
       AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
-      AI_TEXT_BASE_URL: http://ollama:11434
-      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-llama3.1:8b}
+      AI_TEXT_BASE_URL: ${AI_TEXT_BASE_URL:-http://host.docker.internal:8080}
+      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-local-model}
       STORAGE_ROOT: /data
       # Полная автономность: заказы в Postgres, задачи в Redis
       DB_DRIVER: postgres
       DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
       QUEUE_DRIVER: redis
       REDIS_URL: redis://redis:6379
+      WORKER_IN_API: 'false'
       ML_SERVICE_URL: http://ml-service:8000
     volumes:
       - book-output:/data
@@ -24,24 +25,22 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      ollama:
-        condition: service_started
 
-  # Воркер: те же образ и переменные, но выполняет задачи, а не принимает HTTP.
-  # Масштабируется независимо: docker compose up --scale worker=3
+  # Воркер: тот же образ, но выполняет задачи и не принимает HTTP.
+  # Масштабируется независимо: docker compose up -d --scale worker=3
   worker:
     build: .
     command: ['node', 'src/worker.js']
     environment:
+      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-mock}
+      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
+      AI_TEXT_BASE_URL: ${AI_TEXT_BASE_URL:-http://host.docker.internal:8080}
+      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-local-model}
       STORAGE_ROOT: /data
       DB_DRIVER: postgres
       DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
       QUEUE_DRIVER: redis
       REDIS_URL: redis://redis:6379
-      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-ollama}
-      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
-      AI_TEXT_BASE_URL: http://ollama:11434
-      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-llama3.1:8b}
       ML_SERVICE_URL: http://ml-service:8000
     volumes:
       - book-output:/data
@@ -79,23 +78,7 @@ services:
       timeout: 3s
       retries: 10
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - '11434:11434'
-    volumes:
-      - ollama-models:/root/.ollama
-    # Для GPU раскомментируйте (нужен nvidia-container-toolkit):
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-
 volumes:
   book-output:
   postgres-data:
   redis-data:
-  ollama-models:

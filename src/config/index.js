@@ -11,6 +11,11 @@ const float = (value, fallback) => {
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
+const bool = (value, fallback) => {
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).toLowerCase());
+};
+
 export const config = {
   env: process.env.NODE_ENV ?? 'development',
   isProduction: process.env.NODE_ENV === 'production',
@@ -63,6 +68,9 @@ export const config = {
   queue: {
     // memory — in-process, без инфраструктуры; redis — BullMQ, durable/распределённо
     driver: process.env.QUEUE_DRIVER ?? 'memory',
+    // Выполняет ли процесс API задачи. false — жёсткое разделение ролей:
+    // API только принимает запросы и отдаёт 202, работу делают воркеры
+    workerInApi: bool(process.env.WORKER_IN_API, true),
     concurrency: int(process.env.QUEUE_CONCURRENCY, 2),
     maxAttempts: int(process.env.QUEUE_MAX_ATTEMPTS, 3),
     backoffMs: int(process.env.QUEUE_BACKOFF_MS, 2000),
@@ -76,8 +84,8 @@ export const config = {
   ai: {
     text: {
       provider: process.env.AI_TEXT_PROVIDER ?? 'mock',
-      baseUrl: process.env.AI_TEXT_BASE_URL ?? 'http://127.0.0.1:11434',
-      model: process.env.AI_TEXT_MODEL ?? 'llama3.1:8b',
+      baseUrl: process.env.AI_TEXT_BASE_URL ?? 'http://127.0.0.1:8080',
+      model: process.env.AI_TEXT_MODEL ?? 'local-model',
       timeoutMs: int(process.env.AI_TEXT_TIMEOUT_MS, 120_000),
       maxTokens: int(process.env.AI_TEXT_MAX_TOKENS, 2048),
       temperature: float(process.env.AI_TEXT_TEMPERATURE, 0.8),

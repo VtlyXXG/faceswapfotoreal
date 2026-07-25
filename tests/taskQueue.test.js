@@ -36,9 +36,11 @@ describe('memory-драйвер', () => {
 
   afterEach(() => driver?.close());
 
+  /** Драйвер с поднятым воркером — процесс, который выполняет задачи. */
   const run = (handlers) => {
     driver = new MemoryDriver({ concurrency: 2, backoffMs: 10 });
     driver.setHandlers(new Map(Object.entries(handlers)));
+    driver.startWorker();
     return driver;
   };
 
@@ -153,7 +155,58 @@ describe('memory-драйвер', () => {
 
     const stats = await d.stats();
     assert.equal(stats.driver, 'memory');
+    assert.equal(stats.worker, true);
     assert.equal(stats.concurrency, 2);
     assert.equal(stats.byStatus[TaskStatus.COMPLETED], 1);
+  });
+});
+
+describe('разделение ролей: процесс без воркера', () => {
+  let driver;
+
+  afterEach(() => driver?.close());
+
+  test('без startWorker задача принимается, но не выполняется', async () => {
+    let executed = false;
+    driver = new MemoryDriver({ concurrency: 2, backoffMs: 10 });
+    driver.setHandlers(
+      new Map([
+        [
+          'echo',
+          async () => {
+            executed = true;
+            return 'ok';
+          },
+        ],
+      ]),
+    );
+
+    const task = createTask('echo', {});
+    await driver.add(task);
+    await settle(80);
+
+    // Это гарантия WORKER_IN_API=false: процесс API принимает задачу (202),
+    // но сам её не выполняет
+    assert.equal(executed, false, 'обработчик не должен вызываться без воркера');
+    assert.equal((await driver.get(task.id)).status, TaskStatus.PENDING);
+
+    const stats = await driver.stats();
+    assert.equal(stats.worker, false);
+    assert.equal(stats.pending, 1);
+  });
+
+  test('startWorker разбирает накопленную очередь', async () => {
+    driver = new MemoryDriver({ concurrency: 2, backoffMs: 10 });
+    driver.setHandlers(new Map([['echo', async () => 'ok']]));
+
+    const task = createTask('echo', {});
+    await driver.add(task);
+    await settle(30);
+    assert.equal((await driver.get(task.id)).status, TaskStatus.PENDING);
+
+    await driver.startWorker();
+    await waitFor(async () => (await driver.get(task.id)).status === TaskStatus.COMPLETED);
+
+    assert.equal((await driver.get(task.id)).result, 'ok');
   });
 });

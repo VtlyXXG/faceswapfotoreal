@@ -6,6 +6,7 @@ import { MockImageProvider } from '../src/ai/providers/MockImageProvider.js';
 import { bookRepository } from '../src/storage/bookRepository.js';
 import { JobStatus } from '../src/domain/book.js';
 import { createBook, getBook } from '../src/services/bookService.js';
+import { startWorker } from '../src/queue/taskQueue.js';
 
 /** Провайдер, отдающий валидную структуру и короткие главы. */
 class StubTextProvider extends BaseTextProvider {
@@ -41,6 +42,8 @@ describe('пайплайн генерации', () => {
     resetProviders();
     registerTextProvider(process.env.AI_TEXT_PROVIDER ?? 'mock', StubTextProvider);
     registerImageProvider(process.env.AI_IMAGE_PROVIDER ?? 'mock', MockImageProvider);
+    // Тест играет роль процесса-воркера: без него задачи только копятся
+    await startWorker();
   });
 
   test('заказ доходит до статуса completed', async () => {

@@ -17,6 +17,7 @@ export class MemoryDriver {
   #active = 0;
   #timers = new Set();
   #handlers = new Map();
+  #workerStarted = false;
 
   constructor({ concurrency = 2, backoffMs = 2000 } = {}) {
     this.concurrency = Math.max(1, concurrency);
@@ -30,6 +31,9 @@ export class MemoryDriver {
   async add(task) {
     this.#tasks.set(task.id, task);
     this.#pending.push(task.id);
+    // Задачи выполняются только если в этом процессе поднят воркер. Иначе они
+    // копятся в pending — так WORKER_IN_API=false гарантирует, что процесс API
+    // ничего не выполняет, а не «случайно» обрабатывает задачи inline
     this.#drain();
     return task;
   }
@@ -39,6 +43,7 @@ export class MemoryDriver {
   }
 
   #drain() {
+    if (!this.#workerStarted) return;
     while (this.#active < this.concurrency && this.#pending.length > 0) {
       const id = this.#pending.shift();
       this.#active += 1;
@@ -126,6 +131,7 @@ export class MemoryDriver {
     }
     return {
       driver: 'memory',
+      worker: this.#workerStarted,
       active: this.#active,
       pending: this.#pending.length,
       concurrency: this.concurrency,
@@ -133,8 +139,12 @@ export class MemoryDriver {
     };
   }
 
+  /** Включает обработку задач в этом процессе и разбирает накопленную очередь. */
   async startWorker() {
-    // memory обрабатывает задачи прямо при add() — отдельный воркер не нужен
+    if (this.#workerStarted) return;
+    this.#workerStarted = true;
+    log.info({ concurrency: this.concurrency }, 'memory-воркер запущен');
+    this.#drain();
   }
 
   async close() {

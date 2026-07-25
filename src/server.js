@@ -13,10 +13,21 @@ const start = async () => {
   await ensureStorage();
   await initBookStore();
 
-  // memory-драйвер обрабатывает задачи в этом же процессе. Для redis это
-  // поднимает воркер рядом с API; в проде воркеры выносят в отдельные процессы
-  // (npm run worker) и масштабируют независимо от приёма запросов.
-  await startWorker();
+  // WORKER_IN_API=false — жёсткое разделение ролей: процесс API только
+  // принимает запросы и отдаёт 202, задачи выполняют отдельные воркеры
+  // (npm run worker), масштабируемые независимо.
+  if (config.queue.workerInApi) {
+    await startWorker();
+  } else {
+    logger.info('воркер в процессе API отключён (WORKER_IN_API=false)');
+    if (config.queue.driver !== 'redis') {
+      logger.warn(
+        { driver: config.queue.driver },
+        'воркер отключён при драйвере не-redis: очередь у каждого процесса своя, ' +
+          'задачи никто не выполнит. Нужен QUEUE_DRIVER=redis',
+      );
+    }
+  }
 
   const app = createApp();
   const server = app.listen(config.server.port, config.server.host, async () => {
@@ -25,6 +36,7 @@ const start = async () => {
         url: `http://${config.server.host}:${config.server.port}/api/v1`,
         env: config.env,
         queue: config.queue.driver,
+        workerInApi: config.queue.workerInApi,
       },
       'сервис запущен',
     );

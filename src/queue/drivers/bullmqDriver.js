@@ -152,6 +152,7 @@ export class BullMqDriver {
     );
     return {
       driver: 'redis',
+      worker: this.#worker !== null,
       active: counts.active ?? 0,
       pending: (counts.waiting ?? 0) + (counts.delayed ?? 0),
       concurrency: this.concurrency,
