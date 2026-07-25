@@ -49,6 +49,11 @@ export const config = {
     root: path.resolve(process.cwd(), process.env.STORAGE_ROOT ?? './storage'),
   },
 
+  uploads: {
+    // Держать согласованным с ML_MAX_UPLOAD_MB ML-сервиса
+    limit: process.env.UPLOAD_LIMIT ?? '40mb',
+  },
+
   db: {
     // memory — in-process (по умолчанию); postgres — общее состояние заказов
     // между процессами API и воркеров, переживает перезапуск
@@ -57,6 +62,7 @@ export const config = {
       url: process.env.DATABASE_URL ?? 'postgres://127.0.0.1:5432/projectx',
       table: process.env.DB_TABLE ?? 'covers',
       ssl: (process.env.DB_SSL ?? 'false') === 'true',
+      connectionTimeoutMs: int(process.env.DB_CONNECT_TIMEOUT_MS, 10_000),
     },
   },
 

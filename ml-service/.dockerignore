@@ -1,0 +1,25 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Локальные учётные данные — конфигурация задаётся через окружение в compose
+.env
+
+# Веса монтируются томом, а не копируются в образ
+models/
+
+logs/
+outputs/
+tmp/
+*.log
+
+# bench/samples содержит фотографии лиц — в образ не попадает
+bench/
+
+tests/
+scripts/
+README.md

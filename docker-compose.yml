@@ -21,9 +21,11 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ml-service:
+        condition: service_healthy
 
   # Воркер: тот же образ, но выполняет задачи и не принимает HTTP.
-  # Масштабируется независимо: docker compose up -d --scale worker=3
+  # Три реплики стартуют всегда — ручной --scale не нужен.
   worker:
     build: .
     command: ['node', 'src/worker.js']
@@ -34,6 +36,8 @@ services:
       QUEUE_DRIVER: redis
       REDIS_URL: redis://redis:6379
       ML_SERVICE_URL: http://ml-service:8000
+    deploy:
+      replicas: 3
     volumes:
       - cover-output:/data
     depends_on:
@@ -41,6 +45,30 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ml-service:
+        condition: service_healthy
+
+  # ML-сервис: замена лица. Веса (855 МБ) лежат вне образа и монтируются
+  # с хоста только на чтение — layout models/models/buffalo_l ждёт insightface.
+  ml-service:
+    build: ./ml-service
+    ports:
+      - '8000:8000'
+    environment:
+      ML_ENV: production
+      ML_HOST: 0.0.0.0
+      ML_PORT: '8000'
+      ML_MODELS_DIR: /models
+      ML_LAZY_LOAD: 'true'
+      ML_ALLOWED_ORIGINS: http://localhost:3000
+    volumes:
+      - ./ml-service/models:/models:ro
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
 
   postgres:
     image: postgres:16-alpine

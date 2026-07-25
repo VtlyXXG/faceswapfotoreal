@@ -1,9 +1,15 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import pinoHttp from 'pino-http';
 import { apiRoutes } from './api/routes/index.js';
 import { errorHandler, notFoundHandler } from './api/middleware/errorHandler.js';
 import { requestId } from './api/middleware/requestId.js';
 import { logger } from './utils/logger.js';
+
+// Путь от модуля, а не от cwd: панель должна находиться и в контейнере,
+// и при запуске из произвольного каталога
+const PUBLIC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
 
 export const createApp = () => {
   const app = express();
@@ -33,6 +39,10 @@ export const createApp = () => {
   app.use(express.json({ limit: '1mb' }));
 
   app.use('/api/v1', apiRoutes);
+
+  // Панель локального тестирования: GET / отдаёт public/index.html.
+  // Смонтирована после API, чтобы статика не перехватывала маршруты.
+  app.use(express.static(PUBLIC_DIR));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

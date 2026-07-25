@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>projectx — панель тестирования</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --card: #fff;
+        --line: #dfe3e8;
+        --text: #1c2024;
+        --muted: #6b7280;
+        --accent: #2563eb;
+        --ok: #15803d;
+        --err: #b91c1c;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16181d;
+          --card: #1f2229;
+          --line: #333842;
+          --text: #e8eaed;
+          --muted: #9aa1ad;
+          --accent: #5b8def;
+          --ok: #4ade80;
+          --err: #f87171;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 2rem 1rem;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      main {
+        max-width: 780px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.35rem;
+        margin: 0 0 0.25rem;
+      }
+      .sub {
+        color: var(--muted);
+        margin: 0 0 1.5rem;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+      }
+      label {
+        display: block;
+        font-weight: 600;
+        margin-bottom: 0.35rem;
+      }
+      .hint {
+        font-weight: 400;
+        color: var(--muted);
+        font-size: 0.86rem;
+      }
+      input[type="text"],
+      input[type="file"] {
+        width: 100%;
+        padding: 0.5rem;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+      }
+      @media (max-width: 560px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+      .field {
+        margin-bottom: 1rem;
+      }
+      button {
+        background: var(--accent);
+        color: #fff;
+        border: 0;
+        border-radius: 6px;
+        padding: 0.6rem 1.2rem;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .preview {
+        margin-top: 0.5rem;
+        max-height: 150px;
+        border-radius: 6px;
+        display: none;
+      }
+      #status {
+        display: none;
+      }
+      .bar {
+        height: 6px;
+        background: var(--line);
+        border-radius: 3px;
+        overflow: hidden;
+        margin: 0.6rem 0;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0;
+        background: var(--accent);
+        transition: width 0.3s;
+      }
+      .state {
+        font-variant-numeric: tabular-nums;
+      }
+      .ok {
+        color: var(--ok);
+      }
+      .err {
+        color: var(--err);
+      }
+      pre {
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 0.7rem;
+        overflow-x: auto;
+        font-size: 0.82rem;
+        margin: 0.5rem 0 0;
+      }
+      #result img {
+        max-width: 100%;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Панель тестирования</h1>
+      <p class="sub">Замена лица на обложке: загрузка исходников, заказ и опрос статуса.</p>
+
+      <form class="card" id="form">
+        <div class="field">
+          <label for="title">Название заказа <span class="hint">— необязательно</span></label>
+          <input type="text" id="title" placeholder="Тестовый заказ" maxlength="200" />
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="source">Фото лица <span class="hint">— источник</span></label>
+            <input type="file" id="source" accept="image/png,image/jpeg,image/webp" required />
+            <img class="preview" id="source-preview" alt="" />
+          </div>
+          <div class="field">
+            <label for="target">Обложка <span class="hint">— куда переносим</span></label>
+            <input type="file" id="target" accept="image/png,image/jpeg,image/webp" required />
+            <img class="preview" id="target-preview" alt="" />
+          </div>
+        </div>
+
+        <button type="submit" id="submit">Создать обложку</button>
+      </form>
+
+      <section class="card" id="status">
+        <div class="state" id="state">—</div>
+        <div class="bar"><i id="bar"></i></div>
+        <div id="result"></div>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const POLL_MS = 1500;
+      // Диффузионный стилизатор идёт минутами — потолок с запасом
+      const POLL_LIMIT = 400;
+
+      for (const name of ["source", "target"]) {
+        $(name).addEventListener("change", (e) => {
+          const file = e.target.files[0];
+          const img = $(`${name}-preview`);
+          if (!file) return (img.style.display = "none");
+          img.src = URL.createObjectURL(file);
+          img.style.display = "block";
+        });
+      }
+
+      const log = (message) => {
+        $("log").textContent += `${message}\n`;
+      };
+
+      const setState = (text, cls = "") => {
+        $("state").className = `state ${cls}`;
+        $("state").textContent = text;
+      };
+
+      /** Отдаёт файл сырым телом; сервер возвращает путь внутри STORAGE_ROOT. */
+      const upload = async (file) => {
+        const res = await fetch("/api/v1/uploads", {
+          method: "POST",
+          headers: { "Content-Type": file.type },
+          body: file,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error?.message ?? `Загрузка не удалась (${res.status})`);
+        return data.path;
+      };
+
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      const showResult = (id, filename) => {
+        const url = `/api/v1/covers/${id}/files/${filename}`;
+        $("result").innerHTML =
+          `<p><a href="${url}" target="_blank" rel="noopener">${filename}</a></p>` +
+          `<img src="${url}" alt="Готовая обложка" />`;
+      };
+
+      $("form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        $("submit").disabled = true;
+        $("status").style.display = "block";
+        $("log").textContent = "";
+        $("result").innerHTML = "";
+        $("bar").style.width = "0";
+
+        try {
+          setState("Загрузка исходников…");
+          const [source, target] = await Promise.all([
+            upload($("source").files[0]),
+            upload($("target").files[0]),
+          ]);
+          log(`source → ${source}`);
+          log(`target → ${target}`);
+
+          setState("Создание заказа…");
+          const body = { source, target };
+          if ($("title").value.trim()) body.title = $("title").value.trim();
+
+          const res = await fetch("/api/v1/covers", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          const job = await res.json();
+          if (!res.ok) throw new Error(job.error?.message ?? `Заказ отклонён (${res.status})`);
+          log(`заказ ${job.id} принят (${res.status})`);
+
+          setState("Обработка…");
+          for (let i = 0; i < POLL_LIMIT; i += 1) {
+            await sleep(POLL_MS);
+            const statusRes = await fetch(`/api/v1/covers/${job.id}/status`);
+            const status = await statusRes.json();
+            if (!statusRes.ok) throw new Error(status.error?.message ?? "Статус недоступен");
+
+            $("bar").style.width = `${status.progress ?? 0}%`;
+            setState(`Обработка… ${status.status} ${status.progress ?? 0}%`);
+
+            if (status.status === "completed") {
+              setState("Готово", "ok");
+              $("bar").style.width = "100%";
+              log(JSON.stringify(status, null, 2));
+              showResult(job.id, status.result);
+              return;
+            }
+            if (status.status === "failed") {
+              setState("Ошибка обработки", "err");
+              log(JSON.stringify(status.error, null, 2));
+              return;
+            }
+          }
+          setState("Превышено время ожидания", "err");
+        } catch (err) {
+          setState(err.message, "err");
+        } finally {
+          $("submit").disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

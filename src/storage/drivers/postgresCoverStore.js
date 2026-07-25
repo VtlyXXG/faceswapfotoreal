@@ -21,13 +21,14 @@ export class PostgresCoverStore {
   #pool = null;
   #client = null; // инъекция для тестов
 
-  constructor({ url, table = 'covers', ssl = false, client = null } = {}) {
+  constructor({ url, table = 'covers', ssl = false, connectionTimeoutMs = 10_000, client = null } = {}) {
     if (!SAFE_IDENT.test(table)) {
       throw new Error(`недопустимое имя таблицы: ${table}`);
     }
     this.url = url;
     this.table = table;
     this.ssl = ssl;
+    this.connectionTimeoutMs = connectionTimeoutMs;
     this.#client = client;
   }
 
@@ -37,6 +38,9 @@ export class PostgresCoverStore {
     this.#pool = new pg.Pool({
       connectionString: this.url,
       ssl: this.ssl ? { rejectUnauthorized: false } : undefined,
+      // По умолчанию pg ждёт соединения бесконечно: недоступный Postgres вешает
+      // старт процесса и тесты навсегда, вместо внятной ошибки. Ограничиваем.
+      connectionTimeoutMillis: this.connectionTimeoutMs,
     });
     return this.#pool;
   }
