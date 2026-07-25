@@ -4,9 +4,12 @@ services:
     ports:
       - '3000:3000'
     environment:
-      AI_TEXT_PROVIDER: ollama
+      # ИИ-провайдер переопределяется из окружения: по умолчанию ollama,
+      # для демо без модели — AI_TEXT_PROVIDER=mock docker compose up
+      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-ollama}
+      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
       AI_TEXT_BASE_URL: http://ollama:11434
-      AI_TEXT_MODEL: llama3.1:8b
+      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-llama3.1:8b}
       STORAGE_ROOT: /data
       # Полная автономность: заказы в Postgres, задачи в Redis
       DB_DRIVER: postgres
@@ -35,8 +38,10 @@ services:
       DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
       QUEUE_DRIVER: redis
       REDIS_URL: redis://redis:6379
-      AI_TEXT_PROVIDER: ollama
+      AI_TEXT_PROVIDER: ${AI_TEXT_PROVIDER:-ollama}
+      AI_IMAGE_PROVIDER: ${AI_IMAGE_PROVIDER:-mock}
       AI_TEXT_BASE_URL: http://ollama:11434
+      AI_TEXT_MODEL: ${AI_TEXT_MODEL:-llama3.1:8b}
       ML_SERVICE_URL: http://ml-service:8000
     volumes:
       - book-output:/data

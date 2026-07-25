@@ -35,8 +35,20 @@ npm start                             # API + воркер против Postgres
 (полный контракт хранилища) и `BullMqDriver` (жизненный цикл задачи, повторы,
 stats) против контейнеров и печатает PASS/FAIL по шагам.
 
-`docker compose up` целиком поднимает и `api`, и `worker` (масштабируется
-`--scale worker=3`), и `postgres`/`redis` — API стартует после их healthcheck.
+Полный стек (сборка образов + все сервисы, включая ollama):
+
+```bash
+docker compose up -d --build                       # ollama — реальный провайдер
+AI_TEXT_PROVIDER=mock docker compose up -d --build # демо без модели (мок-текст)
+```
+
+`api` и `worker` — один образ, разные команды; оба ждут healthcheck
+`postgres`/`redis`. Провайдер ИИ переопределяется из окружения
+(`AI_TEXT_PROVIDER`), поэтому стек поднимается и без скачанной модели.
+
+Воркер масштабируется независимо: `docker compose up -d --scale worker=3`.
+BullMQ раздаёт задачи между всеми процессами (api тоже обрабатывает) через
+Redis, состояние заказов общее в Postgres, артефакты — на общем томе.
 
 ## Структура
 
