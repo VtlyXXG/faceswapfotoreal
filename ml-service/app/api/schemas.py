@@ -58,8 +58,6 @@ class AnalyseResponse(BaseModel):
     count: int
 
 
-class SwapMeta(BaseModel):
-    faces_detected: int
-    faces_swapped: int
-    model: str | None = None
-    seed: int | None = None
+# Схемы для X-Swap-Meta здесь намеренно нет: заголовок собирается в роутере из
+# метаданных вызова fal, состав которых меняется вместе с параметрами модели.
+# Прежняя SwapMeta не использовалась и успела разойтись с реальным заголовком.

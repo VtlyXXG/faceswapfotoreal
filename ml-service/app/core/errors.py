@@ -16,13 +16,6 @@ class MLServiceError(Exception):
         self.details = details or {}
 
 
-class ModelNotLoadedError(MLServiceError):
-    """Веса не найдены или ещё не загружены."""
-
-    status_code = 503
-    code = "MODEL_NOT_LOADED"
-
-
 class NoFaceDetectedError(MLServiceError):
     """На изображении не найдено ни одного лица."""
 

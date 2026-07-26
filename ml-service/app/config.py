@@ -89,7 +89,6 @@ class Settings(BaseSettings):
 
     # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
     max_upload_mb: int = 40
-    max_faces: int = 10
 
     allowed_origins: str = "http://localhost:3000"
 

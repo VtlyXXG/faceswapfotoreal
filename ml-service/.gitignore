@@ -7,9 +7,8 @@ __pycache__/
 .ruff_cache/
 .env
 
-# Веса моделей
-models/*
-!models/.gitkeep
+# Веса моделей. Локального инференса нет — каталога models/ тоже; правила
+# оставлены как страховка на случай, если веса снова окажутся на диске.
 checkpoints/
 weights/
 *.onnx
@@ -21,8 +20,3 @@ outputs/
 tmp/
 logs/
 *.log
-
-# A/B-стенд: входные фото и отчёты содержат лица — только структура каталогов
-bench/samples/*
-!bench/samples/.gitkeep
-bench/out/
