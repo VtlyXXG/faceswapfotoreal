@@ -14,9 +14,9 @@ class BBox(BaseModel):
 
 class FaceInfo(BaseModel):
     bbox: BBox
-    det_score: float
-    gender: int | None = None
-    age: int | None = None
+    # Сетка mediapipe не даёт ни уверенности детекции, ни пола с возрастом,
+    # зато сообщает число найденных точек контура
+    landmarks: int
 
 
 class HealthResponse(BaseModel):
@@ -26,26 +26,31 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
 
 
-class ModelStatus(BaseModel):
-    name: str
-    loaded: bool
-    available: bool
-
-
 class RuntimeStatus(BaseModel):
-    insightface: bool
-    onnxruntime: bool
-    torch: bool
+    mediapipe: bool
+    opencv: bool
+    fal_client: bool
+
+
+class ProviderStatus(BaseModel):
+    backend: str = Field(description="kontext | faceswap")
+    model: str
+    key_present: bool
+    key_env: str
+
+
+class MaskStatus(BaseModel):
+    detector: str
+    blur_kernel: int
+    # У бэкенда faceswap своя детекция — маска не строится
+    required: bool
 
 
 class ReadinessResponse(BaseModel):
     status: str = Field(description="ready | degraded")
-    device: str
-    models_dir: str
     runtime: RuntimeStatus
-    detector: ModelStatus
-    swapper: ModelStatus
-    stylizer: ModelStatus
+    provider: ProviderStatus
+    mask: MaskStatus
     reason: str | None = Field(default=None, description="Почему degraded")
 
 
@@ -57,4 +62,7 @@ class AnalyseResponse(BaseModel):
 class SwapMeta(BaseModel):
     faces_detected: int
     faces_swapped: int
-    source_face: FaceInfo | None = None
+    backend: str | None = None
+    model: str | None = None
+    # Возвращает только kontext; у faceswap seed в ответе нет
+    seed: int | None = None

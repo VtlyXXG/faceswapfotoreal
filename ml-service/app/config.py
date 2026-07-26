@@ -31,39 +31,66 @@ class Settings(BaseSettings):
     # JSON в консоль (prod) или человекочитаемый формат (dev). В файл — всегда JSON.
     log_json: bool = False
 
-    # cpu | cuda | auto
-    device: str = "auto"
+    # --- Замена лица: облачный инференс на fal.ai ---
+    # Ключ читается fal-client из окружения как FAL_KEY — без префикса ML_,
+    # поэтому дублируем сюда только для проверки готовности в /health/ready.
+    fal_key_env: str = "FAL_KEY"
+    fal_timeout_s: int = 600
 
-    models_dir: Path = Path("./models")
-    face_detector: str = "buffalo_l"
-    face_swapper: str = "inswapper_128.onnx"
-    det_size: int = 640
-    lazy_load: bool = True
+    # Какой бэкенд обслуживает замену лица: kontext | faceswap.
+    # Связки «identity-модель + инпейнтинг по маске» на fal нет: и flux-pulid,
+    # и ip-adapter-face-id — чистый text-to-image без mask_url. Поэтому два
+    # разных подхода, и выбор оставлен переключателем.
+    #
+    #   kontext  — инпейнтинг по нашей маске MediaPipe, личность задаётся
+    #              референсом. Держит стиль иллюстрации через промпт, но
+    #              Kontext — модель общего референса, не лицевая.
+    #   faceswap — специализированный перенос лица. Маска не нужна: модель
+    #              сама находит лицо и бережёт волосы обложки. Промпта нет,
+    #              поэтому результат тяготеет к фотореализму.
+    fal_backend: str = "kontext"
 
-    # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
-    # --- Постобработка (согласование лица с иллюстрацией) ---
-    # classical | diffusion | noop
-    style_provider: str = "classical"
-    style_color: float = 0.6
-    style_smooth: float = 0.5
-    style_grain: float = 0.7
-    style_sharpness: float = 0.6
-    style_margin: float = 1.8
+    # --- Бэкенд kontext: инпейнтинг по маске с референсом личности ---
+    # negative_prompt эндпоинт не принимает — его здесь намеренно нет.
+    fal_kontext_model: str = "fal-ai/flux-kontext-lora/inpaint"
+    fal_prompt: str = (
+        "A portrait of a person, matching the exact artistic style, "
+        "brushstrokes, and lighting of the surrounding image"
+    )
+    # Дефолт эндпоинта 0.88; в его документации сказано, что этой модели
+    # подходят высокие значения strength
+    fal_strength: float = 0.88
+    # Дефолт эндпоинта 2.5 — заметно ниже привычных для SD 7.5
+    fal_guidance_scale: float = 2.5
+    fal_steps: int = 30
 
-    # --- Диффузионный стилизатор (SD 1.5 + IP-Adapter FaceID) ---
-    # Пути относительно models_dir; веса кладёт scripts/fetch_style_models.py
-    style_diffusion_model: str = "sd15"
-    style_diffusion_ip_adapter: str = "ip-adapter-faceid"
-    style_diffusion_ip_weight: str = "ip-adapter-faceid_sd15.bin"
-    style_diffusion_ip_lora: str = "ip-adapter-faceid_sd15_lora.safetensors"
-    style_diffusion_use_lora: bool = True  # LoRA капризна к версии; можно отключить
-    style_diffusion_ip_scale: float = 0.8
-    style_diffusion_texture_strength: float = 0.42
-    style_diffusion_identity_keep: float = 0.6  # доля исходной геометрии в зоне глаз/носа/рта
-    style_diffusion_steps: int = 30
-    style_diffusion_guidance: float = 5.0
-    style_diffusion_work_size: int = 512
-    style_diffusion_seed: int = 42
+    # --- Бэкенд faceswap: специализированный перенос лица ---
+    fal_faceswap_model: str = "easel-ai/advanced-face-swap"
+    # target_hair сохраняет причёску обложки — ровно то, ради чего маска
+    # намеренно не заходит на лоб и волосы
+    fal_faceswap_workflow: str = "target_hair"
+    fal_faceswap_upscale: bool = True
+    # Пол донора модель использует для подгонки результата. Значение приходит
+    # из заказа; non-binary — нейтральный дефолт, когда его не передали.
+    fal_faceswap_default_gender: str = "non-binary"
+
+    # --- Маска лица ---
+    # Сильное размытие даёт бесшовный переход к иллюстрации
+    mask_blur_kernel: int = 101
+
+    @property
+    def fal_model(self) -> str:
+        """Активная модель — то, что видно в /health/ready и в логах."""
+        return self.fal_kontext_model if self.fal_backend == "kontext" else self.fal_faceswap_model
+
+    @property
+    def mask_required(self) -> bool:
+        """
+        Нужна ли маска. faceswap ищет лицо сам, и строить её для него не просто
+        лишний расход: MediaPipe не видит лицо мельче ~20% ширины кадра и
+        завернул бы 422 обложку, которую faceswap обработал бы нормально.
+        """
+        return self.fal_backend == "kontext"
 
     # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
     max_upload_mb: int = 40
@@ -78,17 +105,6 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
-
-    def resolve_device(self) -> str:
-        """Разрешает 'auto' в реальное устройство, не требуя torch на старте."""
-        if self.device != "auto":
-            return self.device
-        try:
-            import torch
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except ImportError:
-            return "cpu"
 
 
 @lru_cache

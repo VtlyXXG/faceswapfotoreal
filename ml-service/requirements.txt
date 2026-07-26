@@ -1,5 +1,6 @@
 # Python 3.11
-# CPU-сборка torch по умолчанию. Для CUDA см. requirements-gpu.txt
+# Тяжёлого локального инференса больше нет: замена лица выполняется на fal.ai.
+# Локально остаются только построение маски лица и работа с изображениями.
 
 # --- Web ---
 fastapi==0.115.0
@@ -8,24 +9,14 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 python-multipart==0.0.9
 
-# --- ML runtime ---
-torch==2.4.1
-torchvision==0.19.1
-diffusers==0.30.3
-transformers==4.44.2
-accelerate==0.34.2
-safetensors==0.4.5
-# LoRA-загрузчик IP-Adapter FaceID
-peft==0.13.2
+# --- Облачный инференс: Flux inpainting + IP-Adapter ---
+fal-client==0.5.6
+requests==2.32.3
 
-# --- Face detection / swap ---
-insightface==0.7.3
-onnxruntime==1.19.2
-
-# --- Обработка изображений ---
-numpy==1.26.4
+# --- Маска лица и обработка изображений ---
+mediapipe==0.10.14
 opencv-python-headless==4.10.0.84
-pillow==10.4.0
+numpy==1.26.4
 
 # --- Прочее ---
 python-dotenv==1.0.1

@@ -16,7 +16,7 @@ from app import __version__
 from app.api.middleware.request_id import RequestIdMiddleware
 from app.api.routes import api_router
 from app.config import settings
-from app.core.errors import MLServiceError, register_exception_handlers
+from app.core.errors import register_exception_handlers
 from app.core.logging import get_logger, setup_logging
 from app.pipelines import registry
 
@@ -27,19 +27,11 @@ log = get_logger(__name__)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     log.info(
-        "ml-service %s стартует: device=%s, lazy_load=%s",
+        "ml-service %s стартует: провайдер=%s, ключ=%s",
         __version__,
-        settings.resolve_device(),
-        settings.lazy_load,
+        settings.fal_model,
+        "задан" if registry.status()["provider"]["key_present"] else "НЕ ЗАДАН",
     )
-
-    if not settings.lazy_load:
-        try:
-            registry.warmup()
-            log.info("модели загружены")
-        except MLServiceError as exc:
-            # Не валим сервис: /health останется ok, /health/ready вернёт degraded
-            log.warning("прогрев моделей не удался: %s", exc.message)
 
     yield
 

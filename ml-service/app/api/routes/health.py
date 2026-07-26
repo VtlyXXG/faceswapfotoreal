@@ -29,34 +29,29 @@ async def health() -> HealthResponse:
 @router.get("/health/ready", response_model=ReadinessResponse, summary="Readiness")
 async def readiness(response: Response) -> ReadinessResponse:
     """
-    Готовность к работе: наличие весов и выбранное устройство.
-    503 + degraded, если веса не найдены — Node.js API может отключить
+    Готовность к работе: зависимости на месте и ключ облачного провайдера задан.
+    503 + degraded, если чего-то не хватает — Node.js API может отключить
     иллюстрации с face-swap, не падая целиком.
     """
     state = registry.status()
 
     missing: list[str] = []
-    if not state["runtime"]["insightface"]:
-        missing.append("не установлен insightface")
-    if not state["detector"]["available"]:
-        missing.append(f"нет весов детектора {state['detector']['name']}")
-    if not state["swapper"]["available"]:
-        missing.append(f"нет весов {state['swapper']['name']}")
-    # Стилизатор critical, только если оператор явно выбрал его и весов нет:
-    # classical/noop всегда available, поэтому это бьёт лишь diffusion без весов
-    if not state["stylizer"]["available"]:
-        missing.append(f"стилизатор {state['stylizer']['name']} без весов")
+    if not state["runtime"]["mediapipe"]:
+        missing.append("не установлен mediapipe — маску лица построить нечем")
+    if not state["runtime"]["opencv"]:
+        missing.append("не установлен opencv")
+    if not state["runtime"]["fal_client"]:
+        missing.append("не установлен fal-client")
+    if not state["provider"]["key_present"]:
+        missing.append(f"не задан {state['provider']['key_env']}")
 
     ready = not missing
     response.status_code = 200 if ready else 503
 
     return ReadinessResponse(
         status="ready" if ready else "degraded",
-        device=state["device"],
-        models_dir=state["models_dir"],
         runtime=state["runtime"],
-        detector=state["detector"],
-        swapper=state["swapper"],
-        stylizer=state["stylizer"],
+        provider=state["provider"],
+        mask=state["mask"],
         reason="; ".join(missing) or None,
     )

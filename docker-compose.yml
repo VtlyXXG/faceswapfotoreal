@@ -48,8 +48,8 @@ services:
       ml-service:
         condition: service_healthy
 
-  # ML-сервис: замена лица. Веса (855 МБ) лежат вне образа и монтируются
-  # с хоста только на чтение — layout models/models/buffalo_l ждёт insightface.
+  # ML-сервис: замена лица. Локальных весов нет — инференс идёт на fal.ai,
+  # локально считается только маска лица (mediapipe везёт модель в пакете).
   ml-service:
     build: ./ml-service
     ports:
@@ -58,11 +58,13 @@ services:
       ML_ENV: production
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
-      ML_MODELS_DIR: /models
-      ML_LAZY_LOAD: 'true'
       ML_ALLOWED_ORIGINS: http://localhost:3000
-    volumes:
-      - ./ml-service/models:/models:ro
+      # Замена лица выполняется на fal.ai — без ключа /health/ready даёт degraded
+      FAL_KEY: ${FAL_KEY:-}
+      # kontext — инпейнтинг по маске MediaPipe, держит стиль обложки промптом;
+      # faceswap — специализированный перенос лица, маска не нужна.
+      # Меняется в .env без пересборки: docker compose up -d ml-service
+      ML_FAL_BACKEND: ${ML_FAL_BACKEND:-kontext}
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
       interval: 10s
