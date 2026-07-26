@@ -61,10 +61,11 @@ services:
       ML_ALLOWED_ORIGINS: http://localhost:3000
       # Замена лица выполняется на fal.ai — без ключа /health/ready даёт degraded
       FAL_KEY: ${FAL_KEY:-}
-      # kontext — инпейнтинг по маске MediaPipe, держит стиль обложки промптом;
-      # faceswap — специализированный перенос лица, маска не нужна.
-      # Меняется в .env без пересборки: docker compose up -d ml-service
-      ML_FAL_BACKEND: ${ML_FAL_BACKEND:-kontext}
+      # Инпейнтинг по маске MediaPipe: стиль обложки держится промптом.
+      # Баланс «личность ↔ стиль» меняется в .env без пересборки:
+      # docker compose up -d ml-service
+      ML_FAL_STRENGTH: ${ML_FAL_STRENGTH:-0.82}
+      ML_FAL_GUIDANCE_SCALE: ${ML_FAL_GUIDANCE_SCALE:-3.5}
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
       interval: 10s

@@ -37,60 +37,55 @@ class Settings(BaseSettings):
     fal_key_env: str = "FAL_KEY"
     fal_timeout_s: int = 600
 
-    # Какой бэкенд обслуживает замену лица: kontext | faceswap.
-    # Связки «identity-модель + инпейнтинг по маске» на fal нет: и flux-pulid,
-    # и ip-adapter-face-id — чистый text-to-image без mask_url. Поэтому два
-    # разных подхода, и выбор оставлен переключателем.
+    # Инпейнтинг по нашей маске MediaPipe: личность задаётся референсом, стиль
+    # иллюстрации — промптом. Единственный рабочий вариант из опробованных.
     #
-    #   kontext  — инпейнтинг по нашей маске MediaPipe, личность задаётся
-    #              референсом. Держит стиль иллюстрации через промпт, но
-    #              Kontext — модель общего референса, не лицевая.
-    #   faceswap — специализированный перенос лица. Маска не нужна: модель
-    #              сама находит лицо и бережёт волосы обложки. Промпта нет,
-    #              поэтому результат тяготеет к фотореализму.
-    fal_backend: str = "kontext"
+    # Специализированные лицевые модели fal здесь не подходят. easel-ai/
+    # advanced-face-swap ищет лицо сам и на рисованных обложках просто его не
+    # находит: детектор обучен на фотографиях. Связки «identity-модель +
+    # инпейнтинг по маске» на fal нет вовсе — и flux-pulid, и ip-adapter-face-id
+    # это чистый text-to-image, без mask_url и без базового изображения.
+    # negative_prompt эндпоинт тоже не принимает: все отрицания идут в промпт.
+    fal_model: str = "fal-ai/flux-kontext-lora/inpaint"
 
-    # --- Бэкенд kontext: инпейнтинг по маске с референсом личности ---
-    # negative_prompt эндпоинт не принимает — его здесь намеренно нет.
-    fal_kontext_model: str = "fal-ai/flux-kontext-lora/inpaint"
+    # Промпт решает, чем окажется результат — дорисованным лицом или вклеенной
+    # фотографией. Поэтому он не описывает портрет, а формулирует задачу:
+    # «перерисуй в манере обложки, сохранив личность», и явным перечислением
+    # закрывает то, для чего у эндпоинта нет negative_prompt.
     fal_prompt: str = (
-        "A portrait of a person, matching the exact artistic style, "
-        "brushstrokes, and lighting of the surrounding image"
+        "Repaint the face inside the masked area so that it belongs to this artwork. "
+        "Keep the identity, facial features and proportions of the reference person, "
+        "but render them entirely in the medium of the surrounding illustration: "
+        "the same brush strokes, canvas and paper grain, colour palette, line work, "
+        "level of detail and direction of light. "
+        "Hand-painted and seamlessly blended into the cover art, "
+        "not a photograph pasted on top: no photographic skin texture, no visible "
+        "pores, no cut-out edge or seam around the face, no change of style at the jaw."
     )
-    # Дефолт эндпоинта 0.88; в его документации сказано, что этой модели
-    # подходят высокие значения strength
-    fal_strength: float = 0.88
-    # Дефолт эндпоинта 2.5 — заметно ниже привычных для SD 7.5
-    fal_guidance_scale: float = 2.5
-    fal_steps: int = 30
 
-    # --- Бэкенд faceswap: специализированный перенос лица ---
-    fal_faceswap_model: str = "easel-ai/advanced-face-swap"
-    # target_hair сохраняет причёску обложки — ровно то, ради чего маска
-    # намеренно не заходит на лоб и волосы
-    fal_faceswap_workflow: str = "target_hair"
-    fal_faceswap_upscale: bool = True
-    # Пол донора модель использует для подгонки результата. Значение приходит
-    # из заказа; non-binary — нейтральный дефолт, когда его не передали.
-    fal_faceswap_default_gender: str = "non-binary"
+    # Баланс «личность ↔ стиль». Оба параметра переопределяются из окружения
+    # (ML_FAL_STRENGTH, ML_FAL_GUIDANCE_SCALE) — подбирать их всё равно
+    # приходится глазами по конкретной обложке.
+    #
+    # strength — насколько сильно зашумляется область под маской. Дефолт
+    #   эндпоинта 0.88 перерисовывает её почти с нуля, и мазок оригинала под
+    #   новым лицом не сохраняется. 0.82 оставляет живопись обложки подложкой,
+    #   по которой модель ведёт лицо; ниже ~0.7 начинает проступать исходное лицо.
+    fal_strength: float = 0.82
+    # guidance_scale — насколько строго выполняется промпт, то есть требование
+    #   рисовать, а не вклеивать. Дефолт эндпоинта 2.5 оставляет референсу
+    #   слишком много воли, и его фотографическая фактура протекает в результат.
+    #   3.5 — верх рабочего диапазона Flux; за 4.0 модель начинает «гореть».
+    fal_guidance_scale: float = 3.5
+    # Шагов больше дефолтных 30: переход в кольце растушёвки маски набирается
+    # именно на последних шагах, при 30 он остаётся заметно грубее.
+    fal_steps: int = 40
 
     # --- Маска лица ---
-    # Сильное размытие даёт бесшовный переход к иллюстрации
-    mask_blur_kernel: int = 101
-
-    @property
-    def fal_model(self) -> str:
-        """Активная модель — то, что видно в /health/ready и в логах."""
-        return self.fal_kontext_model if self.fal_backend == "kontext" else self.fal_faceswap_model
-
-    @property
-    def mask_required(self) -> bool:
-        """
-        Нужна ли маска. faceswap ищет лицо сам, и строить её для него не просто
-        лишний расход: MediaPipe не видит лицо мельче ~20% ширины кадра и
-        завернул бы 422 обложку, которую faceswap обработал бы нормально.
-        """
-        return self.fal_backend == "kontext"
+    # Доли высоты лица: padding — сплошное поле вокруг контура, feather —
+    # ширина растушёвки за ним. Подробности профиля — в mask_generator.py
+    mask_padding_ratio: float = 0.06
+    mask_feather_ratio: float = 0.10
 
     # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
     max_upload_mb: int = 40

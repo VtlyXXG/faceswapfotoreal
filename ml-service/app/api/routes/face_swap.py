@@ -46,9 +46,6 @@ async def swap(
     style_strength: float = Form(1.0, ge=0.0, le=2.0, description="Множитель силы постобработки"),
     art_style: str = Form("", description="Стиль обложки для промпта диффузии"),
     output_format: str = Form("png"),
-    donor_gender: str | None = Form(
-        None, description="Пол заказчика: male | female | non-binary. Только для faceswap"
-    ),
 ) -> Response:
     """
     Результат возвращается бинарно; метаданные — в заголовке `X-Swap-Meta` (JSON),
@@ -64,7 +61,6 @@ async def swap(
             style_strength=style_strength,
             art_style=art_style,
             output_format=output_format,
-            donor_gender=donor_gender,
         )
     )
 

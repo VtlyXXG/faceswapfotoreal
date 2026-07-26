@@ -5,8 +5,7 @@
 шагов; детали вызова модели живут в app/pipelines/fal_api.py, построение
 маски — в app/pipelines/mask_generator.py.
 
-Маска строится не всегда: бэкенду faceswap она не нужна, он ищет лицо сам.
-Признак приходит из настроек, чтобы шаг не выполнялся впустую.
+Маска обязательна: единственный рабочий бэкенд — инпейнтинг по ней.
 
 Контракт SwapRequest/SwapResult сохранён прежним: Node.js API получает те же
 бинарный ответ и заголовок X-Swap-Meta, что и раньше.
@@ -45,8 +44,6 @@ class SwapRequest:
     style_strength: float = 1.0
     art_style: str = ""
     output_format: str = "png"
-    # male | female | non-binary; используется только бэкендом faceswap
-    donor_gender: str | None = None
 
 
 @dataclass
@@ -59,13 +56,15 @@ class SwapResult:
 
 
 def run(request: SwapRequest) -> SwapResult:
-    mask_png = None
-    if settings.mask_required:
-        # Маска строится по target: перерисовывается лицо на иллюстрации, а не
-        # на фотографии заказчика. Отсутствие лица здесь — 422 из детектора.
-        target_image = decode_image(request.target)
-        mask = mask_generator.generate_mask(target_image, blur_kernel=settings.mask_blur_kernel)
-        mask_png, _ = encode_image(mask, "png")
+    # Маска строится по target: перерисовывается лицо на иллюстрации, а не на
+    # фотографии заказчика. Отсутствие лица здесь — 422 из детектора.
+    target_image = decode_image(request.target)
+    mask = mask_generator.generate_mask(
+        target_image,
+        padding_ratio=settings.mask_padding_ratio,
+        feather_ratio=settings.mask_feather_ratio,
+    )
+    mask_png, _ = encode_image(mask, "png")
 
     image, call_meta = fal_api.swap_face(
         target=request.target,
@@ -73,7 +72,6 @@ def run(request: SwapRequest) -> SwapResult:
         source=request.source,
         source_mime=_sniff_mime(request.source),
         mask=mask_png,
-        donor_gender=request.donor_gender,
         output_format=request.output_format,
     )
 
@@ -81,15 +79,11 @@ def run(request: SwapRequest) -> SwapResult:
 
     log.info(
         "замена лица выполнена через fal",
-        extra={
-            "backend": call_meta.get("backend"),
-            "model": call_meta.get("model"),
-            "bytes": len(image),
-        },
+        extra={"model": call_meta.get("model"), "bytes": len(image)},
     )
 
-    # Оба бэкенда обрабатывают ровно одно лицо, поэтому счётчики всегда 1:
-    # поля сохранены ради неизменного формата X-Swap-Meta.
+    # Перерисовывается ровно одно лицо — крупнейшее найденное, — поэтому
+    # счётчики всегда 1: поля сохранены ради неизменного формата X-Swap-Meta.
     return SwapResult(
         image=image,
         mime_type=mime_type,

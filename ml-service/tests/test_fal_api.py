@@ -1,5 +1,5 @@
 """
-Вызов fal: схема аргументов обоих бэкендов и обработка ошибок транспорта.
+Вызов fal: схема аргументов эндпоинта и обработка ошибок транспорта.
 
 Схему фиксируем тестами намеренно. Именно на ней уже обожглись вживую: fal
 принял запрос, но упал на несуществующем имени весов, и выяснилось это только
@@ -76,142 +76,86 @@ def test_upload_failure_becomes_fal_error():
     assert error.details["bytes"] == 10
 
 
-def test_unknown_backend_is_rejected(monkeypatch):
-    monkeypatch.setattr(settings, "fal_backend", "pulid")
-
-    with pytest.raises(fal_api.FalBackendUnknownError):
-        _call()
+# --- Схема запроса ---
 
 
-# --- Бэкенд kontext ---
-
-
-def test_kontext_arguments_match_endpoint_schema(monkeypatch, client):
-    monkeypatch.setattr(settings, "fal_backend", "kontext")
-
+def test_arguments_match_endpoint_schema(client):
     _call(output_format="png")
 
-    assert client.model == settings.fal_kontext_model
+    assert client.model == settings.fal_model
     args = client.arguments
     # Три обязательных ссылки эндпоинта
     assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
     assert args["prompt"] == settings.fal_prompt
     assert args["strength"] == settings.fal_strength
+    assert args["guidance_scale"] == settings.fal_guidance_scale
     assert args["num_inference_steps"] == settings.fal_steps
-    # Эндпоинт не принимает negative_prompt — лишний ключ вызвал бы отказ
-    assert "negative_prompt" not in args
-    # ip_adapters остались в прошлой схеме
-    assert "ip_adapters" not in args
 
 
-def test_kontext_uploads_mask(monkeypatch, client):
-    monkeypatch.setattr(settings, "fal_backend", "kontext")
-
+@pytest.mark.parametrize("key", ["ip_adapter_scale", "ip_adapters", "negative_prompt"])
+def test_arguments_carry_no_unsupported_keys(client, key):
+    """
+    Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
+    а заворачивает весь запрос. Баланс «личность ↔ стиль» здесь задаётся
+    strength и guidance_scale, ip-адаптера у этой модели нет.
+    """
     _call()
 
-    # Обложка, фото донора и маска
+    assert key not in client.arguments
+
+
+def test_uploads_target_source_and_mask(client):
+    _call()
+
     assert len(client.uploads) == 3
     assert (b"mask-bytes", "image/png") in client.uploads
 
 
-def test_kontext_without_mask_fails_before_network(monkeypatch, client):
-    monkeypatch.setattr(settings, "fal_backend", "kontext")
-
-    with pytest.raises(fal_api.FalBackendUnknownError):
+def test_missing_mask_fails_before_network(client):
+    with pytest.raises(fal_api.MaskMissingError) as exc_info:
         _call(mask=None)
 
+    assert exc_info.value.status_code == 500
+    assert client.uploads == [], "до загрузки в CDN дойти не должно"
     assert client.arguments is None, "до вызова модели дойти не должно"
 
 
-def test_kontext_jpeg_alias(monkeypatch, client):
-    monkeypatch.setattr(settings, "fal_backend", "kontext")
-
+def test_jpeg_alias(client):
     _call(output_format="jpg")
 
     # Эндпоинт знает только jpeg, но наружу принимаем и jpg
     assert client.arguments["output_format"] == "jpeg"
 
 
-# --- Бэкенд faceswap ---
-
-
-def test_faceswap_arguments_match_endpoint_schema(monkeypatch):
-    monkeypatch.setattr(settings, "fal_backend", "faceswap")
-    fake = _FakeClient(result={"image": {"url": "https://cdn/y.png"}})
-    monkeypatch.setattr(fal_api, "_client", lambda: fake)
-    monkeypatch.setattr(fal_api, "_download", lambda image: b"PNGDATA")
-
-    _call(donor_gender="female")
-
-    assert fake.model == settings.fal_faceswap_model
-    args = fake.arguments
-    assert args["target_image"] and args["face_image_0"]
-    assert args["gender_0"] == "female"
-    assert args["workflow_type"] == settings.fal_faceswap_workflow
-    # Маску и промпт эндпоинт не принимает
-    assert "mask_url" not in args
-    assert "prompt" not in args
-
-
-def test_faceswap_does_not_upload_mask(monkeypatch):
-    """Маска бэкенду не нужна — незачем и грузить её в CDN."""
-    monkeypatch.setattr(settings, "fal_backend", "faceswap")
-    fake = _FakeClient(result={"image": {"url": "https://cdn/y.png"}})
-    monkeypatch.setattr(fal_api, "_client", lambda: fake)
-    monkeypatch.setattr(fal_api, "_download", lambda image: b"PNGDATA")
-
-    _call(mask=None)
-
-    assert len(fake.uploads) == 2
-
-
-@pytest.mark.parametrize(
-    "given,expected",
-    [
-        ("male", "male"),
-        ("Female", "female"),
-        (" non-binary ", "non-binary"),
-        ("", "non-binary"),
-        (None, "non-binary"),
-        ("мужской", "non-binary"),
-    ],
-)
-def test_gender_normalisation(given, expected):
-    """Неизвестное значение не должно уходить в fal и ловить оттуда отказ."""
-    assert fal_api.normalise_gender(given) == expected
-
-
 # --- Разбор ответа ---
 
 
-def test_extract_image_handles_both_shapes():
-    kontext = {"images": [{"url": "https://cdn/a.png"}], "seed": 1}
-    faceswap = {"image": {"url": "https://cdn/b.png"}}
+def test_extract_image_takes_first_of_images():
+    result = {"images": [{"url": "https://cdn/a.png"}], "seed": 1}
 
-    assert fal_api._extract_image(kontext, "kontext")["url"] == "https://cdn/a.png"
-    assert fal_api._extract_image(faceswap, "faceswap")["url"] == "https://cdn/b.png"
+    assert fal_api._extract_image(result)["url"] == "https://cdn/a.png"
 
 
 @pytest.mark.parametrize(
-    "response,backend",
+    "response",
     [
-        ({"images": []}, "kontext"),
-        ({}, "kontext"),
-        ({"image": None}, "faceswap"),
-        ({"images": [{"url": "x"}]}, "faceswap"),  # форма чужого бэкенда
+        {"images": []},
+        {},
+        {"images": [{}]},  # объект без ссылки
+        {"image": {"url": "x"}},  # форма чужого эндпоинта
     ],
 )
-def test_extract_image_rejects_empty_response(response, backend):
+def test_extract_image_rejects_empty_response(response):
     with pytest.raises(fal_api.FalError):
-        fal_api._extract_image(response, backend)
+        fal_api._extract_image(response)
 
 
-def test_meta_reports_backend_and_seed(monkeypatch, client):
-    monkeypatch.setattr(settings, "fal_backend", "kontext")
-
+def test_meta_reports_model_params_and_seed(client):
     _, meta = _call()
 
-    assert meta["backend"] == "kontext"
-    assert meta["model"] == settings.fal_kontext_model
+    assert meta["model"] == settings.fal_model
+    assert meta["strength"] == settings.fal_strength
+    assert meta["guidance_scale"] == settings.fal_guidance_scale
+    assert meta["steps"] == settings.fal_steps
     assert meta["seed"] == 7
     assert meta["mime_type"] == "image/png"

@@ -33,7 +33,6 @@ class RuntimeStatus(BaseModel):
 
 
 class ProviderStatus(BaseModel):
-    backend: str = Field(description="kontext | faceswap")
     model: str
     key_present: bool
     key_env: str
@@ -41,9 +40,9 @@ class ProviderStatus(BaseModel):
 
 class MaskStatus(BaseModel):
     detector: str
-    blur_kernel: int
-    # У бэкенда faceswap своя детекция — маска не строится
-    required: bool
+    # Доли высоты лица: сплошное поле вокруг контура и ширина растушёвки за ним
+    padding_ratio: float
+    feather_ratio: float
 
 
 class ReadinessResponse(BaseModel):
@@ -62,7 +61,5 @@ class AnalyseResponse(BaseModel):
 class SwapMeta(BaseModel):
     faces_detected: int
     faces_swapped: int
-    backend: str | None = None
     model: str | None = None
-    # Возвращает только kontext; у faceswap seed в ответе нет
     seed: int | None = None

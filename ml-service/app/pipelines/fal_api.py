@@ -5,16 +5,13 @@
 загрузку входных изображений, схему аргументов и скачивание результата. Что
 именно и по какой маске перерисовывается, решает pipeline.py.
 
-Бэкендов два, потому что связки «identity-модель + инпейнтинг по маске» на fal
-не существует: и flux-pulid, и ip-adapter-face-id принимают только промпт и
-фото лица, без mask_url и без базового изображения. Отсюда развилка:
+Эндпоинт один: fal-ai/flux-kontext-lora/inpaint — image_url (обложка) +
+mask_url (наша маска) + reference_image_url (фото заказчика). Второй бэкенд,
+easel-ai/advanced-face-swap, был снят: он ищет лицо своим детектором и на
+рисованных обложках его не видит — детектор обучен на фотографиях.
 
-  kontext  — fal-ai/flux-kontext-lora/inpaint: image_url + mask_url +
-             reference_image_url. Наша маска в деле, стиль держится промптом.
-  faceswap — easel-ai/advanced-face-swap: target_image + face_image_0.
-             Маску не принимает, ищет лицо сам и сохраняет волосы обложки.
-
-Транспорт у них общий, различаются только сборка arguments и разбор ответа.
+Схема аргументов зафиксирована тестами: эндпоинт отвергает лишние ключи, а
+узнаётся это только после боевого прогона.
 """
 
 from __future__ import annotations
@@ -26,9 +23,6 @@ from app.core.errors import MLServiceError
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
-
-# Эндпоинт faceswap принимает только эти три значения
-_GENDERS = ("male", "female", "non-binary")
 
 
 class FalError(MLServiceError):
@@ -45,11 +39,14 @@ class FalNotConfiguredError(MLServiceError):
     code = "FAL_NOT_CONFIGURED"
 
 
-class FalBackendUnknownError(MLServiceError):
-    """В настройках указан бэкенд, которого нет."""
+class MaskMissingError(MLServiceError):
+    """
+    Инпейнтинг без маски невозможен. Это дефект вызывающего кода, а не отказ
+    fal, поэтому 500 и отдельный код: до сети такой запрос доходить не должен.
+    """
 
     status_code = 500
-    code = "FAL_BACKEND_UNKNOWN"
+    code = "MASK_MISSING"
 
 
 def key_present() -> bool:
@@ -94,16 +91,12 @@ def _upload(client, data: bytes, content_type: str) -> str:
         ) from exc
 
 
-def normalise_gender(value: str | None) -> str:
+def _arguments(*, image_url: str, mask_url: str, identity_url: str, fmt: str) -> dict:
     """
-    Пол донора для faceswap. Неизвестное значение не роняет запрос отказом от
-    fal, а тихо становится нейтральным дефолтом.
+    Полная схема запроса. Ключей вне списка входных параметров эндпоинта здесь
+    быть не должно: ip_adapter_scale и negative_prompt он не принимает, и
+    попытка передать их заворачивает весь запрос.
     """
-    candidate = (value or "").strip().lower()
-    return candidate if candidate in _GENDERS else settings.fal_faceswap_default_gender
-
-
-def _kontext_arguments(*, image_url: str, mask_url: str, identity_url: str, fmt: str) -> dict:
     return {
         "image_url": image_url,
         "mask_url": mask_url,
@@ -116,34 +109,14 @@ def _kontext_arguments(*, image_url: str, mask_url: str, identity_url: str, fmt:
     }
 
 
-def _faceswap_arguments(*, image_url: str, identity_url: str, gender: str) -> dict:
-    return {
-        "target_image": image_url,
-        "face_image_0": identity_url,
-        "gender_0": gender,
-        "workflow_type": settings.fal_faceswap_workflow,
-        "upscale": settings.fal_faceswap_upscale,
-    }
-
-
-def _extract_image(result: dict, backend: str) -> dict:
-    """
-    Достаёт объект изображения. Формы ответа разные: kontext отдаёт список
-    images, faceswap — одиночный image.
-    """
+def _extract_image(result: dict) -> dict:
+    """Достаёт объект изображения: эндпоинт отдаёт список images."""
     result = result or {}
-
-    if backend == "kontext":
-        images = result.get("images") or []
-        image = images[0] if images else None
-    else:
-        image = result.get("image")
+    images = result.get("images") or []
+    image = images[0] if images else None
 
     if not image or not image.get("url"):
-        raise FalError(
-            "Ответ fal не содержит изображения",
-            {"backend": backend, "response_keys": list(result)},
-        )
+        raise FalError("Ответ fal не содержит изображения", {"response_keys": list(result)})
     return image
 
 
@@ -154,7 +127,6 @@ def swap_face(
     source: bytes,
     source_mime: str,
     mask: bytes | None = None,
-    donor_gender: str | None = None,
     output_format: str = "png",
 ) -> tuple[bytes, dict]:
     """
@@ -162,54 +134,29 @@ def swap_face(
 
     :param target: обложка-шаблон (куда переносим)
     :param source: фотография заказчика (донор личности)
-    :param mask: одноканальная маска PNG, белое — зона перерисовки. Обязательна
-        для бэкенда kontext и игнорируется бэкендом faceswap
-    :param donor_gender: male | female | non-binary, только для faceswap
+    :param mask: одноканальная маска PNG, белое — зона перерисовки
     :return: (байты готового изображения, метаданные вызова)
     """
-    backend = settings.fal_backend
-    if backend not in ("kontext", "faceswap"):
-        raise FalBackendUnknownError(
-            f"Неизвестный бэкенд {backend!r}: допустимы kontext и faceswap",
-            {"backend": backend},
-        )
+    if mask is None:
+        raise MaskMissingError("Инпейнтингу нужна маска, но она не построена")
 
     client = _client()
     fmt = "jpeg" if output_format in ("jpg", "jpeg") else "png"
 
     image_url = _upload(client, target, target_mime)
     identity_url = _upload(client, source, source_mime)
+    mask_url = _upload(client, mask, "image/png")
 
-    meta: dict = {"backend": backend, "model": settings.fal_model}
-
-    if backend == "kontext":
-        if mask is None:
-            raise FalBackendUnknownError(
-                "Бэкенду kontext нужна маска, но она не построена",
-                {"backend": backend},
-            )
-        mask_url = _upload(client, mask, "image/png")
-        arguments = _kontext_arguments(
-            image_url=image_url, mask_url=mask_url, identity_url=identity_url, fmt=fmt
-        )
-        meta |= {
-            "strength": settings.fal_strength,
-            "guidance_scale": settings.fal_guidance_scale,
-            "steps": settings.fal_steps,
-            "output_format": fmt,
-        }
-    else:
-        gender = normalise_gender(donor_gender)
-        arguments = _faceswap_arguments(
-            image_url=image_url, identity_url=identity_url, gender=gender
-        )
-        # output_format эндпоинт не принимает — формат определяет он сам,
-        # фактический MIME берётся из ответа
-        meta |= {
-            "gender": gender,
-            "workflow_type": settings.fal_faceswap_workflow,
-            "upscale": settings.fal_faceswap_upscale,
-        }
+    arguments = _arguments(
+        image_url=image_url, mask_url=mask_url, identity_url=identity_url, fmt=fmt
+    )
+    meta: dict = {
+        "model": settings.fal_model,
+        "strength": settings.fal_strength,
+        "guidance_scale": settings.fal_guidance_scale,
+        "steps": settings.fal_steps,
+        "output_format": fmt,
+    }
 
     log.info("запрос замены лица к fal", extra=dict(meta))
 
@@ -218,13 +165,12 @@ def swap_face(
     except Exception as exc:  # noqa: BLE001 — любая ошибка транспорта или модели
         raise FalError(
             f"Замена лица на fal не выполнена: {exc}",
-            {"backend": backend, "model": settings.fal_model},
+            {"model": settings.fal_model},
         ) from exc
 
-    image = _extract_image(result, backend)
+    image = _extract_image(result)
     content = _download(image)
 
-    # seed возвращает только kontext — у faceswap его в ответе нет
     meta |= {"seed": (result or {}).get("seed")}
     return content, {**meta, "mime_type": image.get("content_type") or "image/png"}
 

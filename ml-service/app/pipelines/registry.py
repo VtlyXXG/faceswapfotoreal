@@ -37,15 +37,13 @@ def status() -> dict:
             "fal_client": _installed("fal_client"),
         },
         "provider": {
-            "backend": settings.fal_backend,
             "model": settings.fal_model,
             "key_present": fal_api.key_present(),
             "key_env": settings.fal_key_env,
         },
         "mask": {
             "detector": "mediapipe/face_mesh",
-            "blur_kernel": settings.mask_blur_kernel,
-            # faceswap ищет лицо сам — маска для него не строится
-            "required": settings.mask_required,
+            "padding_ratio": settings.mask_padding_ratio,
+            "feather_ratio": settings.mask_feather_ratio,
         },
     }

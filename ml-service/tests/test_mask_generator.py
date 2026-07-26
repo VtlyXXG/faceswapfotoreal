@@ -1,4 +1,4 @@
-"""Маска лица: геометрия полигона и обработка кадра без лица."""
+"""Маска лица: геометрия полигона, профиль краёв и кадр без лица."""
 
 import cv2
 import numpy as np
@@ -25,6 +25,23 @@ def _fake_landmarks() -> list[tuple[int, int]]:
     return points
 
 
+@pytest.fixture
+def faked(monkeypatch):
+    """Кадр 400x400 и заглушка детектора: тесты про маску, а не про mediapipe."""
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: _fake_landmarks())
+    return np.zeros((400, 400, 3), dtype=np.uint8)
+
+
+def _sharp_polygon() -> np.ndarray:
+    """Тот же контур без паддинга и растушёвки — эталон для сравнения."""
+    mask = np.zeros((400, 400), dtype=np.uint8)
+    cv2.fillPoly(mask, [mask_generator.face_polygon(_fake_landmarks())], 255)
+    return mask
+
+
+# --- Геометрия полигона ---
+
+
 def test_polygon_uses_jaw_and_brows_only():
     polygon = mask_generator.face_polygon(_fake_landmarks())
 
@@ -42,6 +59,9 @@ def test_brows_are_lifted_to_include_eyebrow():
     assert (brow_points[:, 1] < 150).all()
 
 
+# --- Детекция и валидация ---
+
+
 def test_generate_mask_rejects_frame_without_face():
     blank = np.zeros((240, 240, 3), dtype=np.uint8)
 
@@ -49,29 +69,67 @@ def test_generate_mask_rejects_frame_without_face():
         mask_generator.generate_mask(blank)
 
 
-def test_generate_mask_rejects_bad_kernel():
-    blank = np.zeros((240, 240, 3), dtype=np.uint8)
-
+@pytest.mark.parametrize("padding,feather", [(-0.1, 0.1), (0.1, -0.1)])
+def test_generate_mask_rejects_negative_ratios(faked, padding, feather):
     with pytest.raises(InvalidImageError):
-        mask_generator.generate_mask(blank, blur_kernel=0)
+        mask_generator.generate_mask(faked, padding_ratio=padding, feather_ratio=feather)
 
 
-def test_mask_is_single_channel_and_blurred(monkeypatch):
-    """Маска: один канал, размер кадра, мягкие края вместо ступеньки."""
-    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: _fake_landmarks())
+# --- Профиль краёв: паддинг и растушёвка ---
 
-    image = np.zeros((400, 400, 3), dtype=np.uint8)
-    mask = mask_generator.generate_mask(image, blur_kernel=51)
+
+def test_mask_is_single_channel_of_frame_size(faked):
+    mask = mask_generator.generate_mask(faked)
 
     assert mask.shape == (400, 400)
     assert mask.dtype == np.uint8
-    assert mask.max() > 0, "полигон должен быть залит белым"
 
-    # Размытие даёт полутона — именно они обеспечивают бесшовный переход
-    intermediate = np.count_nonzero((mask > 10) & (mask < 245))
-    assert intermediate > 0
 
-    # Чёткая копия того же полигона полутонов не имеет — значит размытие сработало
-    sharp = np.zeros((400, 400), dtype=np.uint8)
-    cv2.fillPoly(sharp, [mask_generator.face_polygon(_fake_landmarks())], 255)
+def test_face_stays_fully_opaque(faked):
+    """
+    Главное свойство профиля: растушёвка живёт снаружи контура и не съедает
+    лицо. До паддинга размытие гасило края полигона до полутонов, и модель
+    перерисовывала лицо не целиком — отсюда и вклеенный вид результата.
+    """
+    mask = mask_generator.generate_mask(faked)
+
+    assert mask[_sharp_polygon() == 255].min() == 255
+
+
+def test_padding_widens_mask_beyond_face(faked):
+    """Паддинг даёт модели поле, на котором она сводит лицо с иллюстрацией."""
+    mask = mask_generator.generate_mask(faked)
+
+    assert np.count_nonzero(mask) > np.count_nonzero(_sharp_polygon())
+
+
+def test_feathering_produces_gradient(faked):
+    """Полутона по краю — то, ради чего всё и затевалось: границы не видно."""
+    mask = mask_generator.generate_mask(faked)
+
+    assert np.count_nonzero((mask > 10) & (mask < 245)) > 0
+    # Чёткая копия того же полигона полутонов не имеет
+    sharp = _sharp_polygon()
     assert np.count_nonzero((sharp > 10) & (sharp < 245)) == 0
+
+
+def test_feathering_reaches_zero(faked):
+    """Спад доходит до нуля: фон обложки остаётся неприкосновенным."""
+    mask = mask_generator.generate_mask(faked)
+
+    assert mask.min() == 0
+
+
+def test_ratios_scale_the_mask(faked):
+    """Доли высоты лица, а не пиксели: шире доля — шире и кайма."""
+    narrow = mask_generator.generate_mask(faked, padding_ratio=0.02, feather_ratio=0.03)
+    wide = mask_generator.generate_mask(faked, padding_ratio=0.12, feather_ratio=0.18)
+
+    assert np.count_nonzero(wide) > np.count_nonzero(narrow)
+
+
+def test_zero_ratios_give_sharp_polygon(faked):
+    """Вырожденный случай — ровно прежнее поведение без паддинга и размытия."""
+    mask = mask_generator.generate_mask(faked, padding_ratio=0.0, feather_ratio=0.0)
+
+    assert np.array_equal(mask, _sharp_polygon())
