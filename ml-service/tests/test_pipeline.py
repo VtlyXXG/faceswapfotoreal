@@ -93,9 +93,9 @@ def test_mask_and_strength_come_from_one_profile(sent):
     """
     profile = sent["captured"]["profile"]
 
-    assert profile.name == "stylise"
+    assert profile.name == "blend"
     assert profile.mask.gradient_ratio > 0
-    assert 0.45 <= profile.strength <= 0.55
+    assert 0.25 <= profile.strength <= 0.28
 
 
 def test_emotion_reaches_the_collage_step(sent):

@@ -75,27 +75,54 @@ def _controlnet_profile() -> profiles.RefineProfile:
 # --- Профили: числа и их связность ---
 
 
-def test_presets_cover_both_regimes():
+def test_presets_cover_every_regime():
     """
-    Консервативный режим не выброшен, а лежит рядом: если стилизация на 0.5
-    окажется слишком вольной, откат — это смена имени профиля, а не ревёрт.
+    Консервативный режим не выброшен, а лежит рядом: если рабочий окажется
+    слишком вольным, откат — это смена имени профиля, а не ревёрт.
     """
-    assert {"seam", "stylise", "stylise_controlnet"} <= set(profiles.available())
+    assert {"seam", "blend", "stylise", "stylise_controlnet"} <= set(profiles.available())
 
     assert profiles.get("seam").strength == 0.20
     assert profiles.get("seam").mask.gradient_ratio == 0.0, "плато, как было"
 
 
-def test_stylise_sits_in_the_requested_band():
+def test_default_profile_blends_the_seam_without_risking_the_hair():
     """
-    Диапазон 0.45-0.55 — то, ради чего второй шаг переделывали. На этой силе
-    модель действительно перерисовывает открытое маской, а не подкрашивает.
+    Связка, ради которой профиль и заведён: градиентная маска сводит шею и
+    контур волос мягко, а strength остаётся в безопасном диапазоне 0.25-0.28 —
+    выше контур причёски плывёт, и без карт ControlNet удержать его нечем.
+    """
+    blend = profiles.get("blend")
+
+    assert 0.25 <= blend.strength <= 0.28
+    assert blend.mask.gradient_ratio > 0, "градиент — половина смысла профиля"
+    # Предупреждение начинается за верхней границей диапазона, а не внутри
+    assert blend.safe_strength >= blend.strength
+    assert blend.safe_strength <= 0.28
+
+
+def test_default_profile_stays_on_the_working_endpoint():
+    """
+    На kontext-inpaint висит наша LoRA, и стиль обложек держится на ней. Уход с
+    этого эндпоинта ради ControlNet стоил бы стиля — карт в дефолте нет
+    осознанно, и вернуть их сюда молча не должно получиться.
+    """
+    blend = profiles.get("blend")
+
+    assert blend.endpoint == "fal-ai/flux-kontext-lora/inpaint"
+    assert blend.controls == ()
+
+
+def test_stylise_sits_in_the_high_band():
+    """
+    Режим настоящей стилизации остался доступен: на 0.5 модель перерисовывает
+    открытое маской. Дефолтом он не выбран — без карт на такой силе плывёт
+    контур причёски.
     """
     stylise = profiles.get("stylise")
 
     assert 0.45 <= stylise.strength <= 0.55
     assert stylise.mask.gradient_ratio > 0, "на такой силе плато даёт ступеньку"
-    # Предупреждение не должно срабатывать внутри рабочего диапазона
     assert stylise.safe_strength >= stylise.strength
 
 
@@ -145,7 +172,7 @@ def test_controlnet_on_an_endpoint_without_controlnet_is_refused():
 
 def test_default_profile_builds(monkeypatch):
     """Профиль по умолчанию обязан собираться без единой переменной окружения."""
-    assert profiles.from_settings().report()["profile"] == "stylise"
+    assert profiles.from_settings().report()["profile"] == "blend"
 
 
 def test_environment_overrides_the_preset(monkeypatch):
@@ -227,10 +254,10 @@ def test_strategy_is_chosen_by_name_from_the_profile(client, collage):
             return refine.RefineResult(image=b"SPY", meta={})
 
     refine.register(_Spy())
-    result = refine.run(_request(collage), replace(profiles.get("stylise"), strategy="spy"))
+    result = refine.run(_request(collage), replace(profiles.get("blend"), strategy="spy"))
 
     assert result.image == b"SPY"
-    assert seen["profile"] == "stylise"
+    assert seen["profile"] == "blend"
     assert client.arguments is None, "до fal дойти не должно"
 
 
@@ -240,7 +267,7 @@ def test_identity_embedding_is_declared_but_not_implemented(collage):
     Пока эндпоинта нет, честнее отдать 501, чем молча отработать инпейнтингом:
     молчаливая подмена обнаружилась бы уже на печати тиража.
     """
-    profile = replace(profiles.get("stylise"), strategy="identity_embedding")
+    profile = replace(profiles.get("blend"), strategy="identity_embedding")
 
     with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
         refine.run(_request(collage), profile)
@@ -255,7 +282,7 @@ def test_identity_reaches_the_strategy(collage):
     когда эндпоинт появится, первым вопросом будет именно этот.
     """
     identity = refine.Identity(embedding=np.zeros((1, 512), dtype=np.float32), model="buffalo_l")
-    profile = replace(profiles.get("stylise"), strategy="identity_embedding")
+    profile = replace(profiles.get("blend"), strategy="identity_embedding")
 
     with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
         refine.run(_request(collage, identity=identity), profile)
@@ -265,23 +292,23 @@ def test_identity_reaches_the_strategy(collage):
 
 def test_unknown_strategy_is_refused(collage):
     with pytest.raises(refine.RefinerNotSupportedError):
-        refine.run(_request(collage), replace(profiles.get("stylise"), strategy="телепатия"))
+        refine.run(_request(collage), replace(profiles.get("blend"), strategy="телепатия"))
 
 
 # --- Схема запроса ---
 
 
 def test_arguments_match_endpoint_schema(client, collage):
-    refine.run(_request(collage), profiles.get("stylise"))
+    refine.run(_request(collage), profiles.get("blend"))
 
     args = client.arguments
-    assert client.model == profiles.get("stylise").endpoint
+    assert client.model == profiles.get("blend").endpoint
     # Три обязательные ссылки эндпоинта
     assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
-    assert args["prompt"] == profiles.get("stylise").prompt
-    assert args["strength"] == 0.50
-    assert args["guidance_scale"] == profiles.get("stylise").guidance_scale
-    assert args["num_inference_steps"] == profiles.get("stylise").steps
+    assert args["prompt"] == profiles.get("blend").prompt
+    assert args["strength"] == profiles.get("blend").strength
+    assert args["guidance_scale"] == profiles.get("blend").guidance_scale
+    assert args["num_inference_steps"] == profiles.get("blend").steps
 
 
 def test_collage_goes_first_and_reference_second(client, collage):
@@ -290,7 +317,7 @@ def test_collage_goes_first_and_reference_second(client, collage):
     референс. Перепутать их местами — значит вернуться к прежней схеме, где
     лицо рисовалось с нуля, причём молча.
     """
-    refine.run(_request(collage), profiles.get("stylise"))
+    refine.run(_request(collage), profiles.get("blend"))
 
     assert client.arguments["image_url"] == "https://cdn/1", "первым загружается коллаж"
     assert client.arguments["reference_image_url"] == "https://cdn/2", "вторым — фотография"
@@ -303,7 +330,7 @@ def test_arguments_carry_no_unsupported_keys(client, collage, key):
     Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
     а заворачивает весь запрос. Отрицания идут прямо в промпт.
     """
-    refine.run(_request(collage), profiles.get("stylise"))
+    refine.run(_request(collage), profiles.get("blend"))
 
     assert key not in client.arguments
 
@@ -313,14 +340,14 @@ def test_no_control_key_without_controls(client, collage):
     Пустой список карт — такой же лишний ключ, как и полный. У эндпоинта без
     ControlNet его быть не должно вовсе.
     """
-    refine.run(_request(collage), profiles.get("stylise"))
+    refine.run(_request(collage), profiles.get("blend"))
 
     assert "controlnets" not in client.arguments
 
 
 def test_missing_mask_fails_before_network(client, collage):
     with pytest.raises(fal_api.MaskMissingError) as exc_info:
-        refine.run(_request(collage, mask=None), profiles.get("stylise"))
+        refine.run(_request(collage, mask=None), profiles.get("blend"))
 
     assert exc_info.value.status_code == 500
     assert client.uploads == [], "до загрузки в CDN дойти не должно"
@@ -328,7 +355,7 @@ def test_missing_mask_fails_before_network(client, collage):
 
 
 def test_jpeg_alias(client, collage):
-    refine.run(_request(collage, output_format="jpg"), profiles.get("stylise"))
+    refine.run(_request(collage, output_format="jpg"), profiles.get("blend"))
 
     # Эндпоинт знает только jpeg, но наружу принимаем и jpg
     assert client.arguments["output_format"] == "jpeg"

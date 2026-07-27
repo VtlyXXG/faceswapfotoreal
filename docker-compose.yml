@@ -67,10 +67,11 @@ services:
       # Голова переносится локально аппликацией, на fal уходит стилизация.
       # Гиперпараметры второго шага живут набором — профилем; см.
       # ml-service/app/pipelines/refine/profiles.py.
-      #   seam    — strength 0.20, модель только сводит шов
-      #   stylise — strength 0.50, градиентная маска, мазок и тени
+      #   seam  — strength 0.20, модель только сводит шов
+      #   blend — strength 0.26, градиентная маска: шея и контур волос сводятся
+      #           мягко, но геометрия причёски не плывёт
       # Подбирается в .env без пересборки: docker compose up -d ml-service
-      ML_REFINE_PROFILE: ${ML_REFINE_PROFILE:-stylise}
+      ML_REFINE_PROFILE: ${ML_REFINE_PROFILE:-blend}
       ML_REFINE_STRENGTH: ${ML_REFINE_STRENGTH:-}
       ML_REFINE_CONTROLS: ${ML_REFINE_CONTROLS:-}
       ML_COLLAGE_COLOUR_MATCH: ${ML_COLLAGE_COLOUR_MATCH:-0.8}
