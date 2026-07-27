@@ -89,6 +89,9 @@ def run(request: SwapRequest) -> SwapResult:
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
         erase_template_head=settings.collage_erase_template_head,
+        erase_method=settings.collage_erase_method,
+        erase_neck_ratio=settings.collage_erase_neck_ratio,
+        erase_pad_ratio=settings.collage_erase_pad_ratio,
     )
 
     # Маска — только стык: контур волос, срез шеи и следы стирания чужой

@@ -20,8 +20,9 @@
      здесь, на вырезанной голове, до переноса в шаблон;
   4. перенос подобием в координаты обложки;
   5. LAB-коррекция тона — только по коже: волосы обязаны сохранить свой цвет;
-  6. стирание причёски нарисованного персонажа, если она торчит из-под
-     вклеенной головы;
+  6. стирание головы нарисованного персонажа целиком и заливка её места фоном
+     обложки — фон при этом берётся только из фона, сам персонаж источником
+     цвета не служит;
   7. композит.
 
 Наружу отдаётся не только картинка, но и геометрия для маски второго шага:
@@ -74,9 +75,31 @@ _COLOUR_MATCH = 0.8
 _PRESCALE_THRESHOLD = 0.99
 
 # Радиус, на который стирание причёски шаблона затягивается окружающим фоном.
-# Доля высоты лица: Telea тянет цвет от границы дыры внутрь, и слишком большой
-# радиус даёт мыло, слишком маленький — не закрывает.
+# Доля высоты лица; используется вариантами telea и ns.
 _INPAINT_RADIUS_RATIO = 0.04
+
+# Способ локального восстановления фона под стёртой причёской персонажа.
+# pyramid — заливка пирамидой (push-pull), telea и ns — cv2.inpaint.
+_ERASE_METHOD = "pyramid"
+_ERASE_METHODS = ("pyramid", "telea", "ns")
+
+# Насколько прямой срез области стирания опускается ниже подбородка персонажа,
+# доля высоты лица. Небольшой запас на погрешность сетки — и только: ниже лежит
+# шея персонажа, а она нужна. Вклеенная голова обрезана по челюсти, своей шеи у
+# неё нет, и садится она ровно на нарисованную; сотрёшь — под подбородком
+# останется дыра, которую модели придётся заполнять воротником с нуля.
+_ERASE_NECK_RATIO = 0.05
+
+# Запас вокруг силуэта персонажа, доля высоты лица. Стирать впритык нельзя:
+# по краю рисованных волос идёт полупрозрачная кромка, и она остаётся тёмной
+# каймой ровно там, где её должно было не стать.
+_ERASE_PAD_RATIO = 0.03
+
+# Порог «здесь есть персонаж» для маски стирания. Он намеренно много ниже
+# segmentation._ALPHA_SOLID: там решается, что взять В аппликацию, и сомнение
+# трактуется в пользу фона; здесь — что убрать С обложки, и сомнение
+# трактуется в пользу стирания. Любой намёк на персонажа — не фон.
+_FOREIGN_FLOOR = 20
 
 
 @dataclass
@@ -276,29 +299,136 @@ def _match_skin(donor: Any, template: Any, skin: Any, ratio: float) -> Any:
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 
+def _pyramid_fill(image: Any, unknown: Any) -> Any:
+    """
+    Заливка дыры пирамидой (push-pull): известное усредняется вниз по уровням и
+    поднимается обратно, заполняя пустое.
+
+    Зачем не cv2.inpaint. Telea и Навье-Стокс тянут цвет от границы дыры внутрь
+    вдоль изофот — на большой дыре это даёт штрихи от каждой неровности контура.
+    Пирамида по построению не может дать ни штриха, ни кольца: на верхних
+    уровнях дыра просто исчезает, и вниз возвращается гладкая интерполяция
+    окрестности. Ровно то, что нужно на месте стёртой причёски — однородный
+    фон, поверх которого второй шаг положит мазок. Плюс на 4K она в 13 раз
+    быстрее Telea (1.5 с против 19.5 с): дыра там размером с голову.
+
+    :param unknown: маска uint8 — пиксели, которые НЕ являются источником цвета
+    :return: изображение, где заполнено всё unknown (вызывающий берёт нужное)
+    """
+    import cv2
+    import numpy as np
+
+    height, width = image.shape[:2]
+    # До уровня, где от кадра остаются единицы пикселей: дыра размером с голову
+    # должна на верхних уровнях полностью раствориться в окрестности
+    levels = max(1, int(np.log2(max(1, min(height, width)))) - 3)
+
+    visible = unknown == 0
+    if not visible.any():
+        return np.asarray(image).copy()  # фона в кадре нет — брать цвет неоткуда
+
+    known = visible.astype(np.float32)
+    weighted = image.astype(np.float32) * known[..., None]
+
+    stack = [(weighted, known)]
+    for _ in range(levels):
+        weighted = cv2.pyrDown(weighted)
+        known = cv2.pyrDown(known)
+        stack.append((weighted, known))
+
+    # Затравка — средний цвет всего видимого фона. Без неё на обложке, где
+    # персонаж занимает почти весь разворот, известного не остаётся даже на
+    # верхнем уровне пирамиды, и дыра заливается чёрным.
+    result = image[visible].mean(axis=0).astype(np.float32).reshape(1, 1, 3)
+
+    # Вверх: на каждом уровне известное берётся как есть, неизвестное — с
+    # уровня выше. Деление на вес возвращает цвет из взвешенной суммы.
+    for weighted, known in reversed(stack):
+        safe = np.maximum(known, 1e-3)[..., None]
+        level = np.where(known[..., None] > 1e-3, weighted / safe, 0.0)
+        coarse = cv2.resize(
+            result, (level.shape[1], level.shape[0]), interpolation=cv2.INTER_LINEAR
+        )
+        result = np.where(known[..., None] > 1e-3, level, coarse)
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _restore_background(
+    image: Any, hole: Any, foreign: Any, face_height: float, method: str
+) -> Any:
+    """
+    Затягивает дыру фоном обложки, не подмешивая в неё персонажа.
+
+    Ключевое здесь — `foreign`. Любой локальный метод восстановления берёт цвет
+    с границы дыры, а граница стёртой причёски — это сам персонаж: его волосы
+    сверху, кожа шеи снизу. Отсюда и брались тёмное кольцо вокруг вклейки, и
+    розовые пятна на месте ушей. Поэтому персонаж целиком объявляется
+    неизвестным наравне с дырой: источником цвета остаётся только настоящий
+    фон. Записывается результат при этом ТОЛЬКО в дыру — остальной персонаж
+    (руки, одежда, всё ниже воротника) обязан остаться нетронутым.
+
+    :param hole: что заполнить — стёртая голова персонажа
+    :param foreign: что нельзя брать за образец — персонаж целиком
+    :param method: pyramid, telea или ns
+    """
+    import cv2
+    import numpy as np
+
+    if method not in _ERASE_METHODS:
+        raise InvalidImageError(
+            "Неизвестный способ восстановления фона",
+            {"method": method, "available": list(_ERASE_METHODS)},
+        )
+
+    unknown = np.maximum(np.asarray(hole), np.asarray(foreign))
+    if method == "pyramid":
+        filled = _pyramid_fill(image, unknown)
+    else:
+        radius = max(1, round(face_height * _INPAINT_RADIUS_RATIO))
+        flag = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
+        filled = cv2.inpaint(image, unknown, radius, flag)
+
+    return np.where(np.asarray(hole)[..., None] > 0, filled, image)
+
+
 def _erase_template_head(
     target: Any,
     points: list[tuple[int, int]],
     pasted: Any,
     face_height: float,
     model: str,
+    method: str = _ERASE_METHOD,
+    neck_ratio: float = _ERASE_NECK_RATIO,
+    pad_ratio: float = _ERASE_PAD_RATIO,
 ) -> tuple[Any, Any, dict]:
     """
-    Стирает причёску нарисованного персонажа там, где её не закрыла вклейка.
+    Стирает голову нарисованного персонажа и затягивает её место фоном.
 
     Без этого шага перенос причёски виден насквозь: у персонажа с длинными
     волосами вокруг вклеенной головы остаётся его собственная шевелюра, и на
     развороте оказывается два человека сразу. Понизить strength и попросить
     модель убрать её нельзя — на 0.2 она ничего не убирает, только подкрашивает.
 
-    Дыра затягивается Telea по окружающему фону: получается размытое пятно,
-    которое затем попадает в маску инпейнтинга и там дорисовывается мазком. Это
-    компромисс — идеально восстановить фон за головой локально невозможно.
+    Стирается голова **целиком**, а не только торчащая из-под вклейки часть.
+    Разница принципиальная: если оставить закрытую часть на месте, дыра
+    получается кольцом, и её внутренняя граница — тёмные волосы персонажа.
+    Любой локальный метод восстановления тянет цвет от границы внутрь, поэтому
+    ровно эти волосы и размазывались вокруг вклейки тёмным ореолом. Середину
+    всё равно закрывает вклеенная голова, так что стирать её ничего не стоит.
+
+    Маски здесь свои, не донорские: срез опускается ниже челюсти (уши
+    персонажа), эрозии нет вовсе, а порог «здесь есть персонаж» много ниже —
+    сомнение трактуется в пользу стирания, а не в пользу фона.
 
     Отказ сегментатора на обложке не фатален: рисованный персонаж — не тот
     материал, на котором учили U²-Net, и вероятность промаха здесь выше, чем на
     фотографии. Поэтому шаг пропускается с предупреждением, а не роняет заказ.
 
+    :param pasted: силуэт вклеенной головы донора — что уже закрыто
+    :param method: способ восстановления фона (pyramid, telea, ns)
+    :param neck_ratio: насколько опустить срез ниже челюсти персонажа
+    :param pad_ratio: запас вокруг силуэта персонажа
     :return: (изображение с затянутой дырой, маска стирания, метаданные)
     """
     import cv2
@@ -306,7 +436,15 @@ def _erase_template_head(
 
     empty = np.zeros(target.shape[:2], dtype=np.uint8)
     try:
-        head = segmentation.cutout_head(target, points, model)
+        # Срез прямой, а не по дуге челюсти: дуга поднимается к ушам и
+        # оставляет их кончики красными лепестками по бокам вклейки, а если
+        # опустить её настолько, чтобы их достать, вместе с ними стирается шея
+        # персонажа под подбородком — та самая, на которую садится вклеенная
+        # голова. Прямая на уровне подбородка забирает ухо целиком и шею не трогает.
+        region, _, _ = segmentation.head_region(
+            points, target.shape[:2], neck_ratio=neck_ratio, follow_jaw=False
+        )
+        silhouette = np.asarray(segmentation.silhouette(target, model))
     except MLServiceError as exc:
         log.warning(
             "причёску персонажа стереть не удалось — сегментатор не нашёл голову",
@@ -314,30 +452,46 @@ def _erase_template_head(
         )
         return target, empty, {"erased_ratio": None}
 
-    # Запас вокруг вклейки: стирать вплотную к ней нельзя, иначе Telea затянет
-    # дыру цветом самой вклейки и по контуру волос пойдёт ореол.
+    pad = max(1, round(face_height * pad_ratio))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1))
+
+    # Персонаж целиком — он не источник цвета для заливки ни одним пикселем
+    foreign = cv2.dilate(np.where(silhouette > _FOREIGN_FLOOR, 255, 0).astype(np.uint8), kernel)
+    # Дыра — та его часть, что попала в область головы. Крупнейшая компонента:
+    # в эллипс головы могла заехать поднятая рука или ветка за спиной
+    head = segmentation.largest_component(np.where(region > 0, foreign, 0).astype(np.uint8))
+    hole = cv2.dilate(head, kernel)
+
+    if not hole.any():
+        # Пустой силуэт — это промах сегментатора на рисованном персонаже, а не
+        # «голова нулевой площади». Тот же случай, что и отказ выше: пропускаем
+        # шаг с предупреждением, а не роняем заказ.
+        log.warning("причёску персонажа стереть не удалось — силуэт пуст")
+        return target, empty, {"erased_ratio": None}
+
+    head_px = int(np.count_nonzero(hole))
+
+    # Запас вокруг вклейки: то, что она закрывает, модели перерисовывать не надо
     grow = max(1, round(face_height * 0.02))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
-    covered = cv2.dilate((pasted > 127).astype(np.uint8), kernel)
+    covered = cv2.dilate(
+        (pasted > 127).astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)),
+    )
+    erased = np.where((hole > 0) & (covered == 0), 255, 0).astype(np.uint8)
 
-    erased = np.where((head.alpha > 127) & (covered == 0), 255, 0).astype(np.uint8)
-    # Крошка по краям силуэта — не причёска, а погрешность сегментации
-    erased = cv2.morphologyEx(erased, cv2.MORPH_OPEN, kernel)
-
-    head_px = max(1, int(np.count_nonzero(head.alpha > 127)))
     ratio = float(np.count_nonzero(erased)) / head_px
-    meta = {"erased_ratio": round(ratio, 3), "template_head_px": head_px}
+    meta = {
+        "erased_ratio": round(ratio, 3),
+        "template_head_px": head_px,
+        "erase_method": method,
+    }
 
-    if not erased.any():
-        return target, empty, meta
+    filled = _restore_background(target, hole, foreign, face_height, method)
 
-    radius = max(1, round(face_height * _INPAINT_RADIUS_RATIO))
-    filled = cv2.inpaint(target, erased, radius, cv2.INPAINT_TELEA)
-
-    log.info("причёска персонажа стёрта", extra=meta)
+    log.info("голова персонажа стёрта", extra=meta)
     if ratio > 0.5:
-        # Половина головы персонажа мимо вклейки — фон за ней Telea честно
-        # восстановить не сможет, и на 0.2 модель это не спасёт.
+        # Половина головы персонажа мимо вклейки — фон за ней честно
+        # восстановить нечем, и на 0.2 модель это не спасёт.
         log.warning(
             "стёрта большая часть головы персонажа — фон придётся домысливать",
             extra=meta,
@@ -358,6 +512,9 @@ def build(
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
     erase_template_head: bool = True,
+    erase_method: str = _ERASE_METHOD,
+    erase_neck_ratio: float = _ERASE_NECK_RATIO,
+    erase_pad_ratio: float = _ERASE_PAD_RATIO,
 ) -> Collage:
     """
     Вклеивает голову донора в шаблон и возвращает коллаж для инпейнтинга.
@@ -369,7 +526,10 @@ def build(
     :param model_cover: модель сегментации для обложки
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :param colour_match: доля приведения тона кожи к шаблону, 0..1
-    :param erase_template_head: стирать ли причёску персонажа из-под вклейки
+    :param erase_template_head: стирать ли голову персонажа из-под вклейки
+    :param erase_method: чем затягивать её место (pyramid, telea, ns)
+    :param erase_neck_ratio: насколько опустить срез ниже челюсти персонажа
+    :param erase_pad_ratio: запас вокруг силуэта персонажа
     """
     import cv2
     import numpy as np
@@ -423,7 +583,16 @@ def build(
     warped = _match_skin(warped, target, skin, colour_match)
 
     base, erased, erase_meta = (
-        _erase_template_head(target, target_points, alpha, template_face_height, model_cover)
+        _erase_template_head(
+            target,
+            target_points,
+            alpha,
+            template_face_height,
+            model_cover,
+            erase_method,
+            erase_neck_ratio,
+            erase_pad_ratio,
+        )
         if erase_template_head
         else (target, np.zeros((height, width), dtype=np.uint8), {"erased_ratio": None})
     )

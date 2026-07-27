@@ -11,14 +11,19 @@
     30_alpha.png       итог вырезки: пересечение первых двух, порог и эрозия
     40_cutout.png      сама аппликация — голова на прозрачном фоне (BGRA)
     50_collage.png     коллаж: голова в шаблоне
+    55_erased.png      что стёрто от головы персонажа и открыто модели
+    56_erased_base.png шаблон с затёртой головой персонажа, до наложения вклейки
     60_mask.png        маска стыка — что ушло бы в инпейнтинг (не отправляется)
     meta.json          метаданные обоих шагов вырезки
 
 Смотреть в первую очередь на 40_cutout.png: там не должно быть ни шеи, ни
-одежды, ни каймы фона фотографии вокруг волос.
+одежды, ни каймы фона фотографии вокруг волос. Второе — 56_erased_base.png: фон
+на месте стёртой головы персонажа должен быть однородным, без тёмного кольца по
+контуру его причёски и без розовых пятен на месте ушей.
 
     python scripts/collage_preview.py --source ../source.jpg --target ../target.png
     python scripts/collage_preview.py --erode-ratio 0.01 --neck-ratio 0.05
+    python scripts/collage_preview.py --erase-method ns --erase-pad-ratio 0.06
 
 Модели rembg скачиваются при первом запуске (~176 МБ на модель).
 """
@@ -89,6 +94,14 @@ def main() -> int:
     # Две доли, которые сейчас и подбираются, — остальное берётся из настроек
     parser.add_argument("--neck-ratio", type=float, default=settings.head_neck_ratio)
     parser.add_argument("--erode-ratio", type=float, default=settings.head_erode_ratio)
+    # Затирка головы персонажа на шаблоне
+    parser.add_argument(
+        "--erase-method",
+        choices=collage_builder._ERASE_METHODS,
+        default=settings.collage_erase_method,
+    )
+    parser.add_argument("--erase-neck-ratio", type=float, default=settings.collage_erase_neck_ratio)
+    parser.add_argument("--erase-pad-ratio", type=float, default=settings.collage_erase_pad_ratio)
     args = parser.parse_args()
 
     for path in (args.source, args.target):
@@ -151,6 +164,9 @@ def main() -> int:
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
         erase_template_head=settings.collage_erase_template_head,
+        erase_method=args.erase_method,
+        erase_neck_ratio=args.erase_neck_ratio,
+        erase_pad_ratio=args.erase_pad_ratio,
     )
 
     mask = mask_generator.blend_mask(
@@ -166,7 +182,30 @@ def main() -> int:
         feather_ratio=settings.mask_feather_ratio,
     )
 
-    _save(args.out, {"50_collage.png": collage.image, "60_mask.png": mask})
+    # Шаблон без головы персонажа, до наложения вклейки. Именно по нему видно,
+    # оставила ли затирка тёмное кольцо или пятна на месте ушей: в готовом
+    # коллаже середина закрыта, и разглядеть там нечего
+    target_points = mask_generator.face_landmarks(target)
+    base, _, _ = collage_builder._erase_template_head(
+        target,
+        target_points,
+        collage.head_alpha,
+        collage.meta["face_height_target"],
+        settings.seg_model_cover,
+        args.erase_method,
+        args.erase_neck_ratio,
+        args.erase_pad_ratio,
+    )
+
+    _save(
+        args.out,
+        {
+            "50_collage.png": collage.image,
+            "55_erased.png": collage.erased,
+            "56_erased_base.png": base,
+            "60_mask.png": mask,
+        },
+    )
 
     meta = {
         "source": str(args.source),

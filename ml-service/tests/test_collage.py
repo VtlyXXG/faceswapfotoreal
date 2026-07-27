@@ -231,6 +231,102 @@ def test_template_hair_outside_the_paste_is_erased(monkeypatch, photo, cover):
     assert result.meta["erased_ratio"] > 0
 
 
+def test_erased_hair_is_not_smeared_back_into_the_hole(monkeypatch, photo, cover):
+    """
+    Тёмное кольцо вокруг вклейки. Пока стиралась только торчащая часть головы
+    персонажа, дыра выходила кольцом, и её внутренней границей были его же
+    тёмные волосы: любой локальный метод тянет цвет от границы внутрь, и они
+    размазывались обратно. Поэтому голова стирается целиком, а сам персонаж
+    исключается из источников цвета — заливка берётся только из фона.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    dark = np.zeros(cover.shape[:2], dtype=np.uint8)
+    cv2.circle(dark, (200, 190), 150, 255, -1)
+    painted = cover.copy()
+    painted[dark > 0] = (10, 10, 10)  # грива персонажа — почти чёрная
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.circle(alpha, (200, 190), 70 if model == "photo" else 150, 255, -1)
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(
+        photo, painted, model_photo="photo", model_cover="cover", colour_match=0.0
+    )
+
+    # Полоса между вклейкой и краем стёртой гривы — то, что увидит заказчик
+    band = (result.erased > 0) & (result.head_alpha == 0)
+    assert band.any()
+    assert float(result.image[band].mean()) > 40, "фон вместо размазанных тёмных волос"
+
+
+def test_erasing_does_not_touch_the_rest_of_the_character(monkeypatch, photo, cover):
+    """
+    Стирается голова, а не персонаж: руки, одежда и всё ниже воротника обязаны
+    остаться нетронутыми. Заливка знает про них только как про запрещённый
+    источник цвета.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    painted = cover.copy()
+    painted[330:400, :] = (0, 0, 200)  # «одежда» персонажа внизу кадра
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.circle(alpha, (200, 190), 70 if model == "photo" else 150, 255, -1)
+        alpha[330:400, :] = 255
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(
+        photo, painted, model_photo="photo", model_cover="cover", colour_match=0.0
+    )
+
+    assert np.array_equal(result.image[330:400, :], painted[330:400, :])
+
+
+def test_full_bleed_cover_does_not_fill_the_hole_with_black(monkeypatch, photo, cover):
+    """
+    Разворот, где персонаж занимает почти весь кадр: фона, из которого можно
+    брать цвет, почти нет. Пирамида без затравки заливает дыру чёрным — а
+    чёрное пятно на месте головы хуже любого ореола.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    def _silhouette(image, model):
+        if model == "photo":
+            return cv2.circle(np.zeros(image.shape[:2], np.uint8), (200, 190), 70, 255, -1)
+        alpha = np.full(image.shape[:2], 255, dtype=np.uint8)
+        alpha[:6, :6] = 0  # весь кадр — персонаж, кроме уголка
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(photo, cover, model_photo="photo", model_cover="cover", colour_match=0.0)
+
+    band = (result.erased > 0) & (result.head_alpha == 0)
+    assert band.any()
+    assert float(result.image[band].mean()) == pytest.approx(60, abs=2), "цвет уцелевшего фона"
+
+
+def test_unknown_erase_method_is_refused(monkeypatch, photo, cover):
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+    monkeypatch.setattr(
+        segmentation,
+        "silhouette",
+        lambda image, model: cv2.circle(
+            np.zeros(image.shape[:2], np.uint8), (200, 190), 150, 255, -1
+        ),
+    )
+
+    with pytest.raises(InvalidImageError):
+        collage.build(photo, cover, erase_method="poisson")
+
+
 def test_segmenter_failure_on_the_cover_does_not_kill_the_order(monkeypatch, photo, cover):
     """
     Рисованный персонаж — не тот материал, на котором учили U²-Net. Промах на

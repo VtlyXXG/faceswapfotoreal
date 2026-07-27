@@ -148,6 +148,7 @@ def head_region(
     width_ratio: float = _WIDTH_RATIO,
     hair_ratio: float = _HAIR_RATIO,
     neck_ratio: float = _NECK_RATIO,
+    follow_jaw: bool = True,
 ) -> tuple[Any, tuple[tuple[int, int], tuple[int, int]], float]:
     """
     Область головы по сетке лица: эллипс со срезанным по челюсти низом.
@@ -162,7 +163,13 @@ def head_region(
     за собой воротник и плечи. Дуга снимает и то и другое: под срезом не
     остаётся ни пикселя шеи, а уши и волосы выше линии челюсти сохраняются.
 
-    :param neck_ratio: отступ среза вниз от челюсти, доля высоты лица
+    Прямой срез (`follow_jaw=False`) нужен там, где голову не вырезают, а
+    наоборот стирают: дуга поднимается к ушам и оставляет их кончики, а прямая
+    на уровне подбородка забирает ухо целиком и не трогает шею под подбородком.
+
+    :param neck_ratio: отступ среза вниз от челюсти (или от подбородка при
+        follow_jaw=False), доля высоты лица
+    :param follow_jaw: вести срез по дуге челюсти или прямой поперёк оси лица
     :return: (маска области uint8, отрезок среза шеи, высота лица в пикселях)
     """
     import cv2
@@ -204,13 +211,23 @@ def head_region(
     side = np.array([-up[1], up[0]])  # перпендикуляр к оси лица
     reach = float(max(height, width)) * 2.0
 
-    jaw = np.array([points[i] for i in mask_generator._JAW_ARC], dtype=np.float64) - up * neck_down
-    # Куда продлевать концы дуги, зависит от того, с какой стороны лица лежит
-    # её начало: порядок обхода в сетке фиксирован, но знак перпендикуляра — нет
-    outward = side if float(np.dot(jaw[0] - chin, side)) > 0 else -side
-    first, last = jaw[0] + outward * reach, jaw[-1] - outward * reach
+    if follow_jaw:
+        jaw = (
+            np.array([points[i] for i in mask_generator._JAW_ARC], dtype=np.float64)
+            - up * neck_down
+        )
+        # Куда продлевать концы дуги, зависит от того, с какой стороны лица
+        # лежит её начало: порядок обхода в сетке фиксирован, знак
+        # перпендикуляра — нет
+        outward = side if float(np.dot(jaw[0] - chin, side)) > 0 else -side
+        first, last = jaw[0] + outward * reach, jaw[-1] - outward * reach
+        cut = [first, *jaw, last]
+    else:
+        flat = chin - up * neck_down
+        cut = [flat + side * reach, flat - side * reach]
+
     below = np.array(
-        [first, *jaw, last, last - up * reach, first - up * reach],
+        [*cut, cut[-1] - up * reach, cut[0] - up * reach],
         dtype=np.int32,
     )
     cv2.fillPoly(region, [below], 0)  # дуга невыпуклая — fillConvexPoly здесь соврёт
@@ -252,7 +269,7 @@ def clean_alpha(alpha: Any, erode_px: int) -> Any:
     return solid
 
 
-def _largest_component(mask: Any) -> Any:
+def largest_component(mask: Any) -> Any:
     """
     Оставляет крупнейший связный кусок.
 
@@ -300,7 +317,7 @@ def cutout_head(
     erode_px = max(1, round(face_height * erode_ratio)) if erode_ratio > 0 else 0
     alpha = clean_alpha(silhouette(image, model), erode_px)
 
-    head = _largest_component(np.where(region > 0, alpha, 0).astype(np.uint8))
+    head = largest_component(np.where(region > 0, alpha, 0).astype(np.uint8))
 
     area = int(np.count_nonzero(head > 127))
     meta = {
