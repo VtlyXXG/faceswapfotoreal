@@ -57,6 +57,11 @@ _ALIGN_POINTS = (
 # Растушёвка края аппликации, доля высоты лица. Коллаж намеренно жёсткий: это
 # ровно та ширина, которая убирает ступеньку антиалиасинга по контуру волос.
 # Настоящее сведение с фоном — работа второго шага.
+#
+# Спад ведётся ВНУТРЬ силуэта. Симметричная растушёвка (или тем более
+# mask_generator.soften, который сначала расширяет область) вернула бы наружу
+# те самые пиксели фона фотографии, ради которых силуэт подрезали эрозией в
+# segmentation.clean_alpha, — только с половинной прозрачностью.
 _FEATHER_RATIO = 0.01
 
 # Приведение тона кожи к шаблону (среднее и разброс по каналам LAB). Считается
@@ -177,6 +182,41 @@ def _warp(image: Any, matrix: Any, scale: float, size: tuple[int, int]) -> Any:
         flags = cv2.INTER_LINEAR
 
     return cv2.warpAffine(image, matrix, (width, height), flags=flags, borderValue=0)
+
+
+def _feather_inwards(alpha: Any, face_height: float, feather_ratio: float) -> Any:
+    """
+    Мягкий край аппликации, целиком лежащий внутри вырезанного силуэта.
+
+    Порядок ровно обратный `mask_generator.soften`: там область сначала
+    расширяют, чтобы спад ушёл наружу и залитое осталось непрозрачным, — для
+    зоны инпейнтинга это правильно. Здесь наружу уходить некуда: за контуром
+    волос лежит фон фотографии, и любой полупрозрачный пиксель там — это ореол.
+    Поэтому сначала эрозия, потом размытие: спад укладывается внутрь контура
+    целиком, а плато 255 отступает от края на ширину растушёвки.
+
+    Эрозия на пиксель шире ядра размытия — не запас «на всякий случай», а
+    ровно то, что делает гарантию строгой: гауссиан с ядром 2f+1 тянется на f
+    пикселей, и стартуй он с контура минус f, крайний пиксель контура получил бы
+    ненулевую альфу.
+
+    :param face_height: высота лица на шаблоне — база доли
+    """
+    import cv2
+
+    if feather_ratio < 0:
+        raise InvalidImageError(
+            "Растушёвка края аппликации не может быть отрицательной",
+            {"feather_ratio": feather_ratio},
+        )
+
+    feather = round(face_height * feather_ratio)
+    if feather <= 0:
+        return alpha
+
+    trim = feather + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * trim + 1, 2 * trim + 1))
+    return cv2.GaussianBlur(cv2.erode(alpha, kernel), (2 * feather + 1, 2 * feather + 1), 0)
 
 
 def _transform_points(points: Any, matrix: Any) -> Any:
@@ -314,6 +354,7 @@ def build(
     width_ratio: float = segmentation._WIDTH_RATIO,
     hair_ratio: float = segmentation._HAIR_RATIO,
     neck_ratio: float = segmentation._NECK_RATIO,
+    erode_ratio: float = segmentation._ERODE_RATIO,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
     erase_template_head: bool = True,
@@ -326,6 +367,7 @@ def build(
     :param emotion: имя трансформера мимики; пусто — нейтральное выражение
     :param model_photo: модель сегментации для фотографии
     :param model_cover: модель сегментации для обложки
+    :param erode_ratio: подрезка края силуэта, доля высоты лица
     :param colour_match: доля приведения тона кожи к шаблону, 0..1
     :param erase_template_head: стирать ли причёску персонажа из-под вклейки
     """
@@ -342,7 +384,7 @@ def build(
     target_points = _landmarks(target, "обложка")
 
     head = segmentation.cutout_head(
-        source, source_points, model_photo, width_ratio, hair_ratio, neck_ratio
+        source, source_points, model_photo, width_ratio, hair_ratio, neck_ratio, erode_ratio
     )
 
     # Мимика — до переноса: на вклеенной голове её правка поехала бы вместе с
@@ -367,8 +409,11 @@ def build(
     template_polygon = mask_generator.face_polygon(target_points)
     template_face_height = float(template_polygon[:, 1].max() - template_polygon[:, 1].min())
 
-    # Край аппликации: чуть размыть, чтобы контур волос не пилило антиалиасингом
-    alpha = mask_generator.soften(alpha, template_face_height, 0.0, feather_ratio)
+    # Край аппликации: чуть размыть, чтобы контур волос не пилило антиалиасингом.
+    # Эрозия перед размытием сдвигает весь спад внутрь силуэта — снаружи от
+    # вырезанного контура не остаётся ни одного полупрозрачного пикселя, то есть
+    # ни одного пикселя фона фотографии.
+    alpha = _feather_inwards(alpha, template_face_height, feather_ratio)
 
     # Кожа = лицо внутри силуэта. Волосы сюда не попадают, и коррекция их не
     # трогает — в этом весь смысл переноса причёски.
@@ -395,6 +440,7 @@ def build(
         "emotion": (emotion or expression.NEUTRAL).strip().lower(),
         "colour_match": colour_match,
         "segmenter": head.meta["model"],
+        "erode_px": head.meta["erode_px"],
         # Насколько силуэт заполнил отведённый эллипс головы. Близко к нулю —
         # сегментатор промахнулся, близко к единице — причёска упёрлась в
         # границу области, и часть волос могла остаться за кадром вклейки.

@@ -133,6 +133,19 @@ def test_donor_pixels_are_pasted_verbatim(same_pose, photo, cover):
     assert np.abs(result.image[core].astype(int) - photo[core].astype(int)).max() <= 1
 
 
+def test_feathered_edge_stays_inside_the_cutout(same_pose, photo, cover):
+    """
+    Растушёвка края ведётся внутрь силуэта. Симметричная вернула бы наружу те
+    самые пиксели фона фотографии, которые срезала эрозия в segmentation, —
+    только с половинной прозрачностью, то есть тем же ореолом вокруг волос.
+    """
+    hard = _build(photo, cover, feather_ratio=0.0)
+    soft = _build(photo, cover, feather_ratio=0.05)
+
+    assert not np.any((soft.head_alpha > 0) & (hard.head_alpha == 0))
+    assert 0 < int((soft.head_alpha > 0).sum()) < int((hard.head_alpha > 0).sum())
+
+
 def test_cover_outside_the_head_is_untouched(same_pose, photo, cover):
     result = _build(photo, cover)
 
