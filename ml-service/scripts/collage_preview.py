@@ -117,6 +117,13 @@ def main() -> int:
     # Пусто — искать линию одежды донора по цвету
     parser.add_argument("--neck-ratio", type=float, default=settings.head_neck_ratio)
     parser.add_argument("--erode-ratio", type=float, default=settings.head_erode_ratio)
+    # Масштаб: umeyama — по всем опорным точкам, остальные — по одной мерке
+    parser.add_argument(
+        "--scale-mark",
+        choices=[*sorted(collage_builder._SCALE_MARKS), "median", "umeyama"],
+        default=settings.head_scale_mark,
+    )
+    parser.add_argument("--no-anchor", action="store_true", help="не опускать шею к воротнику")
     # Затирка головы персонажа на шаблоне
     parser.add_argument(
         "--erase-method",
@@ -190,6 +197,8 @@ def main() -> int:
         hair_ratio=settings.head_hair_ratio,
         neck_ratio=args.neck_ratio,
         erode_ratio=args.erode_ratio,
+        scale_mark=args.scale_mark,
+        anchor_neck=not args.no_anchor,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
         erase_template_head=settings.collage_erase_template_head,

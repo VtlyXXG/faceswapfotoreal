@@ -59,8 +59,18 @@ def same_pose(monkeypatch, head_silhouette):
 
 
 def _build(photo, cover, **overrides):
-    """Аппликация без стирания причёски шаблона — оно проверяется отдельно."""
-    kwargs = {"erase_template_head": False, "feather_ratio": 0.0, "colour_match": 0.0}
+    """
+    Аппликация без стирания причёски шаблона — оно проверяется отдельно.
+
+    Якорь шеи тоже выключен: он двигает вклейку по холсту, а здесь проверяются
+    свойства самого преобразования. Ему посвящены отдельные тесты ниже.
+    """
+    kwargs = {
+        "erase_template_head": False,
+        "feather_ratio": 0.0,
+        "colour_match": 0.0,
+        "anchor_neck": False,
+    }
     kwargs.update(overrides)
     return collage.build(photo, cover, **kwargs)
 
@@ -391,3 +401,125 @@ def test_missing_face_reports_which_image(monkeypatch, photo, cover):
         _build(photo, cover)
 
     assert exc_info.value.details["image"] == "фотография заказчика"
+
+
+# --- Масштаб: строго по лицу ---
+
+
+def test_scale_never_sees_the_hair():
+    """
+    Главная гарантия: причёска в масштаб не входит. Донор с копной до плеч и
+    он же стриженый обязаны дать одинаковый масштаб — меняется силуэт, а не
+    лицо.
+    """
+    donor, template = face_mesh(), face_mesh(centre=(180, 220), scale=0.5)
+
+    _, scale = collage.similarity_transform(
+        [donor[i] for i in collage._ALIGN_POINTS],
+        [template[i] for i in collage._ALIGN_POINTS],
+    )
+
+    assert scale == pytest.approx(0.5, abs=0.02)
+    # Все опорные точки — из сетки лица, а она заканчивается на бровях
+    assert max(collage._ALIGN_POINTS) < 468
+
+
+def test_biometric_marks_are_measured_separately():
+    """
+    Мерки независимы и на стилизованном лице расходятся. Считаем их все и
+    кладём в метаданные: по одному числу потом не понять, почему голова вышла
+    такой.
+    """
+    ratios = collage.biometric_ratios(face_mesh(), face_mesh(scale=0.5))
+
+    assert {"eyes", "cheeks", "jaw", "face_height"} <= set(ratios)
+    for mark, value in ratios.items():
+        assert value == pytest.approx(0.5, abs=0.02), mark
+
+
+def test_median_mark_ignores_one_distorted_feature():
+    """
+    У рисованного персонажа глаза вдвое больше человеческих. Медиана обязана
+    это пережить — одна уехавшая мерка не должна тянуть масштаб за собой.
+    """
+    ratios = {"eyes": 1.6, "cheeks": 1.05, "jaw": 1.0, "face_height": 0.95}
+
+    assert collage.biometric_scale(ratios, "median") == pytest.approx(1.025, abs=0.01)
+    assert collage.biometric_scale(ratios, "eyes") == 1.6
+    assert collage.biometric_scale(ratios, "umeyama") is None
+
+
+def test_unknown_mark_is_refused():
+    with pytest.raises(InvalidImageError):
+        collage.biometric_scale({"eyes": 1.0}, "nose_length")
+
+
+def test_chosen_mark_sets_the_size(same_pose, photo, cover):
+    """Выбранная мерка должна действительно менять масштаб, а не только логи."""
+    default = _build(photo, cover)
+    forced = _build(photo, cover, scale_mark="eyes")
+
+    assert forced.meta["scale_mark"] == "eyes"
+    assert forced.meta["scale_marks"]["eyes"] == pytest.approx(1.0, abs=0.01)
+    assert default.meta["scale_mark"] == "umeyama"
+
+
+# --- Якорь шеи ---
+
+
+@pytest.fixture
+def cover_with_collar() -> np.ndarray:
+    """Обложка, где под подбородком персонажа есть кожа, а ниже — одежда."""
+    image = np.zeros((400, 400, 3), dtype=np.uint8)
+    image[:] = (60, 60, 60)
+    cv2.rectangle(image, (140, 150), (260, 400), (170, 180, 210), -1)  # лицо и шея
+    cv2.rectangle(image, (100, 330), (300, 400), (40, 90, 220), -1)  # воротник
+    return image
+
+
+def test_anchor_drops_the_head_onto_the_collar(same_pose, photo, cover_with_collar):
+    """
+    Шея на фотографии короче, чем у персонажа: голова, посаженная строго по
+    лицу, повисает над воротником. Якорь опускает её до нахлёста.
+    """
+    floating = _build(photo, cover_with_collar)
+    anchored = _build(photo, cover_with_collar, anchor_neck=True)
+
+    assert anchored.meta["anchor_px"] > 0
+    # Низ вклейки опустился ровно на величину сдвига
+    assert int(np.nonzero(anchored.head_alpha.any(axis=1))[0].max()) > int(
+        np.nonzero(floating.head_alpha.any(axis=1))[0].max()
+    )
+
+
+def test_anchor_does_not_lift_an_overlapping_neck(same_pose, photo, cover_with_collar):
+    """
+    Сдвиг только вниз. Если шея уже перекрыла воротник — это нахлёст, ровно то,
+    что нужно, и поднимать её обратно незачем.
+    """
+    result = _build(photo, cover_with_collar, anchor_neck=True, neck_ratio=1.0)
+
+    assert result.meta["anchor_px"] == 0.0
+
+
+def test_anchor_is_capped(same_pose, photo, cover_with_collar):
+    """
+    Потолок обязателен: дотянуть шею любой ценой означает уронить лицо ниже,
+    чем его нарисовал художник.
+    """
+    result = _build(photo, cover_with_collar, anchor_neck=True)
+
+    template_face = mask_generator.face_polygon(face_mesh())
+    height = float(template_face[:, 1].max() - template_face[:, 1].min())
+    assert result.meta["anchor_px"] <= collage._ANCHOR_MAX_RATIO * height + 1
+
+
+def test_anchor_is_skipped_when_the_collar_is_not_found(same_pose, photo, cover):
+    """
+    Ровная обложка: воротника не видно. Двигать лицо заказчика по холсту на
+    основании догадки нельзя — пусть лучше останется зазор, его хотя бы видно.
+    """
+    result = _build(photo, cover, anchor_neck=True)
+
+    assert result.meta["anchor_px"] == 0.0
+    assert result.meta["anchor_collar"] != "skin"

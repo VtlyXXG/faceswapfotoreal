@@ -257,7 +257,7 @@ def test_clothing_line_stops_at_the_collar():
 
     ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
 
-    assert meta["neck_source"] == "skin"
+    assert meta["neck_source"] == "collar"
     # Подбородок на y=260, воротник на 320: шеи 60 px при лице 80, минус отступ
     assert ratio == pytest.approx(60 / 80 - segmentation._COLLAR_MARGIN, abs=0.05)
 
@@ -272,7 +272,7 @@ def test_clothing_line_steps_over_the_shadow_under_the_chin():
 
     ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
 
-    assert meta["neck_source"] == "skin"
+    assert meta["neck_source"] == "collar"
     assert ratio > 0.5, "тень перешагнута, шея взята целиком"
 
 
@@ -285,7 +285,7 @@ def test_clothing_line_takes_what_it_can_when_the_frame_is_cropped():
 
     ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
 
-    assert meta["neck_source"] == "skin"
+    assert meta["neck_source"] == "frame", "кожа упёрлась в край кадра"
     assert segmentation._NECK_MIN_RATIO <= ratio <= 0.5
 
 
@@ -298,7 +298,7 @@ def test_turtleneck_leaves_almost_no_neck():
 
     ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
 
-    assert meta["neck_source"] == "skin"
+    assert meta["neck_source"] == "collar"
     assert ratio == segmentation._NECK_MIN_RATIO
 
 
@@ -337,5 +337,5 @@ def test_cutout_reports_where_the_cut_came_from(monkeypatch):
 
     head = segmentation.cutout_head(frame, face_mesh(), "stub")
 
-    assert head.meta["neck_source"] == "skin"
+    assert head.meta["neck_source"] == "collar"
     assert head.meta["neck_ratio"] > 0.3, "шея взята, а не отрезана по челюсти"

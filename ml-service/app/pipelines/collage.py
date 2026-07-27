@@ -55,6 +55,23 @@ _ALIGN_POINTS = (
     70, 300,  # внешние края бровей
 )
 
+# Биометрические мерки для масштаба — пары точек сетки, расстояние между
+# которыми меряется на обоих лицах. Причёски и габаритов головы здесь нет:
+# масштаб считается строго по лицу.
+_SCALE_MARKS = {
+    "pupils": (468, 473),  # зрачки; есть только при refine_landmarks
+    "eyes": (33, 263),  # внешние углы глаз
+    "cheeks": (234, 454),  # скулы на уровне ушей
+    "jaw": (172, 397),  # углы нижней челюсти
+    "face_height": (152, 9),  # подбородок → переносица
+}
+
+# На сколько высот лица разрешено опустить вклейку, чтобы шея дотянулась до
+# воротника. Сдвиг нужен, когда шеи на фотографии мало: голова, посаженная
+# строго по лицу, повисает над воротником. Но и уводить лицо далеко от того
+# места, где его нарисовал художник, нельзя — отсюда потолок.
+_ANCHOR_MAX_RATIO = 0.25
+
 # Растушёвка края аппликации, доля высоты лица. Коллаж намеренно жёсткий: это
 # ровно та ширина, которая убирает ступеньку антиалиасинга по контуру волос.
 # Настоящее сведение с фоном — работа второго шага.
@@ -127,7 +144,59 @@ def _landmarks(image: Any, role: str) -> list[tuple[int, int]]:
         raise NoFaceDetectedError(f"Не найдено лицо: {role}", {"image": role}) from exc
 
 
-def similarity_transform(source: Any, target: Any) -> tuple[Any, float]:
+def biometric_ratios(source: list, target: list) -> dict[str, float]:
+    """
+    Во сколько раз лицо шаблона больше лица донора — по каждой мерке отдельно.
+
+    Мерки независимы, и на рисованном персонаже они расходятся: у него глаза
+    вдвое больше человеческих, а лицо короче. На spread_08 расхождение доходит
+    до 18% — зрачки дают 1.60, скулы 1.48, челюсть 1.43, высота лица 1.35.
+    Поэтому «масштабировать по биометрии» — это не одно число, а выбор, какой
+    мерке верить; выбор живёт в ML_HEAD_SCALE_MARK, а сами числа уезжают в
+    метаданные, чтобы расхождение было видно на конкретном заказе.
+
+    Волос ни в одной мерке нет и быть не может: все точки — из сетки лица.
+    """
+    import numpy as np
+
+    ratios = {}
+    for mark, (first, second) in _SCALE_MARKS.items():
+        if max(first, second) >= min(len(source), len(target)):
+            continue  # зрачки есть только при refine_landmarks
+        src = np.linalg.norm(np.array(source[first], float) - np.array(source[second], float))
+        dst = np.linalg.norm(np.array(target[first], float) - np.array(target[second], float))
+        if src > 1e-6:
+            ratios[mark] = float(dst / src)
+    return ratios
+
+
+def biometric_scale(ratios: dict[str, float], mark: str) -> float | None:
+    """
+    Масштаб по выбранной мерке. None — оставить решение методу наименьших
+    квадратов (`umeyama`), то есть подгонку сразу по всем 18 опорным точкам.
+
+    Медиана здесь не «на всякий случай»: она устойчива к одной уехавшей мерке,
+    а уезжает на стилизованном лице обычно ровно одна — глаза.
+    """
+    import numpy as np
+
+    if mark == "umeyama":
+        return None
+    if not ratios:
+        raise InvalidImageError("Биометрические мерки не посчитаны", {"mark": mark})
+    if mark == "median":
+        return float(np.median(list(ratios.values())))
+    if mark not in ratios:
+        raise InvalidImageError(
+            "Неизвестная биометрическая мерка",
+            {"mark": mark, "available": [*sorted(ratios), "median", "umeyama"]},
+        )
+    return ratios[mark]
+
+
+def similarity_transform(
+    source: Any, target: Any, scale_override: float | None = None
+) -> tuple[Any, float]:
     """
     Преобразование подобия source → target методом наименьших квадратов.
 
@@ -137,12 +206,18 @@ def similarity_transform(source: Any, target: Any) -> tuple[Any, float]:
     повернуться и изменить размер целиком; ни растяжения по оси, ни сдвига
     (shear) такая матрица выразить не в состоянии.
 
+    Опорные точки — только лицевые (`_ALIGN_POINTS`): углы глаз, нос, рот,
+    подбородок, скулы, брови. Ни причёска, ни габариты головы в масштаб не
+    входят вовсе — ни при каком значении scale_override.
+
     Альтернатива — cv2.estimateAffinePartial2D — считает то же самое, но через
     RANSAC со случайными выборками: результат меняется от запуска к запуску, а
     для одинаковых входов пайплайн обязан давать одинаковый коллаж.
 
     :param source: точки-источники Nx2
     :param target: соответствующие им точки-приёмники Nx2
+    :param scale_override: взять масштаб отсюда, а не из МНК. Поворот и привязка
+        к центру лица остаются прежними — меняется только размер.
     :return: (матрица 2x3 float64, масштаб)
     """
     import numpy as np
@@ -169,11 +244,87 @@ def similarity_transform(source: Any, target: Any) -> tuple[Any, float]:
 
     rotation = u @ correction @ vt
     scale = float((singular * np.diag(correction)).sum() / variance)
+    if scale_override is not None:
+        if scale_override <= 0:
+            raise InvalidImageError(
+                "Масштаб должен быть положительным", {"scale": scale_override}
+            )
+        scale = float(scale_override)
 
     matrix = np.zeros((2, 3), dtype=np.float64)
     matrix[:, :2] = scale * rotation
     matrix[:, 2] = dst_mean - scale * rotation @ src_mean
     return matrix, scale
+
+
+def neck_anchor(
+    target: Any,
+    target_points: list,
+    neck_line: tuple,
+    matrix: Any,
+    face_height: float,
+    max_ratio: float = _ANCHOR_MAX_RATIO,
+) -> tuple[float, dict]:
+    """
+    На сколько опустить вклейку, чтобы шея донора дошла до воротника шаблона.
+
+    Совместить одним преобразованием подобия и лицо, и низ шеи невозможно:
+    длина шеи на фотографии своя, у персонажа своя. Лицо важнее — по нему и
+    считается матрица, — а низ шеи после этого оказывается где придётся. Если он
+    оказался выше воротника, между шеей и телом остаётся зазор, и голова висит в
+    воздухе; сюда и добавляется сдвиг.
+
+    Сдвиг только вниз и только по оси лица шаблона. Вверх двигать нечего: если
+    шея уже перекрыла воротник — это нахлёст, ровно то, что нужно.
+
+    Линия одежды персонажа ищется тем же способом, что и у донора, но по
+    сплошной альфе: сегментатор для этого не запускается — второй прогон на 4K
+    стоит секунд, а нужна здесь только граница кожи и ткани.
+
+    :param neck_line: отрезок низа шеи донора в координатах ФОТОГРАФИИ
+    :param matrix: преобразование донор → шаблон
+    :param face_height: высота лица на шаблоне
+    :return: (сдвиг в пикселях вдоль оси лица вниз, метаданные)
+    """
+    import numpy as np
+
+    from app.pipelines import segmentation
+
+    chin, up, _, _ = segmentation._axis(target_points)
+
+    solid = np.full(target.shape[:2], 255, dtype=np.uint8)
+    collar_ratio, collar_meta = segmentation.clothing_line(target, solid, target_points)
+
+    if collar_meta["neck_source"] != "collar":
+        # Найденного воротника нет: кожа упёрлась в край кадра, не кончилась
+        # вовсе или мерить было нечего. Сдвиг двигает лицо заказчика по холсту,
+        # и делать это по догадке нельзя — пусть лучше останется зазор, его
+        # хотя бы видно и он достаётся зоне стыка
+        log.info("якорь шеи пропущен: воротник персонажа не найден", extra=collar_meta)
+        return 0.0, {"anchor_px": 0.0, "anchor_collar": collar_meta["neck_source"]}
+
+    collar = chin - up * (collar_ratio * face_height)
+
+    # Низ шеи донора после переноса — середина отрезка среза
+    neck = _transform_points(np.array(neck_line, dtype=np.float64), matrix).mean(axis=0)
+
+    # Насколько воротник ниже низа шеи, вдоль оси лица шаблона
+    gap = float(np.dot(collar - neck, -up))
+    limit = max_ratio * face_height
+    offset = float(min(max(gap, 0.0), limit))
+
+    meta = {
+        "anchor_gap_px": round(gap, 1),
+        "anchor_px": round(offset, 1),
+        "anchor_collar": collar_meta["neck_source"],
+    }
+    if gap > limit:
+        # Шея настолько короче, что дотянуть её до воротника значит уронить лицо
+        # ниже, чем его нарисовал художник. Опускаем на сколько можно, остальное
+        # достаётся зоне стыка — но в логе это должно быть видно.
+        log.warning("шея не дотягивается до воротника даже со сдвигом", extra=meta)
+
+    return offset, meta
 
 
 def _warp(image: Any, matrix: Any, scale: float, size: tuple[int, int]) -> Any:
@@ -515,6 +666,8 @@ def build(
     hair_ratio: float = segmentation._HAIR_RATIO,
     neck_ratio: float | None = segmentation._NECK_RATIO,
     erode_ratio: float = segmentation._ERODE_RATIO,
+    scale_mark: str = "umeyama",
+    anchor_neck: bool = True,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
     erase_template_head: bool = True,
@@ -532,6 +685,9 @@ def build(
     :param model_cover: модель сегментации для обложки
     :param neck_ratio: докуда брать шею; None — искать линию одежды донора
     :param erode_ratio: подрезка края силуэта, доля высоты лица
+    :param scale_mark: по какой биометрической мерке считать масштаб;
+        umeyama — подгонка сразу по всем опорным точкам лица
+    :param anchor_neck: опускать ли вклейку до воротника, если шея не дотянулась
     :param colour_match: доля приведения тона кожи к шаблону, 0..1
     :param erase_template_head: стирать ли голову персонажа из-под вклейки
     :param erase_method: чем затягивать её место (pyramid, telea, ns)
@@ -560,21 +716,39 @@ def build(
         expression.Face(image=source, alpha=head.alpha, points=source_points), emotion
     )
 
+    # Масштаб — строго по лицу. Мерки считаются все, чтобы их расхождение было
+    # видно в метаданных: на рисованном персонаже они спорят между собой до 18%,
+    # и по одному числу потом не понять, почему голова вышла такой.
+    ratios = biometric_ratios(face.points, target_points)
     matrix, scale = similarity_transform(
         [face.points[i] for i in _ALIGN_POINTS],
         [target_points[i] for i in _ALIGN_POINTS],
+        biometric_scale(ratios, scale_mark),
     )
 
     height, width = target.shape[:2]
-    warped = _warp(face.image, matrix, scale, (width, height))
-    alpha = _warp(face.alpha, matrix, scale, (width, height))
-
-    face_polygon = _transform_points(mask_generator.face_polygon(face.points), matrix)
 
     # Все доли маски и растушёвок меряются от лица НА ШАБЛОНЕ: именно его
     # размер определяет, сколько пикселей занимает стык на этой обложке.
     template_polygon = mask_generator.face_polygon(target_points)
     template_face_height = float(template_polygon[:, 1].max() - template_polygon[:, 1].min())
+
+    # Якорь шеи — до переноса: сдвиг входит в ту же матрицу, иначе поедут и
+    # контур лица, и отрезок стыка, а маски строятся уже по ним
+    anchor_meta: dict = {"anchor_px": 0.0}
+    if anchor_neck:
+        offset, anchor_meta = neck_anchor(
+            target, target_points, head.neck_line, matrix, template_face_height
+        )
+        if offset > 0:
+            _, up, _, _ = segmentation._axis(target_points)
+            matrix = np.asarray(matrix, dtype=np.float64).copy()
+            matrix[:, 2] -= up * offset
+
+    warped = _warp(face.image, matrix, scale, (width, height))
+    alpha = _warp(face.alpha, matrix, scale, (width, height))
+
+    face_polygon = _transform_points(mask_generator.face_polygon(face.points), matrix)
 
     # Край аппликации: чуть размыть, чтобы контур волос не пилило антиалиасингом.
     # Эрозия перед размытием сдвигает весь спад внутрь силуэта — снаружи от
@@ -622,6 +796,11 @@ def build(
         # аппликацию приехал воротник
         "neck_ratio": head.meta["neck_ratio"],
         "neck_source": head.meta["neck_source"],
+        # Масштаб и его разброс по меркам: если голова вышла велика или мала,
+        # смотреть надо сюда, а не на габариты причёски
+        "scale_mark": scale_mark,
+        "scale_marks": {name: round(value, 3) for name, value in ratios.items()},
+        **anchor_meta,
         # Насколько силуэт заполнил отведённый эллипс головы. Близко к нулю —
         # сегментатор промахнулся, близко к единице — причёска упёрлась в
         # границу области, и часть волос могла остаться за кадром вклейки.

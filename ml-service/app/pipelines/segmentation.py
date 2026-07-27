@@ -205,8 +205,17 @@ def clothing_line(
     проверку, поэтому короткие разрывы перешагиваются — иначе срез встал бы
     вплотную к подбородку, ради избавления от чего всё и затевалось.
 
-    Отказывать нельзя ни в одном случае: фотографии присылают заказчики. Кадр
-    обрезан под подбородком — берём, сколько есть; свитер под горло — fallback.
+    Отказывать нельзя ни в одном случае: фотографии присылают заказчики. Поэтому
+    вместе с числом возвращается и то, чем поиск кончился (`neck_source`):
+
+      collar   — кожа кончилась и больше не началась. Воротник найден;
+      frame    — кожа дошла до края кадра. Кадр обрезан, берём сколько есть;
+      open     — кожа не кончилась и на предельной глубине. Границы не видно;
+      fallback — мерить нечего вовсе.
+
+    Разница не косметическая: для вырезки годится любой исход, а вот двигать
+    вклейку по холсту (`collage.neck_anchor`) можно только по найденному
+    воротнику — по догадке нельзя.
 
     :param image: BGR-кадр донора
     :param alpha: его же бинарный силуэт
@@ -234,9 +243,11 @@ def clothing_line(
     gap = max(1, int(round(_SKIN_GAP_RATIO * face_height)))
 
     last_skin = 0
+    source = "open"  # кожа не кончилась и на предельной глубине
     for step in range(depth + 1):
         x, y = np.rint(chin - up * float(step)).astype(int)
         if not (0 <= x < width and 0 <= y < height):
+            source = "frame"
             break
 
         pixel = lab[y, x]
@@ -248,6 +259,7 @@ def clothing_line(
         if skin:
             last_skin = step
         elif step - last_skin > gap:
+            source = "collar"
             break
 
     meta = {"skin_px": last_skin, "skin_gap_px": gap}
@@ -256,7 +268,7 @@ def clothing_line(
 
     return _clamp_neck(last_skin / face_height - _COLLAR_MARGIN), {
         **meta,
-        "neck_source": "skin",
+        "neck_source": source,
     }
 
 
