@@ -1,26 +1,25 @@
 """
-Оркестрация замены лица: коллаж локально → лёгкая стилизация на fal.ai.
+Оркестрация замены лица: фото-аппликация локально → сведение стыка на fal.ai.
 
 Пайплайн из двух шагов, и порядок в нём принципиален:
 
-  1. **Коллаж** (`collage.py`, локально, OpenCV + mediapipe). Лицо с фотографии
-     переносится в шаблон преобразованием подобия и вклеивается оригинальными
-     пикселями. Геометрия лица на этом шаге переносится ровно один в один.
-  2. **Стилизация** (`fal_api.py`, на fal.ai). Тот же коллаж уходит в
-     инпейнтинг по маске с очень низким strength — модель накладывает мазок
-     кисти, согласует свет и растворяет шов склейки, но зашумление слишком
-     слабое, чтобы она могла изменить черты лица и пропорции.
+  1. **Аппликация** (`collage.py`, локально: rembg + OpenCV + mediapipe).
+     Голова заказчика — лицо вместе с причёской — вырезается по силуэту
+     сегментатора и вклеивается в шаблон преобразованием подобия. Геометрия
+     переносится один в один, цвет и структура волос сохраняются.
+  2. **Сведение стыка** (`fal_api.py`, на fal.ai). Коллаж уходит в инпейнтинг
+     по маске с экстремально низким strength. Маска накрывает только внешний
+     контур волос, срез шеи и следы стирания чужой причёски — лицо из неё
+     вычтено явно, модель до него физически не дотягивается.
 
-Прежняя схема — отдать fal чистую обложку и попросить нарисовать лицо по
-референсу при strength 0.82 — портретного сходства не давала: при таком шуме
-модель рисует лицо заново, а не переносит. Сходство и стилизация здесь
-разведены по разным шагам именно поэтому.
-
-Маска обязательна и накрывает объединение двух контуров: лица шаблона и
-вклейки. Иначе шов коллажа оказался бы вне зоны инпейнтинга и остался виден.
+Прежние схемы и почему они не подошли: при strength 0.82 модель рисовала лицо
+заново по референсу и портретного сходства не давала; версия с переносом одного
+лишь овала лица сохраняла сходство, но оставляла заказчику причёску
+нарисованного персонажа.
 
 Контракт SwapRequest/SwapResult сохранён прежним: Node.js API получает те же
-бинарный ответ и заголовок X-Swap-Meta, что и раньше.
+бинарный ответ и заголовок X-Swap-Meta, что и раньше. Добавилось одно
+необязательное поле `emotion` — параметр будущей трансформации мимики.
 """
 
 from __future__ import annotations
@@ -51,6 +50,9 @@ def _sniff_mime(data: bytes) -> str:
 class SwapRequest:
     source: bytes
     target: bytes
+    # Мимика вклеиваемого лица. Пусто — нейтральное выражение, то есть лицо как
+    # снято. Список доступных значений — expression.available().
+    emotion: str = ""
     target_face_index: int | None = None
     swap_all_faces: bool = False
     enhance: bool = False
@@ -69,25 +71,37 @@ class SwapResult:
 
 
 def run(request: SwapRequest) -> SwapResult:
-    # Шаг 1. Лицо переносится локально: отсутствие лица в любом из двух кадров —
-    # 422 из детектора, с пометкой в деталях, какой именно кадр не подошёл.
+    # Шаг 1. Голова переносится локально: отсутствие лица в любом из двух
+    # кадров — 422 из детектора, с пометкой, какой именно кадр не подошёл.
     target_image = decode_image(request.target)
     source_image = decode_image(request.source)
 
     collage = collage_builder.build(
         source_image,
         target_image,
-        grow_ratio=settings.collage_grow_ratio,
+        emotion=request.emotion,
+        model_photo=settings.seg_model_photo,
+        model_cover=settings.seg_model_cover,
+        width_ratio=settings.head_width_ratio,
+        hair_ratio=settings.head_hair_ratio,
+        neck_ratio=settings.head_neck_ratio,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
+        erase_template_head=settings.collage_erase_template_head,
     )
 
-    # Маска — по объединению контуров: и лицо шаблона, и вклейка целиком, чтобы
-    # шов склейки заведомо оказался внутри зоны инпейнтинга.
-    mask = mask_generator.mask_from_polygons(
+    # Маска — только стык: контур волос, срез шеи и следы стирания чужой
+    # причёски. Лицо из неё вычитается внутри blend_mask.
+    mask = mask_generator.blend_mask(
         target_image.shape[:2],
-        [collage.face_polygon, collage.paste_polygon],
-        padding_ratio=settings.mask_padding_ratio,
+        collage.head_alpha,
+        collage.face_polygon,
+        collage.neck_line,
+        collage.erased,
+        collage.meta["face_height_target"],
+        edge_ratio=settings.mask_edge_ratio,
+        neck_ratio=settings.mask_neck_ratio,
+        guard_ratio=settings.mask_guard_ratio,
         feather_ratio=settings.mask_feather_ratio,
     )
     mask_png, _ = encode_image(mask, "png")

@@ -24,9 +24,12 @@ def test_readiness_reports_provider():
 
     body = response.json()
     assert body["status"] in ("ready", "degraded")
-    assert set(body["runtime"]) == {"mediapipe", "opencv", "fal_client"}
+    assert set(body["runtime"]) == {"mediapipe", "opencv", "fal_client", "rembg"}
     assert body["provider"]["model"]
     assert body["mask"]["detector"] == "mediapipe/face_mesh"
+    # Оба шага пайплайна видны снаружи: сегментатор с весами и список эмоций
+    assert body["collage"]["segmenter_photo"]
+    assert "neutral" in body["expressions"]
 
     # degraded обязан объяснять причину, ready — не имеет её
     if body["status"] == "degraded":

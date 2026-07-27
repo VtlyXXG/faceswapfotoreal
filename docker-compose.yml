@@ -59,15 +59,19 @@ services:
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
       ML_ALLOWED_ORIGINS: http://localhost:3000
-      # Стилизация выполняется на fal.ai — без ключа /health/ready даёт degraded
+      # Сведение стыка выполняется на fal.ai — без ключа /health/ready даёт degraded
       FAL_KEY: ${FAL_KEY:-}
-      # Лицо переносится локально коллажем, fal только стилизует его по маске.
-      # strength держится в диапазоне 0.15–0.30: выше модель начинает
-      # перерисовывать вклеенные пиксели и портретное сходство теряется.
+      # Веса сегментатора лежат в образе (см. ml-service/Dockerfile), качать их
+      # в рантайме не нужно
+      U2NET_HOME: /opt/rembg
+      # Голова переносится локально аппликацией, fal сводит только стык.
+      # strength держится в диапазоне 0.15–0.25: выше модель начинает
+      # перерисовывать вклеенные пиксели и сходство с причёской теряется.
       # Подбирается в .env без пересборки: docker compose up -d ml-service
-      ML_FAL_STRENGTH: ${ML_FAL_STRENGTH:-0.22}
+      ML_FAL_STRENGTH: ${ML_FAL_STRENGTH:-0.20}
       ML_FAL_GUIDANCE_SCALE: ${ML_FAL_GUIDANCE_SCALE:-2.5}
       ML_COLLAGE_COLOUR_MATCH: ${ML_COLLAGE_COLOUR_MATCH:-0.8}
+      ML_COLLAGE_ERASE_TEMPLATE_HEAD: ${ML_COLLAGE_ERASE_TEMPLATE_HEAD:-true}
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
       interval: 10s

@@ -30,19 +30,34 @@ class RuntimeStatus(BaseModel):
     mediapipe: bool
     opencv: bool
     fal_client: bool
+    rembg: bool
 
 
 class ProviderStatus(BaseModel):
     model: str
     key_present: bool
     key_env: str
+    # Главная ручка пайплайна: подбирается из окружения на живом сервисе
+    strength: float
 
 
 class MaskStatus(BaseModel):
     detector: str
-    # Доли высоты лица: сплошное поле вокруг контура и ширина растушёвки за ним
-    padding_ratio: float
+    # Доли высоты лица: кольцо вдоль контура волос, полоса на срезе шеи,
+    # защита лица и общий спад по краям зоны
+    edge_ratio: float
+    neck_ratio: float
+    guard_ratio: float
     feather_ratio: float
+
+
+class CollageStatus(BaseModel):
+    segmenter_photo: str
+    segmenter_cover: str
+    # Скачаны ли веса сегментатора: иначе первый заказ ждёт ~176 МБ на модель
+    weights_ready: bool
+    colour_match: float
+    erase_template_head: bool
 
 
 class ReadinessResponse(BaseModel):
@@ -50,6 +65,8 @@ class ReadinessResponse(BaseModel):
     runtime: RuntimeStatus
     provider: ProviderStatus
     mask: MaskStatus
+    collage: CollageStatus
+    expressions: list[str] = Field(description="Допустимые значения параметра emotion")
     reason: str | None = Field(default=None, description="Почему degraded")
 
 

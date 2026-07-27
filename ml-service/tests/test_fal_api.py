@@ -98,12 +98,12 @@ def test_arguments_match_endpoint_schema(client):
 def test_strength_stays_low(client):
     """
     Смысл второго шага — не тронуть вклеенные пиксели. Дефолт обязан лежать в
-    диапазоне «мазок есть, черты целы»: выше него модель перерисовывает лицо, и
-    коллаж, ради которого всё затевалось, пропадает впустую.
+    диапазоне «мазок есть, черты и волосы целы»: выше него модель перерисовывает
+    лицо и плывёт контур причёски, а аппликация пропадает впустую.
     """
     _call()
 
-    assert 0.15 <= client.arguments["strength"] <= 0.30
+    assert 0.15 <= client.arguments["strength"] <= 0.25
 
 
 def test_collage_goes_first_and_reference_second(client):

@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import os
 from importlib.util import find_spec
+from pathlib import Path
 
 from app.config import settings
-from app.pipelines import fal_api
+from app.pipelines import expression, fal_api
 
 
 def _installed(module: str) -> bool:
@@ -19,6 +21,21 @@ def _installed(module: str) -> bool:
         return find_spec(module) is not None
     except (ImportError, ValueError):
         return False
+
+
+def _weights_ready() -> bool:
+    """
+    Скачаны ли веса сегментатора.
+
+    Первый вызов тянет ~176 МБ на модель, и заказ, попавший на эту загрузку,
+    ждёт её минутами. В /health/ready это видно заранее — до того, как в
+    очередь встанет живой заказ.
+    """
+    home = os.environ.get("U2NET_HOME") or Path.home() / ".u2net"
+    return all(
+        (Path(home) / f"{model}.onnx").exists()
+        for model in {settings.seg_model_photo, settings.seg_model_cover}
+    )
 
 
 def warmup() -> None:
@@ -35,6 +52,7 @@ def status() -> dict:
             "mediapipe": _installed("mediapipe"),
             "opencv": _installed("cv2"),
             "fal_client": _installed("fal_client"),
+            "rembg": _installed("rembg"),
         },
         "provider": {
             "model": settings.fal_model,
@@ -46,14 +64,20 @@ def status() -> dict:
         },
         "mask": {
             "detector": "mediapipe/face_mesh",
-            "padding_ratio": settings.mask_padding_ratio,
+            "edge_ratio": settings.mask_edge_ratio,
+            "neck_ratio": settings.mask_neck_ratio,
+            "guard_ratio": settings.mask_guard_ratio,
             "feather_ratio": settings.mask_feather_ratio,
         },
         # Первый шаг пайплайна виден отдельно: по этим числам сразу понятно,
-        # выполняется ли перенос лица локально и с какими допусками.
+        # выполняется ли перенос головы локально и с какими допусками.
         "collage": {
-            "grow_ratio": settings.collage_grow_ratio,
-            "feather_ratio": settings.collage_feather_ratio,
+            "segmenter_photo": settings.seg_model_photo,
+            "segmenter_cover": settings.seg_model_cover,
+            "weights_ready": _weights_ready(),
             "colour_match": settings.collage_colour_match,
+            "erase_template_head": settings.collage_erase_template_head,
         },
+        # Мимика: какие значения параметра emotion эндпоинт сейчас принимает
+        "expressions": expression.available(),
     }

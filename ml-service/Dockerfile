@@ -18,11 +18,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
+# Веса сегментатора кладутся в образ на сборке. Иначе их скачивает первый же
+# заказ: ~176 МБ на модель, минуты ожидания в задаче, которая должна была
+# просто выполниться, — и так в каждом новом контейнере при масштабировании.
+ENV U2NET_HOME=/opt/rembg
+RUN python -c "from rembg import new_session; [new_session(m) for m in ('u2net_human_seg', 'u2net')]"
+
 COPY pyproject.toml ./
 COPY app ./app
 
-# Локальных весов больше нет: инференс выполняется на fal.ai, а маска лица
-# считается mediapipe, который везёт свою модель внутри пакета.
+# Диффузия идёт на fal.ai; локально работают только mediapipe (везёт свою
+# модель внутри пакета) и сегментатор rembg с весами из /opt/rembg.
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

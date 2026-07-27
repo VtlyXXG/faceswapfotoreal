@@ -1,12 +1,9 @@
 """
-Первый шаг пайплайна: перенос лица и жёсткая вклейка.
+Первый шаг пайплайна: перенос головы и жёсткая аппликация.
 
-Главное свойство, которое здесь проверяется, — геометрия донора не меняется.
-Ради него весь двухшаговый пайплайн и появился: заказчику нужно портретное
-сходство, а не «похожее» лицо, нарисованное моделью.
-
-mediapipe не запускается: сетка подменяется заглушкой, потому что тесты про
-перенос и вклейку, а не про детектор.
+Главных свойств два, и оба — про то, ради чего пайплайн переписывали:
+геометрия донора не меняется, а волосы сохраняют свой цвет. Ни mediapipe, ни
+rembg не запускаются: сетка и силуэт подменяются заглушками.
 """
 
 import cv2
@@ -14,71 +11,66 @@ import numpy as np
 import pytest
 
 from app.core.errors import InvalidImageError, NoFaceDetectedError
-from app.pipelines import collage, mask_generator
+from app.pipelines import collage, expression, mask_generator, segmentation
+from tests.conftest import face_mesh
 
-
-def _mesh(centre=(200, 200), scale=1.0, angle=0.0) -> list[tuple[int, int]]:
-    """
-    468 точек-заглушек: лицо-эллипс, повёрнутое и промасштабированное как надо.
-
-    Точки раскладываются по кругу, чтобы контур получался выпуклым, а опорные
-    индексы — различимыми: заглушка «все точки в одной координате» не дала бы
-    проверить ни поворот, ни масштаб.
-    """
-    points = [(centre[0], centre[1])] * 468
-    radians = np.radians(angle)
-    rotation = np.array(
-        [[np.cos(radians), -np.sin(radians)], [np.sin(radians), np.cos(radians)]]
-    )
-
-    def place(index: int, dx: float, dy: float) -> None:
-        x, y = rotation @ (np.array([dx, dy]) * scale)
-        points[index] = (int(round(centre[0] + x)), int(round(centre[1] + y)))
-
-    arc = mask_generator._JAW_ARC
-    for offset, index in enumerate(arc):
-        angle_step = np.pi * offset / (len(arc) - 1)
-        place(index, 90 * np.cos(angle_step), 90 * np.sin(angle_step))
-
-    brows = mask_generator._BROW_ARC
-    for offset, index in enumerate(brows):
-        place(index, -70 + offset * 15, -60)
-
-    # Опорные точки совмещения: без них similarity_transform считает по
-    # вырожденному набору (все индексы указывают в центр).
-    for offset, index in enumerate(collage._ALIGN_POINTS):
-        if points[index] != (centre[0], centre[1]):
-            continue
-        place(index, -40 + (offset % 5) * 20, -30 + (offset // 5) * 25)
-
-    return points
+# Цвет «волос» на тестовой фотографии — намеренно ядовитый: любую перекраску
+# видно сразу.
+_HAIR = (30, 200, 40)
+_SKIN = (170, 180, 200)
 
 
 @pytest.fixture
 def photo() -> np.ndarray:
-    """Шумовая «фотография»: на равномерной заливке вклейку не увидеть."""
-    rng = np.random.default_rng(seed=17)
-    return rng.integers(0, 255, size=(400, 400, 3), dtype=np.uint8)
+    """
+    Фотография: зелёные волосы вокруг светлого лица.
+
+    Разделение на кожу и волосы здесь принципиально — на них держится проверка,
+    что LAB-коррекция трогает только кожу.
+    """
+    image = np.zeros((400, 400, 3), dtype=np.uint8)
+    image[:] = _HAIR
+    cv2.fillPoly(image, [mask_generator.face_polygon(face_mesh())], _SKIN)
+    return image
 
 
 @pytest.fixture
 def cover() -> np.ndarray:
-    """«Обложка» ровного цвета — сразу видно, что от неё осталось."""
+    """Обложка ровного цвета — сразу видно, что от неё осталось."""
     return np.full((400, 400, 3), 60, dtype=np.uint8)
 
 
 @pytest.fixture
-def same_pose(monkeypatch):
+def head_silhouette(monkeypatch):
+    """Сегментатор, отдающий круглую голову вокруг лица заглушки."""
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.circle(alpha, (200, 190), 130, 255, -1)
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+
+@pytest.fixture
+def same_pose(monkeypatch, head_silhouette):
     """Лица донора и шаблона совпадают: преобразование должно выйти единичным."""
-    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: _mesh())
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+
+def _build(photo, cover, **overrides):
+    """Аппликация без стирания причёски шаблона — оно проверяется отдельно."""
+    kwargs = {"erase_template_head": False, "feather_ratio": 0.0, "colour_match": 0.0}
+    kwargs.update(overrides)
+    return collage.build(photo, cover, **kwargs)
 
 
 # --- Преобразование подобия ---
 
 
 def test_transform_recovers_known_pose():
-    source = np.array(_mesh(), dtype=np.float64)[list(collage._ALIGN_POINTS)]
-    target = np.array(_mesh(centre=(300, 250), scale=0.5, angle=20), dtype=np.float64)[
+    source = np.array(face_mesh(), dtype=np.float64)[list(collage._ALIGN_POINTS)]
+    target = np.array(face_mesh(centre=(300, 250), scale=0.5, angle=20), dtype=np.float64)[
         list(collage._ALIGN_POINTS)
     ]
 
@@ -89,15 +81,15 @@ def test_transform_recovers_known_pose():
     assert np.abs(projected - target).max() < 2
 
 
-def test_transform_cannot_distort_the_face():
+def test_transform_cannot_distort_the_head():
     """
     Четыре степени свободы вместо шести — то, что физически запрещает модели
     геометрии подогнать донора под форму чужого лица. У матрицы [s·R | t]
     столбцы ортогональны и равны по длине; у аффина это не так, и лицо едет.
     """
-    source = np.array(_mesh(), dtype=np.float64)[list(collage._ALIGN_POINTS)]
+    source = np.array(face_mesh(), dtype=np.float64)[list(collage._ALIGN_POINTS)]
     # Приёмник намеренно «сплюснут» по вертикали: полный аффин сжал бы лицо
-    stretched = np.array(_mesh(centre=(210, 190)), dtype=np.float64)
+    stretched = np.array(face_mesh(centre=(210, 190)), dtype=np.float64)
     stretched[:, 1] *= 0.6
     target = stretched[list(collage._ALIGN_POINTS)]
 
@@ -115,101 +107,170 @@ def test_transform_rejects_degenerate_points():
         collage.similarity_transform(same, same)
 
 
-# --- Вклейка ---
+# --- Аппликация ---
+
+
+def test_hair_is_transferred_with_the_head(same_pose, photo, cover):
+    """
+    Главное новое требование: причёска донора переносится вместе с лицом. Над
+    лбом на обложке должны оказаться его волосы, а не персонажа.
+    """
+    result = _build(photo, cover)
+
+    above_brow = result.image[110, 200]
+    assert tuple(int(v) for v in above_brow) == _HAIR
 
 
 def test_donor_pixels_are_pasted_verbatim(same_pose, photo, cover):
     """
-    Сердце всей затеи: внутри контура остаются пиксели фотографии, а не их
+    Сердце всей затеи: внутри силуэта остаются пиксели фотографии, а не их
     интерпретация. Проверяется на совпадающих позах и без коррекции цвета —
     тогда перенос обязан быть тождественным.
     """
-    result = collage.build(photo, cover, grow_ratio=0.0, feather_ratio=0.0, colour_match=0.0)
+    result = _build(photo, cover)
 
-    inside = np.zeros(cover.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(inside, [result.paste_polygon], 255)
-    # Край контура сглажен антиалиасингом заливки — сравниваем заведомо
-    # внутренние пиксели
-    core = cv2.erode(inside, np.ones((5, 5), np.uint8)) > 0
-
+    core = cv2.erode(result.head_alpha, np.ones((7, 7), np.uint8)) > 250
     assert np.abs(result.image[core].astype(int) - photo[core].astype(int)).max() <= 1
 
 
-def test_cover_outside_the_paste_is_untouched(same_pose, photo, cover):
-    result = collage.build(photo, cover, grow_ratio=0.0, feather_ratio=0.0, colour_match=0.0)
+def test_cover_outside_the_head_is_untouched(same_pose, photo, cover):
+    result = _build(photo, cover)
 
-    outside = np.zeros(cover.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(outside, [result.paste_polygon], 255)
-    untouched = cv2.dilate(outside, np.ones((5, 5), np.uint8)) == 0
-
-    assert np.array_equal(result.image[untouched], cover[untouched])
+    outside = cv2.dilate(result.head_alpha, np.ones((7, 7), np.uint8)) == 0
+    assert np.array_equal(result.image[outside], cover[outside])
 
 
-def test_paste_covers_the_template_face(same_pose, photo, cover):
-    """Черты персонажа обложки должны уйти под вклейку целиком."""
-    result = collage.build(photo, cover)
-
-    assert result.meta["coverage"] >= 0.9
-
-
-def test_grow_widens_the_paste(same_pose, photo, cover):
-    narrow = collage.build(photo, cover, grow_ratio=0.0, feather_ratio=0.0)
-    wide = collage.build(photo, cover, grow_ratio=0.08, feather_ratio=0.0)
-
-    changed = lambda result: np.count_nonzero(  # noqa: E731
-        (result.image != cover).any(axis=2)
-    )
-    assert changed(wide) > changed(narrow)
-
-
-def test_scaled_donor_keeps_its_proportions(monkeypatch, photo, cover):
+def test_scaled_donor_keeps_its_proportions(monkeypatch, head_silhouette, photo, cover):
     """
-    Лицо донора вдвое крупнее лица на обложке: после переноса контур вклейки
-    обязан совпасть с лицом шаблона по обеим осям одинаково — иначе где-то
-    затесался неравномерный масштаб.
+    Лицо донора вдвое крупнее лица на обложке: после переноса контур обязан
+    совпасть с лицом шаблона по обеим осям одинаково — иначе где-то затесался
+    неравномерный масштаб.
     """
-    meshes = iter([_mesh(scale=2.0), _mesh(centre=(180, 220), scale=1.0)])
+    meshes = iter([face_mesh(scale=2.0), face_mesh(centre=(180, 220))])
     monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: next(meshes))
 
-    result = collage.build(photo, cover, grow_ratio=0.0, feather_ratio=0.0)
+    result = _build(photo, cover)
 
-    paste, template = result.paste_polygon, result.face_polygon
+    face, template = result.face_polygon, mask_generator.face_polygon(face_mesh(centre=(180, 220)))
     for axis in (0, 1):
-        size_paste = paste[:, axis].max() - paste[:, axis].min()
-        size_template = template[:, axis].max() - template[:, axis].min()
-        assert size_paste == pytest.approx(size_template, abs=3)
+        assert (face[:, axis].max() - face[:, axis].min()) == pytest.approx(
+            template[:, axis].max() - template[:, axis].min(), abs=3
+        )
     assert result.meta["scale"] == pytest.approx(0.5, abs=0.02)
 
 
-# --- Приведение цвета ---
+# --- Коррекция тона: кожа да, волосы нет ---
 
 
-def test_colour_match_pulls_tone_towards_the_cover(same_pose, cover):
-    """Свет и тон подгоняются локально: при strength ~0.2 модель не успевает."""
-    bright = np.full((400, 400, 3), 230, dtype=np.uint8)
+def test_colour_match_pulls_skin_towards_the_cover(same_pose, photo, cover):
+    plain = _build(photo, cover, colour_match=0.0)
+    matched = _build(photo, cover, colour_match=1.0)
 
-    plain = collage.build(bright, cover, colour_match=0.0)
-    matched = collage.build(bright, cover, colour_match=1.0)
-
-    region = np.zeros(cover.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(region, [matched.paste_polygon], 255)
-    core = cv2.erode(region, np.ones((9, 9), np.uint8)) > 0
+    skin = np.zeros(cover.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(skin, [matched.face_polygon], 255)
+    core = cv2.erode(skin, np.ones((15, 15), np.uint8)) > 0
 
     assert abs(float(matched.image[core].mean()) - 60) < abs(float(plain.image[core].mean()) - 60)
 
 
+def test_colour_match_leaves_the_hair_alone(same_pose, photo, cover):
+    """
+    Волосы переносят ради того, чтобы они остались волосами заказчика.
+    Подтянуть их к палитре персонажа — значит перекрасить донора.
+    """
+    matched = _build(photo, cover, colour_match=1.0)
+
+    assert tuple(int(v) for v in matched.image[110, 200]) == _HAIR
+
+
 def test_colour_match_ratio_is_validated(same_pose, photo, cover):
     with pytest.raises(InvalidImageError):
-        collage.build(photo, cover, colour_match=1.5)
+        _build(photo, cover, colour_match=1.5)
 
 
-# --- Отказы ---
+# --- Стирание причёски персонажа ---
+
+
+def test_template_hair_outside_the_paste_is_erased(monkeypatch, photo, cover):
+    """
+    У длинноволосого персонажа вокруг вклеенной головы остаётся его
+    собственная шевелюра — на развороте это читается как два человека.
+    Понизить strength и попросить модель убрать её нельзя: на 0.2 она ничего
+    не убирает.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        # Голова персонажа заметно шире вклеиваемой: у заказчика стрижка,
+        # у героя обложки грива до плеч
+        radius = 70 if model == "photo" else 190
+        cv2.circle(alpha, (200, 190), radius, 255, -1)
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(
+        photo, cover, model_photo="photo", model_cover="cover", colour_match=0.0
+    )
+
+    assert result.erased.any(), "торчащая причёска персонажа должна попасть в стирание"
+    assert result.meta["erased_ratio"] > 0
+
+
+def test_segmenter_failure_on_the_cover_does_not_kill_the_order(monkeypatch, photo, cover):
+    """
+    Рисованный персонаж — не тот материал, на котором учили U²-Net. Промах на
+    обложке обязан стоить предупреждения в логе, а не отказа заказчику.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    def _silhouette(image, model):
+        if model == "cover":
+            return np.zeros(image.shape[:2], dtype=np.uint8)
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.circle(alpha, (200, 190), 130, 255, -1)
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(photo, cover, model_photo="photo", model_cover="cover")
+
+    assert result.meta["erased_ratio"] is None
+    assert not result.erased.any()
+
+
+# --- Мимика и отказы ---
+
+
+def test_expression_runs_before_the_paste(same_pose, photo, cover, monkeypatch):
+    """
+    Точка расширения должна получать вырезанную голову и влиять на результат:
+    иначе параметр эмоции окажется декоративным.
+    """
+    seen = {}
+
+    def _spy(face, emotion=""):
+        seen["emotion"] = emotion
+        seen["has_alpha"] = bool(face.alpha.any())
+        return expression.Face(image=face.image, alpha=face.alpha, points=face.points)
+
+    monkeypatch.setattr(collage.expression, "transform", _spy)
+
+    _build(photo, cover, emotion="grin")
+
+    assert seen == {"emotion": "grin", "has_alpha": True}
+
+
+def test_unknown_emotion_is_refused(same_pose, photo, cover):
+    with pytest.raises(expression.ExpressionNotSupportedError):
+        _build(photo, cover, emotion="smile")
 
 
 def test_missing_face_reports_which_image(monkeypatch, photo, cover):
     """
-    Раньше 422 всегда означала «нет лица на обложке». Теперь лицо ищется в двух
-    кадрах, и без пометки заказчик не поймёт, что переснимать.
+    Лицо ищется в двух кадрах, и без пометки заказчик не поймёт, что
+    переснимать: фотографию или подбирать другой шаблон.
     """
 
     def _fail(_):
@@ -218,6 +279,6 @@ def test_missing_face_reports_which_image(monkeypatch, photo, cover):
     monkeypatch.setattr(mask_generator, "face_landmarks", _fail)
 
     with pytest.raises(NoFaceDetectedError) as exc_info:
-        collage.build(photo, cover)
+        _build(photo, cover)
 
     assert exc_info.value.details["image"] == "фотография заказчика"

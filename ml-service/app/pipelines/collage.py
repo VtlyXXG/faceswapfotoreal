@@ -1,39 +1,31 @@
 """
-Шаг 1 замены лица: жёсткий коллаж из оригинальных пикселей фотографии.
+Шаг 1 замены лица: фото-аппликация головы донора на шаблон.
 
-Зачем он вообще нужен. Раньше пайплайн отдавал fal обложку, маску и фото
-заказчика как референс личности, а перерисовку вела модель при strength 0.82 —
-то есть область под маской зашумлялась почти до нуля и рисовалась заново «по
-мотивам» референса. Похожесть при этом держится только на том, насколько хорошо
-модель прочитала личность с одного фото, и портретного сходства она не даёт:
-геометрия лица уезжает. Заказчику нужно ровно обратное — 100% сохранение
-геометрии при лёгкой стилизации.
+Что переносится. Голова целиком — лицо вместе с причёской, её цветом, длиной и
+структурой. Силуэт даёт сегментатор (`segmentation.py`), а не сетка лица: сетка
+про волосы ничего не знает. Раньше переносился только овал лица, и причёска
+оставалась от нарисованного персонажа — требование изменилось.
 
-Поэтому личность теперь переносится не моделью, а локально и буквально:
-пиксели лица с фотографии вклеиваются в шаблон как есть. Модели остаётся второй
-шаг — пройтись по этому коллажу инпейнтингом с очень низким strength (0.15–0.30,
-см. config.py), когда физически невозможно изменить черты и пропорции, но
-хватает на мазок кисти, свет и растворение шва.
+Как переносится. Преобразованием подобия: поворот, единый масштаб, сдвиг.
+Четыре степени свободы вместо шести у полного аффина — это не экономия, а
+запрет: аффин подогнал бы донора под форму чужого лица, растянув его по одной
+оси, и узнаваемость исчезла бы ровно на этом шаге. Матрица вида [s·R | t]
+такого выразить не может.
 
-Как переносится лицо:
+Порядок шагов внутри:
 
-  1. mediapipe даёт сетку из 468 точек на фотографии и на шаблоне;
-  2. по опорным точкам считается преобразование подобия (поворот, единый
-     масштаб, сдвиг) — оно совмещает лица, но не искажает донора;
-  3. фотография переносится этим преобразованием в систему координат шаблона;
-  4. в шаблон вклеивается только область внутри контура лица донора.
+  1. сетки mediapipe для фотографии и для обложки;
+  2. вырезка головы донора по силуэту сегментатора;
+  3. **мимика** (`expression.py`) — точка расширения: выражение лица меняется
+     здесь, на вырезанной голове, до переноса в шаблон;
+  4. перенос подобием в координаты обложки;
+  5. LAB-коррекция тона — только по коже: волосы обязаны сохранить свой цвет;
+  6. стирание причёски нарисованного персонажа, если она торчит из-под
+     вклеенной головы;
+  7. композит.
 
-Ключевое — именно подобие, а не полный аффин и не гомография. У аффина шесть
-степеней свободы: он подгонит донора под форму лица шаблона, растянув его по
-одной оси и завалив сдвигом, и именно это убивает узнаваемость. Подобие имеет
-четыре, оно физически не может изменить пропорции лица — только повернуть его и
-поменять размер целиком.
-
-rembg здесь не используется намеренно: вырезать фон не нужно, потому что контур
-берётся по сетке лица и в него не попадают ни волосы, ни фон, ни одежда. Тот же
-контур (челюсть + брови вместо лба), что и у маски — по причинам из
-mask_generator.py: вклеенные волосы дают ореол и рассогласование с обложкой.
-Лишняя зависимость с отдельной onnx-моделью ради этого не нужна.
+Наружу отдаётся не только картинка, но и геометрия для маски второго шага:
+силуэт вклейки, контур лица (его инпейнтингу трогать нельзя) и линия среза шеи.
 """
 
 from __future__ import annotations
@@ -41,16 +33,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.errors import InvalidImageError, NoFaceDetectedError
+from app.core.errors import InvalidImageError, MLServiceError, NoFaceDetectedError
 from app.core.logging import get_logger
-from app.pipelines import mask_generator
+from app.pipelines import expression, mask_generator, segmentation
 
 log = get_logger(__name__)
 
 # Опорные точки совмещения — жёсткий каркас лица: углы глаз, спинка и крылья
 # носа, углы рта, подбородок, скулы у ушей, внешние края бровей. Считать
 # преобразование по всем 468 точкам сетки нет смысла: щёки и губы подвижны, а
-# лишние точки только тянут посадку за мимикой донора.
+# лишние точки только тянут посадку за мимикой донора. Волосы в совмещении не
+# участвуют вовсе — голова сажается по лицу, причёска едет следом.
 _ALIGN_POINTS = (
     33, 133, 362, 263,  # внешние и внутренние углы глаз
     168, 6, 195, 4, 1,  # спинка носа сверху вниз до кончика
@@ -61,44 +54,35 @@ _ALIGN_POINTS = (
     70, 300,  # внешние края бровей
 )
 
-# Доли высоты лица (как и всё остальное в пайплайне — обложки приходят и в 4K,
-# и превью-размером).
-#
-# grow — насколько контур вклейки расширяется за пределы лица донора. Нужен,
-#   чтобы вклейка гарантированно накрыла черты лица шаблона: формы лиц разные, и
-#   без запаса у края может остаться, например, бровь исходного персонажа —
-#   а при strength 0.2 модель её уже не уберёт. Больше 3-4% брать нельзя:
-#   начинает затягивать в кадр волосы и фон с фотографии.
-# feather — растушёвка края вклейки. Коллаж намеренно жёсткий: это ровно та
-#   ширина, которая убирает ступеньку антиалиасинга по контуру, и не больше.
-#   Настоящее сведение шва — работа второго шага.
-_GROW_RATIO = 0.02
+# Растушёвка края аппликации, доля высоты лица. Коллаж намеренно жёсткий: это
+# ровно та ширина, которая убирает ступеньку антиалиасинга по контуру волос.
+# Настоящее сведение с фоном — работа второго шага.
 _FEATHER_RATIO = 0.01
 
-# Приведение цвета вклейки к цвету лица на шаблоне (среднее и разброс по
-# каналам LAB). Геометрию не трогает вообще — это поканальная кривая, — но
-# снимает разницу в тоне кожи и температуре света между фотостудией и
-# иллюстрацией. Без него при strength 0.2 модель просто не успевает свести
-# освещение, и лицо остаётся «фотографией на обложке».
-# 1.0 — полностью цвет шаблона, 0.0 — цвет фотографии как есть.
+# Приведение тона кожи к шаблону (среднее и разброс по каналам LAB). Считается
+# и применяется ТОЛЬКО по лицу: волосы должны сохранить исходный цвет, ради
+# этого их и переносят. 1.0 — полностью тон шаблона, 0.0 — как на фотографии.
 _COLOUR_MATCH = 0.8
 
 # Ниже этого масштаба уменьшать фотографию в один проход warpAffine нельзя:
-# билинейная выборка пропускает пиксели и лицо рассыпается на алиасинг.
+# билинейная выборка пропускает пиксели и волосы рассыпаются на алиасинг.
 _PRESCALE_THRESHOLD = 0.99
 
-# Доля лица шаблона, которую вклейка обязана накрыть. Меньше — значит лица
-# несовместимы по ракурсу и часть черт персонажа осталась снаружи.
-_MIN_COVERAGE = 0.9
+# Радиус, на который стирание причёски шаблона затягивается окружающим фоном.
+# Доля высоты лица: Telea тянет цвет от границы дыры внутрь, и слишком большой
+# радиус даёт мыло, слишком маленький — не закрывает.
+_INPAINT_RADIUS_RATIO = 0.04
 
 
 @dataclass
 class Collage:
-    """Результат первого шага: коллаж и контуры для маски второго шага."""
+    """Результат первого шага: аппликация и геометрия для маски второго."""
 
-    image: Any  # BGR numpy.ndarray — шаблон с вклеенным лицом
-    paste_polygon: Any  # контур вклейки в координатах шаблона
-    face_polygon: Any  # контур лица самого шаблона
+    image: Any  # BGR numpy.ndarray — шаблон с вклеенной головой
+    head_alpha: Any  # силуэт вклейки в координатах шаблона
+    face_polygon: Any  # контур лица донора после переноса — зона, которую нельзя трогать
+    neck_line: tuple[tuple[int, int], tuple[int, int]]  # срез шеи в координатах шаблона
+    erased: Any  # маска стёртой причёски персонажа (нули, если не стиралась)
     meta: dict = field(default_factory=dict)
 
 
@@ -106,8 +90,8 @@ def _landmarks(image: Any, role: str) -> list[tuple[int, int]]:
     """
     Сетка лица с пометкой, чей это кадр.
 
-    До двухшагового пайплайна 422 всегда означала «нет лица на обложке», теперь
-    же лицо ищется в обоих кадрах, и без детали причина отказа неотличима.
+    Лицо ищется в обоих кадрах, и без детали причина отказа неотличима: 422 на
+    обложке означает «пришлите другой шаблон», 422 на фотографии — «переснимите».
     """
     try:
         return mask_generator.face_landmarks(image)
@@ -121,7 +105,7 @@ def similarity_transform(source: Any, target: Any) -> tuple[Any, float]:
 
     Классическое решение Умеямы: центрируем оба набора точек, оптимальный
     поворот берём из SVD ковариации, масштаб — как отношение разбросов. Матрица
-    получается ровно вида [s·R | t], поэтому переносимое лицо может только
+    получается ровно вида [s·R | t], поэтому переносимая голова может только
     повернуться и изменить размер целиком; ни растяжения по оси, ни сдвига
     (shear) такая матрица выразить не в состоянии.
 
@@ -166,14 +150,16 @@ def similarity_transform(source: Any, target: Any) -> tuple[Any, float]:
 
 def _warp(image: Any, matrix: Any, scale: float, size: tuple[int, int]) -> Any:
     """
-    Переносит фотографию в систему координат шаблона.
+    Переносит кадр донора в систему координат шаблона.
 
     Лицо на фотографии обычно крупнее, чем на обложке, то есть перенос — это
     уменьшение. Уменьшать одним warpAffine нельзя: интерполяция берёт отдельные
     отсчёты и на коэффициенте вроде 0.3 просто выбрасывает две трети пикселей,
-    оставляя рваные контуры. Поэтому сначала честное усреднение INTER_AREA до
-    нужного размера, а уже потом поворот и сдвиг — тогда в warpAffine остаётся
-    масштаб ~1 и алиасингу взяться неоткуда.
+    оставляя рваные пряди волос. Поэтому сначала честное усреднение INTER_AREA
+    до нужного размера, а уже потом поворот и сдвиг — тогда в warpAffine
+    остаётся масштаб ~1 и алиасингу взяться неоткуда.
+
+    Работает и с трёхканальным кадром, и с одноканальной альфой.
     """
     import cv2
     import numpy as np
@@ -190,36 +176,36 @@ def _warp(image: Any, matrix: Any, scale: float, size: tuple[int, int]) -> Any:
         matrix[:, :2] /= scale
         flags = cv2.INTER_LINEAR
 
-    return cv2.warpAffine(
-        image,
-        matrix,
-        (width, height),
-        flags=flags,
-        borderMode=cv2.BORDER_REPLICATE,
-    )
+    return cv2.warpAffine(image, matrix, (width, height), flags=flags, borderValue=0)
 
 
 def _transform_points(points: Any, matrix: Any) -> Any:
-    """Тот же перенос для контура: точки, а не пиксели."""
+    """Тот же перенос для контура и отрезка: точки, а не пиксели."""
     import numpy as np
 
     pts = np.asarray(points, dtype=np.float64)
     return np.rint(pts @ matrix[:, :2].T + matrix[:, 2]).astype(np.int32)
 
 
-def _match_colour(donor: Any, template: Any, region: Any, ratio: float) -> Any:
+def _match_skin(donor: Any, template: Any, skin: Any, ratio: float) -> Any:
     """
-    Подгоняет тон вклейки под лицо шаблона: среднее и разброс по каналам LAB.
+    Подгоняет тон кожи под лицо шаблона: среднее и разброс по каналам LAB.
 
     LAB, а не BGR: там яркость отделена от цвета, поэтому подгонка тона кожи не
     задевает светотеневой рисунок лица — а он и есть геометрия, которую нельзя
-    трогать. Статистики считаются по одной и той же области в обоих кадрах:
-    донорское лицо после переноса и то, что было на его месте на обложке.
+    трогать.
+
+    Ключевое отличие от прежней версии — коррекция взвешивается маской кожи и
+    **не касается волос**. Их цвет переносится ради того, чтобы он остался
+    цветом заказчика; подтянуть его к палитре персонажа означало бы перекрасить
+    донора в нарисованного героя.
+
+    :param skin: маска кожи uint8, она же вес коррекции
     """
     import cv2
     import numpy as np
 
-    selection = region > 0
+    selection = skin > 127
     if ratio <= 0 or not selection.any():
         return donor
 
@@ -236,30 +222,112 @@ def _match_colour(donor: Any, template: Any, region: Any, ratio: float) -> Any:
         src_std = float(src_values.std())
         gain = float(dst_values.std()) / src_std if src_std > 1e-6 else 1.0
 
-        matched[..., channel] = (
-            src[..., channel] - float(src_values.mean())
-        ) * gain + float(dst_values.mean())
+        matched[..., channel] = (src[..., channel] - float(src_values.mean())) * gain + float(
+            dst_values.mean()
+        )
 
-    blended = src * (1.0 - ratio) + matched * ratio
-    return cv2.cvtColor(np.clip(blended, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    # Смешивание в BGR, а не в LAB, ровно ради волос: обратный перевод
+    # LAB → BGR не побитовый, и пиксели с нулевым весом уехали бы на единицу-две
+    # просто оттого, что их прогнали через цветовое пространство. «Волосы не
+    # тронуты» должно означать «не тронуты», а не «почти».
+    corrected = cv2.cvtColor(np.clip(matched, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    weight = (skin.astype(np.float32) / 255.0 * ratio)[..., None]
+    blended = donor.astype(np.float32) * (1.0 - weight) + corrected.astype(np.float32) * weight
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def _erase_template_head(
+    target: Any,
+    points: list[tuple[int, int]],
+    pasted: Any,
+    face_height: float,
+    model: str,
+) -> tuple[Any, Any, dict]:
+    """
+    Стирает причёску нарисованного персонажа там, где её не закрыла вклейка.
+
+    Без этого шага перенос причёски виден насквозь: у персонажа с длинными
+    волосами вокруг вклеенной головы остаётся его собственная шевелюра, и на
+    развороте оказывается два человека сразу. Понизить strength и попросить
+    модель убрать её нельзя — на 0.2 она ничего не убирает, только подкрашивает.
+
+    Дыра затягивается Telea по окружающему фону: получается размытое пятно,
+    которое затем попадает в маску инпейнтинга и там дорисовывается мазком. Это
+    компромисс — идеально восстановить фон за головой локально невозможно.
+
+    Отказ сегментатора на обложке не фатален: рисованный персонаж — не тот
+    материал, на котором учили U²-Net, и вероятность промаха здесь выше, чем на
+    фотографии. Поэтому шаг пропускается с предупреждением, а не роняет заказ.
+
+    :return: (изображение с затянутой дырой, маска стирания, метаданные)
+    """
+    import cv2
+    import numpy as np
+
+    empty = np.zeros(target.shape[:2], dtype=np.uint8)
+    try:
+        head = segmentation.cutout_head(target, points, model)
+    except MLServiceError as exc:
+        log.warning(
+            "причёску персонажа стереть не удалось — сегментатор не нашёл голову",
+            extra={"cause": exc.message},
+        )
+        return target, empty, {"erased_ratio": None}
+
+    # Запас вокруг вклейки: стирать вплотную к ней нельзя, иначе Telea затянет
+    # дыру цветом самой вклейки и по контуру волос пойдёт ореол.
+    grow = max(1, round(face_height * 0.02))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1))
+    covered = cv2.dilate((pasted > 127).astype(np.uint8), kernel)
+
+    erased = np.where((head.alpha > 127) & (covered == 0), 255, 0).astype(np.uint8)
+    # Крошка по краям силуэта — не причёска, а погрешность сегментации
+    erased = cv2.morphologyEx(erased, cv2.MORPH_OPEN, kernel)
+
+    head_px = max(1, int(np.count_nonzero(head.alpha > 127)))
+    ratio = float(np.count_nonzero(erased)) / head_px
+    meta = {"erased_ratio": round(ratio, 3), "template_head_px": head_px}
+
+    if not erased.any():
+        return target, empty, meta
+
+    radius = max(1, round(face_height * _INPAINT_RADIUS_RATIO))
+    filled = cv2.inpaint(target, erased, radius, cv2.INPAINT_TELEA)
+
+    log.info("причёска персонажа стёрта", extra=meta)
+    if ratio > 0.5:
+        # Половина головы персонажа мимо вклейки — фон за ней Telea честно
+        # восстановить не сможет, и на 0.2 модель это не спасёт.
+        log.warning(
+            "стёрта большая часть головы персонажа — фон придётся домысливать",
+            extra=meta,
+        )
+    return filled, erased, meta
 
 
 def build(
     source: Any,
     target: Any,
-    grow_ratio: float = _GROW_RATIO,
+    emotion: str = "",
+    model_photo: str = "u2net_human_seg",
+    model_cover: str = "u2net",
+    width_ratio: float = segmentation._WIDTH_RATIO,
+    hair_ratio: float = segmentation._HAIR_RATIO,
+    neck_ratio: float = segmentation._NECK_RATIO,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
+    erase_template_head: bool = True,
 ) -> Collage:
     """
-    Вклеивает лицо с фотографии в шаблон и возвращает коллаж для инпейнтинга.
+    Вклеивает голову донора в шаблон и возвращает коллаж для инпейнтинга.
 
     :param source: BGR-фотография заказчика
     :param target: BGR-иллюстрация-шаблон
-    :param grow_ratio: запас контура вклейки, доля высоты лица
-    :param feather_ratio: растушёвка края вклейки, доля высоты лица
-    :param colour_match: доля приведения тона к шаблону, 0..1
-    :return: Collage с готовым изображением и обоими контурами
+    :param emotion: имя трансформера мимики; пусто — нейтральное выражение
+    :param model_photo: модель сегментации для фотографии
+    :param model_cover: модель сегментации для обложки
+    :param colour_match: доля приведения тона кожи к шаблону, 0..1
+    :param erase_template_head: стирать ли причёску персонажа из-под вклейки
     """
     import cv2
     import numpy as np
@@ -273,51 +341,70 @@ def build(
     source_points = _landmarks(source, "фотография заказчика")
     target_points = _landmarks(target, "обложка")
 
+    head = segmentation.cutout_head(
+        source, source_points, model_photo, width_ratio, hair_ratio, neck_ratio
+    )
+
+    # Мимика — до переноса: на вклеенной голове её правка поехала бы вместе с
+    # фоном обложки. Нейтральное выражение проходит насквозь без затрат.
+    face = expression.transform(
+        expression.Face(image=source, alpha=head.alpha, points=source_points), emotion
+    )
+
     matrix, scale = similarity_transform(
-        [source_points[i] for i in _ALIGN_POINTS],
+        [face.points[i] for i in _ALIGN_POINTS],
         [target_points[i] for i in _ALIGN_POINTS],
     )
 
     height, width = target.shape[:2]
-    warped = _warp(source, matrix, scale, (width, height))
+    warped = _warp(face.image, matrix, scale, (width, height))
+    alpha = _warp(face.alpha, matrix, scale, (width, height))
 
+    face_polygon = _transform_points(mask_generator.face_polygon(face.points), matrix)
+
+    # Все доли маски и растушёвок меряются от лица НА ШАБЛОНЕ: именно его
+    # размер определяет, сколько пикселей занимает стык на этой обложке.
     template_polygon = mask_generator.face_polygon(target_points)
-    paste_polygon = _transform_points(mask_generator.face_polygon(source_points), matrix)
+    template_face_height = float(template_polygon[:, 1].max() - template_polygon[:, 1].min())
 
-    face_height = int(template_polygon[:, 1].max() - template_polygon[:, 1].min())
-    paste = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(paste, [paste_polygon], 255)
-    paste = mask_generator.soften(paste, face_height, grow_ratio, feather_ratio)
+    # Край аппликации: чуть размыть, чтобы контур волос не пилило антиалиасингом
+    alpha = mask_generator.soften(alpha, template_face_height, 0.0, feather_ratio)
 
-    warped = _match_colour(warped, target, paste, colour_match)
+    # Кожа = лицо внутри силуэта. Волосы сюда не попадают, и коррекция их не
+    # трогает — в этом весь смысл переноса причёски.
+    skin = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(skin, [face_polygon], 255)
+    skin = cv2.GaussianBlur(np.minimum(skin, alpha), (0, 0), max(1.0, template_face_height * 0.03))
+    warped = _match_skin(warped, target, skin, colour_match)
 
-    # Собственно коллаж: вклейка идёт поверх оригинала, за её пределами шаблон
-    # не меняется ни на бит.
-    alpha = (paste.astype(np.float32) / 255.0)[..., None]
-    image = (warped.astype(np.float32) * alpha + target.astype(np.float32) * (1.0 - alpha)).astype(
+    base, erased, erase_meta = (
+        _erase_template_head(target, target_points, alpha, template_face_height, model_cover)
+        if erase_template_head
+        else (target, np.zeros((height, width), dtype=np.uint8), {"erased_ratio": None})
+    )
+
+    weight = (alpha.astype(np.float32) / 255.0)[..., None]
+    image = (warped.astype(np.float32) * weight + base.astype(np.float32) * (1.0 - weight)).astype(
         np.uint8
     )
 
-    template_area = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(template_area, [template_polygon], 255)
-    covered = int(np.count_nonzero((paste > 127) & (template_area > 0)))
-    coverage = covered / max(1, int(np.count_nonzero(template_area)))
-
+    neck_line = _transform_points(np.array(head.neck_line), matrix)
     meta = {
         "scale": round(scale, 3),
         "rotation_deg": round(float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0]))), 2),
-        "coverage": round(coverage, 3),
+        "emotion": (emotion or expression.NEUTRAL).strip().lower(),
         "colour_match": colour_match,
+        "segmenter": head.meta["model"],
+        # Насколько силуэт заполнил отведённый эллипс головы. Близко к нулю —
+        # сегментатор промахнулся, близко к единице — причёска упёрлась в
+        # границу области, и часть волос могла остаться за кадром вклейки.
+        "head_fill": head.meta["fill"],
+        "head_px": int(np.count_nonzero(alpha > 127)),
+        "face_height_target": round(template_face_height, 1),
+        **erase_meta,
     }
-    log.info("коллаж собран", extra={**meta, "image_size": f"{width}x{height}"})
+    log.info("аппликация собрана", extra={**meta, "image_size": f"{width}x{height}"})
 
-    if coverage < _MIN_COVERAGE:
-        # Не отказ: результат может быть приемлемым, но причина будущей
-        # претензии должна быть видна в логах, а не выясняться по картинке.
-        log.warning(
-            "вклейка накрыла лицо шаблона не полностью — вероятно, разные ракурсы",
-            extra={"coverage": meta["coverage"]},
-        )
     if scale > 1.0:
         log.warning(
             "лицо на фотографии мельче, чем на обложке — вклейка растянута",
@@ -326,7 +413,9 @@ def build(
 
     return Collage(
         image=image,
-        paste_polygon=paste_polygon,
-        face_polygon=template_polygon,
+        head_alpha=alpha,
+        face_polygon=face_polygon,
+        neck_line=(tuple(neck_line[0]), tuple(neck_line[1])),
+        erased=erased,
         meta=meta,
     )
