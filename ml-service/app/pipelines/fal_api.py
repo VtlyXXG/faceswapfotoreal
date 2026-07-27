@@ -1,14 +1,20 @@
 """
-Вызов замены лица на fal.ai.
+Шаг 2 замены лица: стилизация готового коллажа на fal.ai.
 
 Разделение ролей прежнее: этот модуль знает только про транспорт до fal —
 загрузку входных изображений, схему аргументов и скачивание результата. Что
-именно и по какой маске перерисовывается, решает pipeline.py.
+именно и по какой маске обрабатывается, решает pipeline.py.
 
-Эндпоинт один: fal-ai/flux-kontext-lora/inpaint — image_url (обложка) +
+Эндпоинт один: fal-ai/flux-kontext-lora/inpaint — image_url (коллаж) +
 mask_url (наша маска) + reference_image_url (фото заказчика). Второй бэкенд,
 easel-ai/advanced-face-swap, был снят: он ищет лицо своим детектором и на
 рисованных обложках его не видит — детектор обучен на фотографиях.
+
+Изменилась не схема вызова, а его смысл. Раньше сюда уходила чистая обложка и
+модель рисовала лицо заново по референсу; теперь под маской уже лежат
+оригинальные пиксели фотографии (collage.py), и от модели требуется только
+верхний слой: мазок, свет, растворение шва. Отсюда и strength в районе 0.2 —
+при нём шум не доходит до уровня, на котором меняются черты лица.
 
 Схема аргументов зафиксирована тестами: эндпоинт отвергает лишние ключи, а
 узнаётся это только после боевого прогона.
@@ -23,6 +29,10 @@ from app.core.errors import MLServiceError
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+# Верх диапазона, на котором вклеенное лицо ещё переживает инпейнтинг. Выше
+# начинается перерисовка черт — то, ради избавления от чего и появился коллаж.
+_SAFE_STRENGTH = 0.35
 
 
 class FalError(MLServiceError):
@@ -120,31 +130,40 @@ def _extract_image(result: dict) -> dict:
     return image
 
 
-def swap_face(
+def refine_collage(
     *,
-    target: bytes,
-    target_mime: str,
-    source: bytes,
-    source_mime: str,
+    collage: bytes,
+    collage_mime: str,
+    reference: bytes,
+    reference_mime: str,
     mask: bytes | None = None,
     output_format: str = "png",
 ) -> tuple[bytes, dict]:
     """
-    Переносит лицо с source на target и возвращает готовое изображение.
+    Стилизует готовый коллаж под иллюстрацию, не трогая геометрию лица.
 
-    :param target: обложка-шаблон (куда переносим)
-    :param source: фотография заказчика (донор личности)
-    :param mask: одноканальная маска PNG, белое — зона перерисовки
+    :param collage: шаблон с уже вклеенным лицом заказчика
+    :param reference: фотография заказчика — референс личности
+    :param mask: одноканальная маска PNG, белое — зона обработки
     :return: (байты готового изображения, метаданные вызова)
     """
     if mask is None:
         raise MaskMissingError("Инпейнтингу нужна маска, но она не построена")
 
+    if settings.fal_strength > _SAFE_STRENGTH:
+        # Не отказ: значение переопределяется из окружения именно для подбора.
+        # Но выше этой границы шум съедает вклеенные пиксели, и весь смысл
+        # двухшагового пайплайна пропадает — в логе это должно быть видно.
+        log.warning(
+            "strength выше безопасного для коллажа — черты лица могут поехать",
+            extra={"strength": settings.fal_strength, "safe_max": _SAFE_STRENGTH},
+        )
+
     client = _client()
     fmt = "jpeg" if output_format in ("jpg", "jpeg") else "png"
 
-    image_url = _upload(client, target, target_mime)
-    identity_url = _upload(client, source, source_mime)
+    image_url = _upload(client, collage, collage_mime)
+    identity_url = _upload(client, reference, reference_mime)
     mask_url = _upload(client, mask, "image/png")
 
     arguments = _arguments(

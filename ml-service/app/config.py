@@ -31,14 +31,32 @@ class Settings(BaseSettings):
     # JSON в консоль (prod) или человекочитаемый формат (dev). В файл — всегда JSON.
     log_json: bool = False
 
-    # --- Замена лица: облачный инференс на fal.ai ---
+    # --- Шаг 1: коллаж локально (OpenCV + mediapipe) ---
+    # Лицо переносится в шаблон преобразованием подобия и вклеивается
+    # оригинальными пикселями. Доли — от высоты лица, подробности в collage.py.
+    #
+    # grow — запас контура вклейки за пределы лица: без него у края может
+    #   остаться бровь исходного персонажа, а при низком strength модель её уже
+    #   не уберёт. Выше 0.03-0.04 начинает затягивать волосы и фон с фотографии.
+    collage_grow_ratio: float = 0.02
+    # feather — растушёвка края вклейки. Коллаж намеренно жёсткий: ровно
+    #   столько, чтобы убрать ступеньку антиалиасинга. Шов сводит второй шаг.
+    collage_feather_ratio: float = 0.01
+    # colour_match — доля приведения тона вклейки к лицу шаблона (среднее и
+    #   разброс по каналам LAB). Геометрию не трогает, снимает разницу между
+    #   светом фотостудии и светом иллюстрации: при strength ~0.2 модель сама
+    #   свести освещение не успевает. 0 — цвет фотографии как есть.
+    collage_colour_match: float = 0.8
+
+    # --- Шаг 2: облачный инференс на fal.ai ---
     # Ключ читается fal-client из окружения как FAL_KEY — без префикса ML_,
     # поэтому дублируем сюда только для проверки готовности в /health/ready.
     fal_key_env: str = "FAL_KEY"
     fal_timeout_s: int = 600
 
-    # Инпейнтинг по нашей маске MediaPipe: личность задаётся референсом, стиль
-    # иллюстрации — промптом. Единственный рабочий вариант из опробованных.
+    # Инпейнтинг по нашей маске MediaPipe. Личность больше не доверяется
+    # модели — она приходит готовым коллажем; от эндпоинта нужны только маска и
+    # управляемый strength. Единственный рабочий вариант из опробованных.
     #
     # Специализированные лицевые модели fal здесь не подходят. easel-ai/
     # advanced-face-swap ищет лицо сам и на рисованных обложках просто его не
@@ -48,42 +66,49 @@ class Settings(BaseSettings):
     # negative_prompt эндпоинт тоже не принимает: все отрицания идут в промпт.
     fal_model: str = "fal-ai/flux-kontext-lora/inpaint"
 
-    # Промпт решает, чем окажется результат — дорисованным лицом или вклеенной
-    # фотографией. Поэтому он не описывает портрет, а формулирует задачу:
-    # «перерисуй в манере обложки, сохранив личность», и явным перечислением
-    # закрывает то, для чего у эндпоинта нет negative_prompt.
+    # Под маской уже лежит вклеенное лицо заказчика, поэтому промпт больше не
+    # просит его нарисовать — он запрещает трогать геометрию и описывает ровно
+    # тот верхний слой, который нужен: мазок, свет, исчезнувший шов. Отрицания
+    # идут прямо в текст: negative_prompt эндпоинт не принимает.
     fal_prompt: str = (
-        "Repaint the face inside the masked area so that it belongs to this artwork. "
-        "Keep the identity, facial features and proportions of the reference person, "
-        "but render them entirely in the medium of the surrounding illustration: "
-        "the same brush strokes, canvas and paper grain, colour palette, line work, "
-        "level of detail and direction of light. "
-        "Hand-painted and seamlessly blended into the cover art, "
-        "not a photograph pasted on top: no photographic skin texture, no visible "
-        "pores, no cut-out edge or seam around the face, no change of style at the jaw."
+        "The face inside the masked area is a photograph collaged onto a painted "
+        "illustration. Keep its geometry exactly as it is: the same features, the same "
+        "proportions, the same position and size — do not redraw, move or reshape "
+        "anything, this must stay the very same person. "
+        "Change only the surface: convert the photographic skin into the medium of the "
+        "surrounding artwork — the same brush strokes, canvas and paper grain, colour "
+        "palette, line work and level of detail — match the direction and temperature "
+        "of the light of the cover, and dissolve the collage seam so that no cut-out "
+        "edge is left around the face. "
+        "A hand-painted portrait that belongs to the cover art: no photographic skin "
+        "texture, no visible pores, no visible seam or change of style at the jaw."
     )
 
-    # Баланс «личность ↔ стиль». Оба параметра переопределяются из окружения
-    # (ML_FAL_STRENGTH, ML_FAL_GUIDANCE_SCALE) — подбирать их всё равно
-    # приходится глазами по конкретной обложке.
+    # Ключевой параметр всего пайплайна.
     #
-    # strength — насколько сильно зашумляется область под маской. Дефолт
-    #   эндпоинта 0.88 перерисовывает её почти с нуля, и мазок оригинала под
-    #   новым лицом не сохраняется. 0.82 оставляет живопись обложки подложкой,
-    #   по которой модель ведёт лицо; ниже ~0.7 начинает проступать исходное лицо.
-    fal_strength: float = 0.82
-    # guidance_scale — насколько строго выполняется промпт, то есть требование
-    #   рисовать, а не вклеивать. Дефолт эндпоинта 2.5 оставляет референсу
-    #   слишком много воли, и его фотографическая фактура протекает в результат.
-    #   3.5 — верх рабочего диапазона Flux; за 4.0 модель начинает «гореть».
-    fal_guidance_scale: float = 3.5
-    # Шагов больше дефолтных 30: переход в кольце растушёвки маски набирается
-    # именно на последних шагах, при 30 он остаётся заметно грубее.
-    fal_steps: int = 40
+    # strength — насколько сильно зашумляется область под маской. Здесь под ней
+    #   лежат оригинальные пиксели фотографии, и задача ровно одна: не дать
+    #   модели до них добраться. Рабочий диапазон 0.15–0.30 — шума хватает на
+    #   мазок кисти, свет и сведение шва, но не на изменение черт лица. Выше
+    #   ~0.35 (см. _SAFE_STRENGTH в fal_api.py) геометрия начинает плыть, и
+    #   смысл коллажа теряется; дефолт эндпоинта 0.88 перерисовал бы лицо с нуля.
+    #   Ниже 0.15 мазок не набирается и шов остаётся виден.
+    fal_strength: float = 0.22
+    # guidance_scale — насколько строго выполняется промпт. Прежние 3.5 нужны
+    #   были, чтобы перебороть фотофактуру референса; теперь фотография — это
+    #   основа кадра, а не соперник, и давить нечего. 2.5 (дефолт эндпоинта) на
+    #   низком strength даёт более чистый результат: выше начинают лезть
+    #   артефакты контраста на считанных шагах денойза.
+    fal_guidance_scale: float = 2.5
+    # Шагов больше прежних 40, потому что реально исполняется лишь доля
+    # strength от них: 50 × 0.22 ≈ 11 шагов денойза. При 30-40 их остаётся
+    # 7-9, и переход в кольце растушёвки набраться уже не успевает.
+    fal_steps: int = 50
 
     # --- Маска лица ---
     # Доли высоты лица: padding — сплошное поле вокруг контура, feather —
-    # ширина растушёвки за ним. Подробности профиля — в mask_generator.py
+    # ширина растушёвки за ним. Подробности профиля — в mask_generator.py.
+    # Маска строится по объединению контуров лица шаблона и вклейки коллажа.
     mask_padding_ratio: float = 0.06
     mask_feather_ratio: float = 0.10
 

@@ -1,11 +1,23 @@
 """
-Оркестрация замены лица: маска по target → вызов fal.ai → результат.
+Оркестрация замены лица: коллаж локально → лёгкая стилизация на fal.ai.
 
-Локального инференса больше нет. Здесь остаётся только последовательность
-шагов; детали вызова модели живут в app/pipelines/fal_api.py, построение
-маски — в app/pipelines/mask_generator.py.
+Пайплайн из двух шагов, и порядок в нём принципиален:
 
-Маска обязательна: единственный рабочий бэкенд — инпейнтинг по ней.
+  1. **Коллаж** (`collage.py`, локально, OpenCV + mediapipe). Лицо с фотографии
+     переносится в шаблон преобразованием подобия и вклеивается оригинальными
+     пикселями. Геометрия лица на этом шаге переносится ровно один в один.
+  2. **Стилизация** (`fal_api.py`, на fal.ai). Тот же коллаж уходит в
+     инпейнтинг по маске с очень низким strength — модель накладывает мазок
+     кисти, согласует свет и растворяет шов склейки, но зашумление слишком
+     слабое, чтобы она могла изменить черты лица и пропорции.
+
+Прежняя схема — отдать fal чистую обложку и попросить нарисовать лицо по
+референсу при strength 0.82 — портретного сходства не давала: при таком шуме
+модель рисует лицо заново, а не переносит. Сходство и стилизация здесь
+разведены по разным шагам именно поэтому.
+
+Маска обязательна и накрывает объединение двух контуров: лица шаблона и
+вклейки. Иначе шов коллажа оказался бы вне зоны инпейнтинга и остался виден.
 
 Контракт SwapRequest/SwapResult сохранён прежним: Node.js API получает те же
 бинарный ответ и заголовок X-Swap-Meta, что и раньше.
@@ -17,6 +29,7 @@ from dataclasses import dataclass, field
 
 from app.config import settings
 from app.core.logging import get_logger
+from app.pipelines import collage as collage_builder
 from app.pipelines import fal_api, mask_generator
 from app.utils.image import decode_image, encode_image
 
@@ -56,21 +69,41 @@ class SwapResult:
 
 
 def run(request: SwapRequest) -> SwapResult:
-    # Маска строится по target: перерисовывается лицо на иллюстрации, а не на
-    # фотографии заказчика. Отсутствие лица здесь — 422 из детектора.
+    # Шаг 1. Лицо переносится локально: отсутствие лица в любом из двух кадров —
+    # 422 из детектора, с пометкой в деталях, какой именно кадр не подошёл.
     target_image = decode_image(request.target)
-    mask = mask_generator.generate_mask(
+    source_image = decode_image(request.source)
+
+    collage = collage_builder.build(
+        source_image,
         target_image,
+        grow_ratio=settings.collage_grow_ratio,
+        feather_ratio=settings.collage_feather_ratio,
+        colour_match=settings.collage_colour_match,
+    )
+
+    # Маска — по объединению контуров: и лицо шаблона, и вклейка целиком, чтобы
+    # шов склейки заведомо оказался внутри зоны инпейнтинга.
+    mask = mask_generator.mask_from_polygons(
+        target_image.shape[:2],
+        [collage.face_polygon, collage.paste_polygon],
         padding_ratio=settings.mask_padding_ratio,
         feather_ratio=settings.mask_feather_ratio,
     )
     mask_png, _ = encode_image(mask, "png")
 
-    image, call_meta = fal_api.swap_face(
-        target=request.target,
-        target_mime=_sniff_mime(request.target),
-        source=request.source,
-        source_mime=_sniff_mime(request.source),
+    # PNG, а не JPEG: коллаж — это оригинальные пиксели фотографии, и терять их
+    # на артефактах сжатия перед единственным шагом, который их сохраняет,
+    # бессмысленно.
+    collage_png, collage_mime = encode_image(collage.image, "png")
+
+    # Шаг 2. Референсом остаётся исходное фото: при strength ~0.2 оно почти ни
+    # на что не влияет, но подсказывает модели, чьё лицо она обводит мазком.
+    image, call_meta = fal_api.refine_collage(
+        collage=collage_png,
+        collage_mime=collage_mime,
+        reference=request.source,
+        reference_mime=_sniff_mime(request.source),
         mask=mask_png,
         output_format=request.output_format,
     )
@@ -78,8 +111,8 @@ def run(request: SwapRequest) -> SwapResult:
     mime_type = call_meta.pop("mime_type", "image/png")
 
     log.info(
-        "замена лица выполнена через fal",
-        extra={"model": call_meta.get("model"), "bytes": len(image)},
+        "замена лица выполнена: коллаж + стилизация на fal",
+        extra={"model": call_meta.get("model"), "bytes": len(image), **collage.meta},
     )
 
     # Перерисовывается ровно одно лицо — крупнейшее найденное, — поэтому
@@ -89,7 +122,7 @@ def run(request: SwapRequest) -> SwapResult:
         mime_type=mime_type,
         faces_detected=1,
         faces_swapped=1,
-        meta=call_meta,
+        meta={**call_meta, "collage": collage.meta},
     )
 
 

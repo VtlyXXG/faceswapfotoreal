@@ -59,13 +59,15 @@ services:
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
       ML_ALLOWED_ORIGINS: http://localhost:3000
-      # Замена лица выполняется на fal.ai — без ключа /health/ready даёт degraded
+      # Стилизация выполняется на fal.ai — без ключа /health/ready даёт degraded
       FAL_KEY: ${FAL_KEY:-}
-      # Инпейнтинг по маске MediaPipe: стиль обложки держится промптом.
-      # Баланс «личность ↔ стиль» меняется в .env без пересборки:
-      # docker compose up -d ml-service
-      ML_FAL_STRENGTH: ${ML_FAL_STRENGTH:-0.82}
-      ML_FAL_GUIDANCE_SCALE: ${ML_FAL_GUIDANCE_SCALE:-3.5}
+      # Лицо переносится локально коллажем, fal только стилизует его по маске.
+      # strength держится в диапазоне 0.15–0.30: выше модель начинает
+      # перерисовывать вклеенные пиксели и портретное сходство теряется.
+      # Подбирается в .env без пересборки: docker compose up -d ml-service
+      ML_FAL_STRENGTH: ${ML_FAL_STRENGTH:-0.22}
+      ML_FAL_GUIDANCE_SCALE: ${ML_FAL_GUIDANCE_SCALE:-2.5}
+      ML_COLLAGE_COLOUR_MATCH: ${ML_COLLAGE_COLOUR_MATCH:-0.8}
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
       interval: 10s

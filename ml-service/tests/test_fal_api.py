@@ -4,6 +4,9 @@
 Схему фиксируем тестами намеренно. Именно на ней уже обожглись вживую: fal
 принял запрос, но упал на несуществующем имени весов, и выяснилось это только
 после боевого прогона. Опечатка в ключе аргумента ловится здесь бесплатно.
+
+Второй шаг двухшагового пайплайна: сюда уходит уже собранный коллаж, а не
+чистая обложка. Отсюда и требование к strength — см. test_strength_stays_low.
 """
 
 import pytest
@@ -41,14 +44,14 @@ def client(monkeypatch):
 
 def _call(**overrides):
     kwargs = {
-        "target": b"target-bytes",
-        "target_mime": "image/png",
-        "source": b"source-bytes",
-        "source_mime": "image/jpeg",
+        "collage": b"collage-bytes",
+        "collage_mime": "image/png",
+        "reference": b"source-bytes",
+        "reference_mime": "image/jpeg",
         "mask": b"mask-bytes",
     }
     kwargs.update(overrides)
-    return fal_api.swap_face(**kwargs)
+    return fal_api.refine_collage(**kwargs)
 
 
 # --- Транспорт ---
@@ -92,6 +95,31 @@ def test_arguments_match_endpoint_schema(client):
     assert args["num_inference_steps"] == settings.fal_steps
 
 
+def test_strength_stays_low(client):
+    """
+    Смысл второго шага — не тронуть вклеенные пиксели. Дефолт обязан лежать в
+    диапазоне «мазок есть, черты целы»: выше него модель перерисовывает лицо, и
+    коллаж, ради которого всё затевалось, пропадает впустую.
+    """
+    _call()
+
+    assert 0.15 <= client.arguments["strength"] <= 0.30
+
+
+def test_collage_goes_first_and_reference_second(client):
+    """
+    Порядок ссылок важен: под инпейнтинг идёт коллаж, фотография — только
+    референс. Перепутать их местами — значит вернуться к прежней схеме, где
+    лицо рисовалось с нуля, причём молча.
+    """
+    _call()
+
+    args = client.arguments
+    assert args["image_url"] == "https://cdn/1", "первым загружается коллаж"
+    assert args["reference_image_url"] == "https://cdn/2", "вторым — фото заказчика"
+    assert client.uploads[0] == (b"collage-bytes", "image/png")
+
+
 @pytest.mark.parametrize("key", ["ip_adapter_scale", "ip_adapters", "negative_prompt"])
 def test_arguments_carry_no_unsupported_keys(client, key):
     """
@@ -104,7 +132,7 @@ def test_arguments_carry_no_unsupported_keys(client, key):
     assert key not in client.arguments
 
 
-def test_uploads_target_source_and_mask(client):
+def test_uploads_collage_reference_and_mask(client):
     _call()
 
     assert len(client.uploads) == 3

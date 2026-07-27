@@ -40,10 +40,20 @@ def status() -> dict:
             "model": settings.fal_model,
             "key_present": fal_api.key_present(),
             "key_env": settings.fal_key_env,
+            # Виден в /health/ready намеренно: strength — главная ручка
+            # пайплайна, и подбирают её из окружения на живом сервисе
+            "strength": settings.fal_strength,
         },
         "mask": {
             "detector": "mediapipe/face_mesh",
             "padding_ratio": settings.mask_padding_ratio,
             "feather_ratio": settings.mask_feather_ratio,
+        },
+        # Первый шаг пайплайна виден отдельно: по этим числам сразу понятно,
+        # выполняется ли перенос лица локально и с какими допусками.
+        "collage": {
+            "grow_ratio": settings.collage_grow_ratio,
+            "feather_ratio": settings.collage_feather_ratio,
+            "colour_match": settings.collage_colour_match,
         },
     }

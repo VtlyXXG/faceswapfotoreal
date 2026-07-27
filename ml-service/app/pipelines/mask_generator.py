@@ -6,6 +6,11 @@
 челюсти, щёки, брови) и намеренно НЕ включает лоб, волосы и фон: перерисованные
 волосы дают ореолы и рассогласование с иллюстрацией.
 
+Полигонов на входе может быть несколько: пайплайн подаёт сюда и контур лица
+шаблона, и контур вклеенного коллажа (collage.py). Маска обязана накрывать их
+объединение — иначе шов склейки окажется снаружи зоны инпейнтинга, и сглаживать
+его будет некому.
+
 Ключевое отличие от Face Detection: та отдаёт лишь прямоугольник, внутри
 которого неизбежно оказываются волосы и фон. Плотная сетка позволяет обвести
 именно лицо.
@@ -126,27 +131,30 @@ def face_polygon(points: list[tuple[int, int]]) -> Any:
     return np.array(jaw + [(x, y - lift) for x, y in brows], dtype=np.int32)
 
 
-def generate_mask(
-    image: Any,
-    padding_ratio: float = _PADDING_RATIO,
-    feather_ratio: float = _FEATHER_RATIO,
+def soften(
+    mask: Any,
+    face_height: int,
+    padding_ratio: float,
+    feather_ratio: float,
 ) -> Any:
     """
-    Маска инпейнтинга: контур лица с полем и мягко растворяющимся краем.
+    Профиль краёв: сплошное поле вокруг залитой области и спад за ним.
 
-    Полигон заливается белым, расширяется на padding + feather и размывается по
-    Гауссу с ядром в ширину feather. Полностью белым остаётся лицо вместе с
-    полем padding, а спад до чёрного целиком лежит снаружи — переход к
-    иллюстрации получается плавным, и при этом ни один пиксель лица не
-    оказывается наполовину защищённым от перерисовки.
+    Область расширяется на padding + feather и размывается по Гауссу с ядром в
+    ширину feather. Полностью белой остаётся исходная область вместе с полем
+    padding, а спад до чёрного целиком лежит снаружи — ни один пиксель залитого
+    контура не оказывается наполовину прозрачным.
 
-    :param image: BGR numpy.ndarray с лицом
-    :param padding_ratio: поле вокруг контура, доля высоты лица
-    :param feather_ratio: ширина растушёвки за полем, доля высоты лица
-    :return: одноканальная маска uint8 того же размера, что и image
+    Используется дважды: для маски инпейнтинга (padding + feather в долях
+    высоты лица) и для маски вклейки коллажа (микроскопические доли — там
+    растушёвка нужна лишь чтобы убрать ступеньку антиалиасинга).
+
+    :param mask: одноканальная маска uint8, залитая белым
+    :param face_height: высота лица в пикселях — база для обеих долей
+    :param padding_ratio: сплошное поле вокруг области, доля высоты лица
+    :param feather_ratio: ширина спада за полем, доля высоты лица
     """
     import cv2
-    import numpy as np
 
     if padding_ratio < 0 or feather_ratio < 0:
         raise InvalidImageError(
@@ -154,15 +162,6 @@ def generate_mask(
             {"padding_ratio": padding_ratio, "feather_ratio": feather_ratio},
         )
 
-    height, width = image.shape[:2]
-    mask = np.zeros((height, width), dtype=np.uint8)
-
-    polygon = face_polygon(face_landmarks(image))
-    cv2.fillPoly(mask, [polygon], 255)
-
-    # Высота лица по описанному прямоугольнику полигона: он уже включает подъём
-    # бровей, то есть меряется ровно та область, которую перерисовывает модель.
-    face_height = int(polygon[:, 1].max() - polygon[:, 1].min())
     padding = round(face_height * padding_ratio)
     feather = round(face_height * feather_ratio)
 
@@ -179,14 +178,55 @@ def generate_mask(
     if feather > 0:
         mask = cv2.GaussianBlur(mask, (2 * feather + 1, 2 * feather + 1), 0)
 
+    return mask
+
+
+def mask_from_polygons(
+    shape: tuple[int, int],
+    polygons: list[Any],
+    padding_ratio: float = _PADDING_RATIO,
+    feather_ratio: float = _FEATHER_RATIO,
+) -> Any:
+    """
+    Маска инпейнтинга по готовым контурам: объединение с полем и мягким краем.
+
+    Полигоны заливаются в одну маску, поэтому зона перерисовки накрывает и лицо
+    шаблона, и вклеенный коллаж целиком, чем бы они ни различались.
+
+    :param shape: (height, width) кадра
+    :param polygons: контуры Nx2 в пикселях кадра
+    :param padding_ratio: поле вокруг контуров, доля высоты лица
+    :param feather_ratio: ширина растушёвки за полем, доля высоты лица
+    :return: одноканальная маска uint8 размера shape
+    """
+    import cv2
+    import numpy as np
+
+    height, width = shape
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    # По одному вызову на контур: fillPoly со списком считает их частями одной
+    # фигуры по правилу чёт-нечет, и пересечение двух контуров осталось бы
+    # дырой — ровно в том месте, где лицо шаблона и вклейка совпадают.
+    contours = [np.asarray(polygon, dtype=np.int32) for polygon in polygons]
+    for contour in contours:
+        cv2.fillPoly(mask, [contour], 255)
+
+    # Высота лица — по описанному прямоугольнику объединения: полигоны уже
+    # включают подъём бровей, то есть меряется ровно перерисовываемая область.
+    ys = np.concatenate([contour[:, 1] for contour in contours])
+    face_height = int(ys.max() - ys.min())
+
+    result = soften(mask, face_height, padding_ratio, feather_ratio)
+
     log.info(
         "маска лица построена",
         extra={
             "image_size": f"{width}x{height}",
-            "polygon_points": len(polygon),
+            "polygons": len(contours),
             "face_height": face_height,
-            "padding_px": padding,
-            "feather_px": feather,
+            "padding_px": round(face_height * padding_ratio),
+            "feather_px": round(face_height * feather_ratio),
         },
     )
-    return mask
+    return result
