@@ -6,23 +6,26 @@
 скрипт останавливается на коллаже и раскладывает по файлам все промежуточные
 стадии, чтобы было видно, какая именно из них портит результат:
 
-    10_silhouette.png  сырая альфа rembg — весь человек, с одеждой и полутенью
-    20_region.png      область головы: эллипс, срезанный снизу по линии челюсти
-    30_alpha.png       итог вырезки: пересечение первых двух, порог и эрозия
-    40_cutout.png      сама аппликация — голова на прозрачном фоне (BGRA)
-    50_collage.png     коллаж: голова в шаблоне
-    55_erased.png      что стёрто от головы персонажа и открыто модели
-    56_erased_base.png шаблон с затёртой головой персонажа, до наложения вклейки
-    60_mask.png        маска стыка — что ушло бы в инпейнтинг (не отправляется)
-    meta.json          метаданные обоих шагов вырезки
+    10_silhouette.png     сырая альфа rembg — весь человек, с одеждой и полутенью
+    20_region.png         область головы: эллипс, срез по челюсти, колонна шеи
+    30_alpha.png          итог вырезки: пересечение первых двух, порог и эрозия
+    40_cutout.png         аппликация — голова с шеей на прозрачном фоне (BGRA)
+    50_collage.png        коллаж: голова в шаблоне
+    55_erased.png         что стёрто от головы персонажа
+    56_erased_base.png    шаблон с затёртой головой, до наложения вклейки
+    60_mask_seam.png      зона 2: стыки, мягкая сила
+    61_mask_background.png зона 3: дыра в фоне, высокая сила
+    62_zones.png          обе зоны поверх коллажа: зелёное — стык, красное — фон
+    meta.json             метаданные обоих шагов вырезки
 
-Смотреть в первую очередь на 40_cutout.png: там не должно быть ни шеи, ни
-одежды, ни каймы фона фотографии вокруг волос. Второе — 56_erased_base.png: фон
-на месте стёртой головы персонажа должен быть однородным, без тёмного кольца по
-контуру его причёски и без розовых пятен на месте ушей.
+Смотреть в первую очередь на 40_cutout.png: там должны быть голова и шея до
+линии одежды — и ни клочка самой одежды. Второе — 62_zones.png: зелёное должно
+идти узкими полосами по контуру волос и по стыку шеи, красное — накрывать дыру
+от чужой причёски и не доходить до новых волос, лицо не должно быть закрашено
+вовсе.
 
     python scripts/collage_preview.py --source ../source.jpg --target ../target.png
-    python scripts/collage_preview.py --erode-ratio 0.01 --neck-ratio 0.05
+    python scripts/collage_preview.py --neck-ratio 0.4   # отступ вместо поиска
     python scripts/collage_preview.py --erase-method ns --erase-pad-ratio 0.06
 
 Модели rembg скачиваются при первом запуске (~176 МБ на модель).
@@ -75,6 +78,25 @@ def _save(out: Path, stages: dict[str, Any]) -> None:
         print(f"  {name}")
 
 
+def _zones(collage: Any, seam: Any, hole: Any) -> Any:
+    """
+    Три зоны одной картинкой: где что достанется модели.
+
+    Зелёное — стыки (мягкая сила), красное — фон (высокая), нетронутое —
+    защищённое лицо и остальной холст. Смотреть в первую очередь сюда: по двум
+    отдельным маскам не видно, не наползают ли они друг на друга.
+    """
+    import numpy as np
+
+    view = collage.astype(np.float32)
+    for channel, zone in ((1, seam), (2, hole)):
+        weight = (np.asarray(zone).astype(np.float32) / 255.0)[..., None]
+        tint = np.zeros_like(view)
+        tint[..., channel] = 255.0
+        view = view * (1.0 - 0.55 * weight) + tint * (0.55 * weight)
+    return np.clip(view, 0, 255).astype(np.uint8)
+
+
 def _cutout(image: Any, alpha: Any) -> Any:
     """Аппликация как она есть: BGRA, всё вне головы — прозрачный ноль."""
     bgra = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
@@ -92,6 +114,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=_ROOT / "outputs" / "collage")
     parser.add_argument("--emotion", default="")
     # Две доли, которые сейчас и подбираются, — остальное берётся из настроек
+    # Пусто — искать линию одежды донора по цвету
     parser.add_argument("--neck-ratio", type=float, default=settings.head_neck_ratio)
     parser.add_argument("--erode-ratio", type=float, default=settings.head_erode_ratio)
     # Затирка головы персонажа на шаблоне
@@ -124,13 +147,6 @@ def main() -> int:
 
     # Стадии вырезки по отдельности — ради них скрипт и написан
     points = mask_generator.face_landmarks(source)
-    region, _, face_height = segmentation.head_region(
-        points,
-        source.shape[:2],
-        settings.head_width_ratio,
-        settings.head_hair_ratio,
-        args.neck_ratio,
-    )
     raw = np.asarray(segmentation.silhouette(source, settings.seg_model_photo))
     head = segmentation.cutout_head(
         source,
@@ -140,6 +156,15 @@ def main() -> int:
         settings.head_hair_ratio,
         args.neck_ratio,
         args.erode_ratio,
+    )
+    # Область строится повторно только ради картинки; отступ шеи берётся
+    # найденный, иначе на 20_region.png будет не то, что реально вырезалось
+    region, _, face_height = segmentation.head_region(
+        points,
+        source.shape[:2],
+        settings.head_width_ratio,
+        settings.head_hair_ratio,
+        head.meta["neck_ratio"],
     )
 
     # Стадии вырезки пишутся до сборки коллажа: лицо ищется и на обложке тоже, и
@@ -177,18 +202,28 @@ def main() -> int:
     # strength подбираются вместе, и смотреть на маску от другого набора чисел
     # бессмысленно
     profile = refine.profiles.get(args.profile)
-    mask = mask_generator.blend_mask(
+    face_height = collage.meta["face_height_target"]
+    mask = mask_generator.seam_mask(
         target.shape[:2],
         collage.head_alpha,
         collage.face_polygon,
         collage.neck_line,
-        collage.erased,
-        collage.meta["face_height_target"],
+        face_height,
         edge_ratio=profile.mask.edge_ratio,
         neck_ratio=profile.mask.neck_ratio,
         guard_ratio=profile.mask.guard_ratio,
         feather_ratio=profile.mask.feather_ratio,
         gradient_ratio=profile.mask.gradient_ratio,
+    )
+    hole = mask_generator.hole_mask(
+        target.shape[:2],
+        collage.head_alpha,
+        collage.face_polygon,
+        collage.erased,
+        face_height,
+        margin_ratio=profile.mask.hole_margin_ratio,
+        feather_ratio=profile.mask.hole_feather_ratio,
+        guard_ratio=profile.mask.guard_ratio,
     )
 
     # Шаблон без головы персонажа, до наложения вклейки. Именно по нему видно,
@@ -212,7 +247,9 @@ def main() -> int:
             "50_collage.png": collage.image,
             "55_erased.png": collage.erased,
             "56_erased_base.png": base,
-            "60_mask.png": mask,
+            "60_mask_seam.png": mask,
+            "61_mask_background.png": hole,
+            "62_zones.png": _zones(collage.image, mask, hole),
         },
     )
 

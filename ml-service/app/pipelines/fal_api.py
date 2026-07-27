@@ -129,7 +129,13 @@ def invoke(client, endpoint: str, arguments: dict, meta: dict | None = None) -> 
     content = _download(image)
 
     meta |= {"seed": (result or {}).get("seed")}
-    return content, {**meta, "mime_type": image.get("content_type") or "image/png"}
+    return content, {
+        **meta,
+        "mime_type": image.get("content_type") or "image/png",
+        # Ссылка на результат в CDN: следующему проходу она нужна как вход, и
+        # загружать те же 25-30 МБ обратно только ради неё незачем
+        "image_url": image.get("url"),
+    }
 
 
 def _download(image: dict) -> bytes:

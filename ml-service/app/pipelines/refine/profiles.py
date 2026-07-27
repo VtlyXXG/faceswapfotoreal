@@ -100,25 +100,58 @@ class ControlSpec:
 @dataclass(frozen=True)
 class MaskProfile:
     """
-    Геометрия маски стыка, доли высоты лица на шаблоне.
+    Геометрия зон инпейнтинга, доли высоты лица на шаблоне.
+
+    Зона 2 (стыки) — edge, neck, gradient, feather. Зона 3 (дыра в фоне) —
+    hole_*. Зона 1 (лицо) — guard: она не открывается, а вычитается из обеих.
 
     :param edge_ratio: половина ширины кольца вдоль контура волос
-    :param neck_ratio: толщина полосы на срезе шеи
-    :param guard_ratio: растушёвка защиты лица — она вычитается из маски
-    :param feather_ratio: спад по краям зоны
-    :param gradient_ratio: ширина градиента от стыка наружу. Ноль — прежняя
-        маска-плато со спадом по краю. Больше нуля — маска становится конусом:
-        255 ровно на стыке и линейный спад на эту долю в обе стороны. На
-        strength 0.2 разницы почти нет, на 0.5 плато означает, что вся область
-        под ним перерисовывается одинаково сильно, и по границе плато идёт
-        ступенька — заметная ровно настолько, насколько поднят strength.
+    :param neck_ratio: толщина полосы на стыке шеи с телом персонажа
+    :param guard_ratio: растушёвка защиты лица — она вычитается из обеих масок
+    :param feather_ratio: спад по краям зоны стыков
+    :param gradient_ratio: ширина градиента от стыка наружу. Ноль — маска-плато
+        со спадом по краю. Больше нуля — маска становится конусом: 255 ровно на
+        стыке и линейный спад на эту долю в обе стороны. На strength 0.2 разницы
+        почти нет, на 0.5 плато означает, что вся область под ним
+        перерисовывается одинаково сильно, и по его границе идёт ступенька.
+    :param hole_margin_ratio: отступ зоны фона от вклеенной головы. Зона 3 идёт
+        на высоком strength и всё под собой стирает — до контура новых волос её
+        подпускать нельзя.
+    :param hole_feather_ratio: спад по краям зоны фона
     """
 
-    edge_ratio: float = 0.05
-    neck_ratio: float = 0.35
+    edge_ratio: float = 0.04
+    neck_ratio: float = 0.12
     guard_ratio: float = 0.06
-    feather_ratio: float = 0.06
+    feather_ratio: float = 0.04
     gradient_ratio: float = 0.0
+    hole_margin_ratio: float = 0.05
+    hole_feather_ratio: float = 0.05
+
+
+@dataclass(frozen=True)
+class BackgroundPass:
+    """
+    Отдельный проход по зоне 3 — дыре в фоне на месте стёртой причёски.
+
+    Почему проходов два, а не один. У инпейнтинга одна сила на вызов, а зонам
+    нужна разная: на стыке 0.26 (иначе поедут черты и контур причёски), в дыре
+    0.85 (иначе фон не восстановить). Совместить их в одном вызове можно было бы
+    только если бы эндпоинт читал маску как карту силы попиксельно — он этого не
+    делает. Значит, два вызова: сначала фон, потом стык поверх результата.
+
+    Порядок именно такой. Стык сводит вклейку с тем, что вокруг, и «вокруг»
+    должно быть уже нарисовано — иначе второй проход будет сводить края с мылом.
+
+    :param min_area_ratio: ниже этой доли кадра проход пропускается. У героя со
+        стрижкой дыры почти нет, и платить за второй вызов не за что.
+    """
+
+    strength: float = 0.85
+    guidance_scale: float = 4.0
+    steps: int = 50
+    prompt: str = ""
+    min_area_ratio: float = 0.002
 
 
 @dataclass(frozen=True)
@@ -148,6 +181,8 @@ class RefineProfile:
     mask: MaskProfile = field(default_factory=MaskProfile)
     controls: tuple[ControlSpec, ...] = ()
     control_field: str = "controlnets"
+    # Второй проход по зоне фона. None — одна зона стыков, как было
+    background: BackgroundPass | None = None
 
     def validate(self) -> RefineProfile:
         """
@@ -172,6 +207,22 @@ class RefineProfile:
             raise InvalidImageError(
                 "Число шагов инференса должно быть положительным",
                 {"profile": self.name, "steps": self.steps},
+            )
+        if self.background and not 0.0 <= self.background.strength <= 1.0:
+            raise InvalidImageError(
+                "strength прохода по фону должен лежать в диапазоне 0..1",
+                {"profile": self.name, "strength": self.background.strength},
+            )
+        if self.background and self.background.strength <= self.strength:
+            # Не опечатка, а бессмыслица: ради генерации фона заново второй
+            # вызов и оплачивается. Если сила не выше, чем на стыке, он лишний
+            raise InvalidImageError(
+                "Проход по фону слабее прохода по стыку — тогда он не нужен",
+                {
+                    "profile": self.name,
+                    "background": self.background.strength,
+                    "seam": self.strength,
+                },
             )
         if self.controls and not self.control_field:
             raise InvalidImageError(
@@ -207,12 +258,14 @@ class RefineProfile:
             "steps": self.steps,
             "gradient_ratio": self.mask.gradient_ratio,
             "controls": [f"{c.kind}:{c.weight}" for c in self.controls],
+            "background_strength": self.background.strength if self.background else None,
         }
 
 
 # Промпт консервативного режима: маска открывает только стык, поэтому и речь
-# идёт только о границе.
-_SEAM_PROMPT = (
+# идёт только о границе. Шея там ещё отрезана по челюсти, отсюда и просьба
+# закрыть край воротником.
+_CONSERVATIVE_PROMPT = (
     "A photograph of a head has been collaged onto this painted illustration. "
     "Work only along the seam that is masked: blend the outer edge of the hair "
     "into the painted background, and cover the cut at the neck — paint a collar, "
@@ -226,25 +279,40 @@ _SEAM_PROMPT = (
     "no visible collage border, no second head or duplicated hair."
 )
 
-# Промпт рабочего режима. Маска здесь шире, чем у seam, — градиент захватывает
-# шею и контур волос целиком, — но strength вдвое ниже, чем у stylise, и
-# перерисовки от модели не ждут. Просьба про тень оставлена: на 0.26 мягкая тень
-# под подбородком набирается, а карты глубины, которая поставила бы её по
-# объёму, у рабочего эндпоинта нет.
-_BLEND_PROMPT = (
-    "A photograph of a head has been collaged onto this painted illustration. "
-    "Work along the masked seam and blend it away: dissolve the outer edge of the "
-    "hair into the painted background, and cover the cut at the neck — paint a "
-    "collar, a soft contact shadow under the chin, or a strand of hair there so "
-    "that no torn edge remains. "
-    "Match the brush strokes, canvas and paper grain, colour palette, line work "
-    "and the direction and temperature of the light of the surrounding artwork, "
-    "and let the shading on the neck and jaw follow that same light. "
+# Промпт зоны стыков. Открыты только две узкие полосы — контур волос и место,
+# где шея входит в тело персонажа, — и работа там ровно одна: свести тон и цвет
+# кожи и поставить контактную тень. Про фон здесь не сказано ни слова: фон — это
+# зона 3 и отдельный проход.
+_SEAM_PROMPT = (
+    "A photograph of a head with its neck has been collaged onto this painted "
+    "illustration. Work only inside the narrow masked strips. "
+    "At the neck: blend the skin of the photographed neck into the painted body "
+    "below it — carry the skin tone, colour and warmth of the illustration across "
+    "the join so that no line, no step in colour and no edge of the collar remains "
+    "visible, and paint a soft contact shadow where the chin and the jaw meet the "
+    "neck and where the neck meets the collar, following the light of the scene. "
+    "At the hair: dissolve the outer edge of the hair into whatever lies behind it. "
+    "Match the brush strokes, canvas grain, palette and line work of the artwork. "
     "Keep the hair colour, length and shape exactly as they are, keep the face "
     "untouched — do not redraw, move or reshape anything, this must stay the very "
-    "same person. "
+    "same person, and leave the rest of the canvas alone. "
     "Seamless hand-painted cover art: no cut-out edge, no halo around the hair, "
     "no visible collage border, no second head or duplicated hair."
+)
+
+# Промпт зоны фона. Здесь модель не сводит, а рисует заново: под маской лежит
+# ровная заливка на месте стёртой причёски персонажа, и восстановить по ней
+# нечего. Про лицо и волосы не сказано ничего — маска до них не доходит.
+_BACKGROUND_PROMPT = (
+    "Repaint the masked area as background of this illustration. "
+    "Continue the surrounding scene straight through it — the sky, the clouds, the "
+    "landscape, the foliage and any creature or object whose edges enter the masked "
+    "area must carry on and be completed naturally, with the same brush strokes, "
+    "canvas grain, palette, level of detail and direction of light as the artwork "
+    "around it. "
+    "This is background only: no person, no head, no hair, no face, no figure. "
+    "Hand-painted cover art with no flat blurred patch, no smeared area, no seam "
+    "and no trace that anything was ever removed."
 )
 
 # Промпт режима стилизации. Отличие не косметическое: на strength 0.5 модель
@@ -348,7 +416,7 @@ register(
         name="seam",
         strategy="inpaint_controlnet",
         endpoint=_INPAINT_ENDPOINT,
-        prompt=_SEAM_PROMPT,
+        prompt=_CONSERVATIVE_PROMPT,
         # Ниже 0.15 мазок не набирается и стык остаётся виден, выше 0.28 плывёт
         # контур причёски. Режим существовал ровно ради этой узкой полосы.
         strength=0.20,
@@ -368,7 +436,7 @@ register(
         # ней. Переезд ради ControlNet стоил бы этого стиля — от карт отказались
         # осознанно, а геометрию причёски вместо них удерживает низкий strength.
         endpoint=_INPAINT_ENDPOINT,
-        prompt=_BLEND_PROMPT,
+        prompt=_SEAM_PROMPT,
         # Середина запрошенного диапазона 0.25-0.28. Верхняя граница не
         # круглое число: выше ~0.28 начинает плыть контур причёски, и без карт
         # ControlNet удержать его нечем. 0.26 оставляет запас на то, что сама
@@ -383,10 +451,13 @@ register(
         # Предупреждение начинается ровно там, где заканчивается безопасный
         # диапазон: 0.25-0.28 — рабочий режим, а не повод сорить в лог
         safe_strength=0.28,
-        # Главное отличие от seam: градиент вместо плато. Зона шире и мягче —
-        # спад накрывает шею и контур волос целиком, — но сила при этом
-        # безопасная. Ради этой связки профиль и заведён.
-        mask=MaskProfile(gradient_ratio=0.12),
+        # Градиент вместо плато, но зона узкая: только контур волос и полоса на
+        # стыке шеи. Всё, что шире, уходит в зону фона со своей силой.
+        mask=MaskProfile(gradient_ratio=0.05),
+        # Зона 3: дыра от чужой причёски рисуется заново и отдельным вызовом.
+        # 0.85 — сила, на которой модель действительно генерирует содержимое, а
+        # не подкрашивает; ниже ~0.7 из-под неё проступает мыло от заливки.
+        background=BackgroundPass(prompt=_BACKGROUND_PROMPT),
     )
 )
 

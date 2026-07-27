@@ -27,6 +27,7 @@ class _FakeClient:
         self.uploads: list[tuple[bytes, str]] = []
         self.arguments: dict | None = None
         self.model: str | None = None
+        self.calls: list[dict] = []
 
     def upload(self, data, content_type):
         self.uploads.append((data, content_type))
@@ -35,7 +36,8 @@ class _FakeClient:
     def subscribe(self, model, arguments, with_logs=False):
         self.model = model
         self.arguments = arguments
-        return {"images": [{"url": "https://cdn/out.png"}], "seed": 7}
+        self.calls.append(arguments)
+        return {"images": [{"url": f"https://cdn/out{len(self.calls)}.png"}], "seed": 7}
 
 
 @pytest.fixture
@@ -54,17 +56,22 @@ def collage() -> np.ndarray:
     return image
 
 
-def _request(collage_image=None, **overrides) -> refine.RefineRequest:
+def _request(collage_image=None, masks=None, **overrides) -> refine.RefineRequest:
     kwargs = {
         "collage": b"collage-bytes",
         "collage_mime": "image/png",
         "reference": b"source-bytes",
         "reference_mime": "image/jpeg",
-        "mask": b"mask-bytes",
+        "masks": {"seam": b"seam-mask"} if masks is None else masks,
         "collage_image": collage_image,
     }
     kwargs.update(overrides)
     return refine.RefineRequest(**kwargs)
+
+
+def _seam_only() -> profiles.RefineProfile:
+    """Профиль без прохода по фону: один вызов, как было до трёх зон."""
+    return replace(profiles.get("blend"), background=None)
 
 
 def _controlnet_profile() -> profiles.RefineProfile:
@@ -254,7 +261,7 @@ def test_strategy_is_chosen_by_name_from_the_profile(client, collage):
             return refine.RefineResult(image=b"SPY", meta={})
 
     refine.register(_Spy())
-    result = refine.run(_request(collage), replace(profiles.get("blend"), strategy="spy"))
+    result = refine.run(_request(collage), replace(_seam_only(), strategy="spy"))
 
     assert result.image == b"SPY"
     assert seen["profile"] == "blend"
@@ -267,7 +274,7 @@ def test_identity_embedding_is_declared_but_not_implemented(collage):
     Пока эндпоинта нет, честнее отдать 501, чем молча отработать инпейнтингом:
     молчаливая подмена обнаружилась бы уже на печати тиража.
     """
-    profile = replace(profiles.get("blend"), strategy="identity_embedding")
+    profile = replace(_seam_only(), strategy="identity_embedding")
 
     with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
         refine.run(_request(collage), profile)
@@ -282,7 +289,7 @@ def test_identity_reaches_the_strategy(collage):
     когда эндпоинт появится, первым вопросом будет именно этот.
     """
     identity = refine.Identity(embedding=np.zeros((1, 512), dtype=np.float32), model="buffalo_l")
-    profile = replace(profiles.get("blend"), strategy="identity_embedding")
+    profile = replace(_seam_only(), strategy="identity_embedding")
 
     with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
         refine.run(_request(collage, identity=identity), profile)
@@ -292,23 +299,23 @@ def test_identity_reaches_the_strategy(collage):
 
 def test_unknown_strategy_is_refused(collage):
     with pytest.raises(refine.RefinerNotSupportedError):
-        refine.run(_request(collage), replace(profiles.get("blend"), strategy="телепатия"))
+        refine.run(_request(collage), replace(_seam_only(), strategy="телепатия"))
 
 
 # --- Схема запроса ---
 
 
 def test_arguments_match_endpoint_schema(client, collage):
-    refine.run(_request(collage), profiles.get("blend"))
+    refine.run(_request(collage), _seam_only())
 
     args = client.arguments
-    assert client.model == profiles.get("blend").endpoint
+    assert client.model == _seam_only().endpoint
     # Три обязательные ссылки эндпоинта
     assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
-    assert args["prompt"] == profiles.get("blend").prompt
-    assert args["strength"] == profiles.get("blend").strength
-    assert args["guidance_scale"] == profiles.get("blend").guidance_scale
-    assert args["num_inference_steps"] == profiles.get("blend").steps
+    assert args["prompt"] == _seam_only().prompt
+    assert args["strength"] == _seam_only().strength
+    assert args["guidance_scale"] == _seam_only().guidance_scale
+    assert args["num_inference_steps"] == _seam_only().steps
 
 
 def test_collage_goes_first_and_reference_second(client, collage):
@@ -317,7 +324,7 @@ def test_collage_goes_first_and_reference_second(client, collage):
     референс. Перепутать их местами — значит вернуться к прежней схеме, где
     лицо рисовалось с нуля, причём молча.
     """
-    refine.run(_request(collage), profiles.get("blend"))
+    refine.run(_request(collage), _seam_only())
 
     assert client.arguments["image_url"] == "https://cdn/1", "первым загружается коллаж"
     assert client.arguments["reference_image_url"] == "https://cdn/2", "вторым — фотография"
@@ -330,7 +337,7 @@ def test_arguments_carry_no_unsupported_keys(client, collage, key):
     Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
     а заворачивает весь запрос. Отрицания идут прямо в промпт.
     """
-    refine.run(_request(collage), profiles.get("blend"))
+    refine.run(_request(collage), _seam_only())
 
     assert key not in client.arguments
 
@@ -340,14 +347,14 @@ def test_no_control_key_without_controls(client, collage):
     Пустой список карт — такой же лишний ключ, как и полный. У эндпоинта без
     ControlNet его быть не должно вовсе.
     """
-    refine.run(_request(collage), profiles.get("blend"))
+    refine.run(_request(collage), _seam_only())
 
     assert "controlnets" not in client.arguments
 
 
 def test_missing_mask_fails_before_network(client, collage):
     with pytest.raises(fal_api.MaskMissingError) as exc_info:
-        refine.run(_request(collage, mask=None), profiles.get("blend"))
+        refine.run(_request(collage, masks={}), _seam_only())
 
     assert exc_info.value.status_code == 500
     assert client.uploads == [], "до загрузки в CDN дойти не должно"
@@ -355,7 +362,7 @@ def test_missing_mask_fails_before_network(client, collage):
 
 
 def test_jpeg_alias(client, collage):
-    refine.run(_request(collage, output_format="jpg"), profiles.get("blend"))
+    refine.run(_request(collage, output_format="jpg"), _seam_only())
 
     # Эндпоинт знает только jpeg, но наружу принимаем и jpg
     assert client.arguments["output_format"] == "jpeg"
@@ -385,8 +392,8 @@ def test_canny_map_is_computed_locally(client, collage):
 
     from app.utils.image import decode_image
 
-    # Карта Canny уезжает четвёртой загрузкой, сразу после маски
-    canny_png = client.uploads[3][0]
+    # Порядок загрузок: коллаж, референс, карты, маски проходов
+    canny_png = client.uploads[2][0]
     edges = decode_image(canny_png)[..., 0]
     assert set(np.unique(edges)) <= {0, 255}, "контурная карта бинарна"
     assert edges.any(), "на границе квадрата контур обязан найтись"
@@ -401,7 +408,7 @@ def test_depth_map_sends_the_collage_itself(client, collage):
 
     from app.utils.image import decode_image
 
-    depth_source = decode_image(client.uploads[4][0])
+    depth_source = decode_image(client.uploads[3][0])
     assert np.array_equal(depth_source, collage)
 
 
@@ -431,3 +438,81 @@ def test_meta_reports_the_whole_profile(client, collage):
     assert result.meta["controls_sent"] == 2
     assert result.meta["seed"] == 7
     assert result.meta["mime_type"] == "image/png"
+
+
+# --- Три зоны: два прохода с разной силой ---
+
+
+def test_background_zone_runs_first_and_stronger(client, collage):
+    """
+    Ради этого зоны и разделили. У героя обложки грива до плеч, у заказчика
+    ёжик, и вокруг вклейки остаётся кусок стёртого неба. Сводить его нечем —
+    там нет содержимого, его надо сгенерировать, а это другая сила.
+
+    Порядок обязателен: стык сводит вклейку с тем, что вокруг, и «вокруг» к
+    этому моменту должно быть уже нарисовано.
+    """
+    profile = profiles.get("blend")
+    refine.run(_request(collage, masks={"seam": b"seam", "background": b"hole"}), profile)
+
+    first, second = client.calls
+    assert first["strength"] == profile.background.strength >= 0.8
+    assert second["strength"] == profile.strength <= 0.28
+    assert first["prompt"] != second["prompt"], "у зон разная работа и разный промпт"
+
+
+def test_second_pass_works_on_the_result_of_the_first(client, collage):
+    """
+    Иначе второй проход сводил бы края с тем мылом, которое первый только что
+    заменил живописью, — и оба вызова были бы оплачены впустую.
+    """
+    refine.run(
+        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
+    )
+
+    first, second = client.calls
+    assert second["image_url"] == "https://cdn/out1.png"
+    assert first["image_url"] != second["image_url"]
+
+
+def test_zones_get_their_own_masks(client, collage):
+    refine.run(
+        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
+    )
+
+    first, second = client.calls
+    assert first["mask_url"] != second["mask_url"], "у зон разные маски"
+    assert (b"hole", "image/png") in client.uploads
+    assert (b"seam", "image/png") in client.uploads
+
+
+def test_without_a_hole_there_is_only_one_call(client, collage):
+    """
+    У персонажа со стрижкой дыры почти нет. Второй вызов стоит денег и времени,
+    и платить за него не за что.
+    """
+    refine.run(_request(collage, masks={"seam": b"seam"}), profiles.get("blend"))
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["strength"] == profiles.get("blend").strength
+
+
+def test_background_weaker_than_the_seam_is_refused():
+    """
+    Проход по фону слабее прохода по стыку — это не настройка, а бессмыслица:
+    ради генерации фона второй вызов и оплачивается.
+    """
+    profile = profiles.get("blend")
+    broken = replace(profile, background=replace(profile.background, strength=0.1))
+
+    with pytest.raises(InvalidImageError):
+        broken.validate()
+
+
+def test_meta_reports_both_zones(client, collage):
+    result = refine.run(
+        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
+    )
+
+    assert result.meta["zones"] == ["background", "seam"]
+    assert result.meta["background_strength"] >= 0.8

@@ -107,22 +107,45 @@ def run(request: SwapRequest) -> SwapResult:
     # strength разъезжаются молча.
     profile = refine.profiles.from_settings()
 
-    # Маска — только стык: контур волос, срез шеи и следы стирания чужой
-    # причёски. Лицо из неё вычитается внутри blend_mask.
-    mask = mask_generator.blend_mask(
-        target_image.shape[:2],
+    shape = target_image.shape[:2]
+    face_height = collage.meta["face_height_target"]
+
+    # Зона 2 — стыки: узкое кольцо по контуру новых волос и узкая полоса там,
+    # где шея донора входит в тело персонажа. Лицо вычитается внутри.
+    seam = mask_generator.seam_mask(
+        shape,
         collage.head_alpha,
         collage.face_polygon,
         collage.neck_line,
-        collage.erased,
-        collage.meta["face_height_target"],
+        face_height,
         edge_ratio=profile.mask.edge_ratio,
         neck_ratio=profile.mask.neck_ratio,
         guard_ratio=profile.mask.guard_ratio,
         feather_ratio=profile.mask.feather_ratio,
         gradient_ratio=profile.mask.gradient_ratio,
     )
-    mask_png, _ = encode_image(mask, "png")
+    masks = {"seam": encode_image(seam, "png")[0]}
+
+    # Зона 3 — дыра в фоне на месте чужой причёски. Отдельным проходом и на
+    # высоком strength: заливка оставляет там мыло, и сводить его с чем-либо
+    # бессмысленно, фон нужно рисовать заново.
+    if profile.background is not None:
+        hole = mask_generator.hole_mask(
+            shape,
+            collage.head_alpha,
+            collage.face_polygon,
+            collage.erased,
+            face_height,
+            margin_ratio=profile.mask.hole_margin_ratio,
+            feather_ratio=profile.mask.hole_feather_ratio,
+            guard_ratio=profile.mask.guard_ratio,
+        )
+        # Мелкая дыра второго вызова не стоит: у героя со стрижкой её почти нет
+        share = float((hole > 127).sum()) / float(shape[0] * shape[1])
+        if share >= profile.background.min_area_ratio:
+            masks["background"] = encode_image(hole, "png")[0]
+        else:
+            log.info("зона фона пропущена: дыра мала", extra={"hole_share": round(share, 5)})
 
     # PNG, а не JPEG: коллаж — это оригинальные пиксели фотографии, и терять их
     # на артефактах сжатия перед единственным шагом, который их сохраняет,
@@ -138,7 +161,7 @@ def run(request: SwapRequest) -> SwapResult:
             collage_mime=collage_mime,
             reference=request.source,
             reference_mime=_sniff_mime(request.source),
-            mask=mask_png,
+            masks=masks,
             collage_image=collage.image,
             output_format=request.output_format,
         ),

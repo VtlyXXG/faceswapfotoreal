@@ -66,7 +66,7 @@ def test_photo_goes_as_reference_only(sent):
     request = sent["captured"]["request"]
 
     assert request.reference_mime == "image/png"
-    assert request.mask, "маска обязательна: без неё инпейнтинга нет"
+    assert request.masks.get("seam"), "маска стыка обязательна: без неё инпейнтинга нет"
 
 
 def test_collage_goes_as_pixels_too(sent):
@@ -78,7 +78,7 @@ def test_collage_goes_as_pixels_too(sent):
 
 
 def test_mask_covers_the_seam_and_spares_the_face(sent):
-    mask = decode_image(sent["captured"]["request"].mask)[..., 0]
+    mask = decode_image(sent["captured"]["request"].masks["seam"])[..., 0]
 
     assert mask.shape == (64, 64)
     assert mask.max() == 255, "зона обработки должна быть непустой"

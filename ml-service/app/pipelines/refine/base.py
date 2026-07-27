@@ -82,7 +82,10 @@ class RefineRequest:
     collage_mime: str
     reference: bytes  # фотография заказчика — референс личности
     reference_mime: str
-    mask: bytes | None  # маска стыка, PNG; белое — зона обработки
+    # Маски по зонам: "seam" — стыки, "background" — дыра в фоне. Ключи те же,
+    # что имена проходов в профиле: стратегия берёт маску по имени зоны, и
+    # добавление четвёртой зоны не потребует нового поля.
+    masks: dict[str, bytes] = field(default_factory=dict)
     collage_image: Any = None  # тот же коллаж как BGR numpy.ndarray
     identity: Identity | None = None  # эмбеддинги, когда появятся
     output_format: str = "png"

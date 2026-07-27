@@ -46,57 +46,63 @@ def test_region_reaches_above_the_hairline():
     assert region[260 - int(2.6 * 80), 200] == 0
 
 
-def test_region_is_cut_along_the_jaw():
+def test_head_is_cut_along_the_jaw_and_the_neck_stays():
     """
-    Срез идёт по линии челюсти, а не прямой через подбородок. Разница видна по
-    бокам: у уха челюсть поднимается на полвысоты лица, и прямая оставила бы там
-    треугольник шеи — а с ним и воротник.
+    Область собирается из двух частей: голова срезается по дуге челюсти, а под
+    ней остаётся колонна шеи. Дуга нужна, потому что плечи лежат на той же
+    высоте, что и подбородок, — прямой срез забрал бы их вместе с воротником.
     """
-    region, neck_line, _ = segmentation.head_region(face_mesh(), (400, 400))
+    region, neck_line, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.4)
 
     assert region[254, 200] == 255, "над подбородком — голова"
-    assert region[266, 200] == 0, "под подбородком — уже не наша забота"
+    assert region[290, 200] == 255, "под подбородком — шея"
+    assert region[330, 200] == 0, "ниже линии одежды — уже не наша забота"
 
-    # Сбоку линия челюсти поднимается: у x=240 она проходит по y≈236, тогда как
-    # прямая через подбородок оставила бы здесь ещё 24 пикселя шеи
-    assert region[230, 240] == 255, "щека над челюстью на месте"
-    assert region[245, 240] == 0, "шея под челюстью отрезана"
+    # Сбоку от шеи, на уровне плеч, области быть не должно: там футболка
+    assert region[290, 300] == 0, "плечи в вырезку не попадают"
 
-    # Отрезок среза горизонтален у ненаклонённой головы и лежит на подбородке
+    # Отрезок стыка горизонтален у ненаклонённой головы и лежит на срезе
     (x1, y1), (x2, y2) = neck_line
     assert y1 == pytest.approx(y2, abs=1)
-    assert y1 == pytest.approx(260, abs=2)
-    assert abs(x2 - x1) > 100, "отрезок перекрывает голову по ширине"
+    assert y1 == pytest.approx(260 + 0.4 * 80, abs=3)
 
 
-def test_neck_ratio_lowers_the_cut():
+def test_neck_ratio_sets_how_much_neck_is_taken():
+    """Доля neck — это и есть найденная линия одежды: докуда брать шею."""
+    short, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.15)
+    long, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.5)
+
+    assert short[295, 200] == 0
+    assert long[295, 200] == 255
+
+
+def test_neck_column_narrows_towards_the_collar():
     """
-    Доля neck опускает срез ниже челюсти — на случай, если модели не хватит
-    материала, чтобы дорисовать воротник на голом подбородке.
+    Колонна — эллипс, а не прямоугольник: прямые вертикальные бока во всю длину
+    шеи читаются на живописи как наклейка, и мягким инпейнтингом их не убрать.
     """
-    tight, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.0)
-    loose, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.3)
+    region, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.5)
 
-    assert tight[275, 200] == 0
-    assert loose[275, 200] == 255, "24 пикселя шеи под подбородком остались"
+    def width(row: int) -> int:
+        return int(np.count_nonzero(region[row, :]))
+
+    assert width(275) > width(295) > 0, "к воротнику шея сужается"
 
 
-def test_flat_cut_keeps_what_the_jaw_arc_would_take():
+def test_erase_mode_takes_the_head_without_the_neck():
     """
-    Прямой срез для стирания головы персонажа. Дуга челюсти поднимается к ушам
-    и оставляет их кончики; прямая на уровне подбородка забирает ухо целиком, а
-    шею под подбородком не трогает — на неё садится вклеенная голова.
+    Режим стирания головы персонажа: колонны нет вовсе. Его шея остаётся на
+    месте — на неё садится шея донора, и стирать её незачем.
     """
-    arc, _, _ = segmentation.head_region(face_mesh(), (400, 400))
-    flat, _, _ = segmentation.head_region(face_mesh(), (400, 400), follow_jaw=False)
+    donor, _, _ = segmentation.head_region(face_mesh(), (400, 400), neck_ratio=0.4)
+    erase, _, _ = segmentation.head_region(
+        face_mesh(), (400, 400), neck_ratio=0.05, follow_jaw=False, neck_column=False
+    )
 
-    # На уровне ушей (y=230, сбоку) дуга уже срезала, прямая — ещё нет
-    assert arc[245, 240] == 0
-    assert flat[245, 240] == 255
-
-    # Под подбородком обе одинаково пусты: шея не нужна ни той, ни другой
-    assert arc[266, 200] == 0
-    assert flat[266, 200] == 0
+    assert donor[290, 200] == 255, "шея донора берётся"
+    assert erase[290, 200] == 0, "шея персонажа остаётся нетронутой"
+    # Прямой срез забирает ухо целиком, дуга оставила бы его кончик
+    assert erase[245, 240] == 255
 
 
 def test_region_follows_the_tilt_of_the_head():
@@ -214,3 +220,122 @@ def test_cutout_reports_how_full_the_region_is(whole_frame):
     head = segmentation.cutout_head(_frame(), face_mesh(), "stub")
 
     assert head.meta["fill"] == pytest.approx(1.0, abs=0.01)
+
+
+# --- Линия одежды: докуда брать шею ---
+
+
+def _portrait(collar_at: int | None = None, chin_shadow: bool = False) -> np.ndarray:
+    """
+    Кадр под сетку-заглушку: лицо и шея телесного цвета, ниже — одежда.
+
+    Цвета взяты не с потолка: проверка идёт по хроме LAB, и «кожа» должна
+    отличаться от «ткани» именно в каналах a и b, а не яркостью.
+    """
+    frame = np.zeros((400, 400, 3), dtype=np.uint8)
+    frame[:, :] = (60, 40, 30)  # фон
+    cv2.rectangle(frame, (140, 150), (260, 400), (170, 180, 210), -1)  # кожа
+    if chin_shadow:
+        # Тень под подбородком: та же кожа, но вдвое темнее
+        cv2.rectangle(frame, (140, 262), (260, 280), (85, 90, 105), -1)
+    if collar_at is not None:
+        cv2.rectangle(frame, (100, collar_at), (300, 400), (40, 90, 220), -1)  # ткань
+    return frame
+
+
+def _alpha_for(frame: np.ndarray) -> np.ndarray:
+    """Силуэт: всё, что не фон."""
+    return np.where(frame.sum(axis=2) > 200, 255, 0).astype(np.uint8)
+
+
+def test_clothing_line_stops_at_the_collar():
+    """
+    Ради этого всё и затевалось: срез должен встать на воротнике, а не на
+    челюсти. Голова без шеи садится на обложку и висит в воздухе.
+    """
+    frame = _portrait(collar_at=320)
+
+    ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert meta["neck_source"] == "skin"
+    # Подбородок на y=260, воротник на 320: шеи 60 px при лице 80, минус отступ
+    assert ratio == pytest.approx(60 / 80 - segmentation._COLLAR_MARGIN, abs=0.05)
+
+
+def test_clothing_line_steps_over_the_shadow_under_the_chin():
+    """
+    Под подбородком всегда тень, и первые проценты пути она проверку не
+    проходит. Обрывать поиск на ней — значит срезать шею целиком, ровно как
+    раньше по челюсти.
+    """
+    frame = _portrait(collar_at=320, chin_shadow=True)
+
+    ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert meta["neck_source"] == "skin"
+    assert ratio > 0.5, "тень перешагнута, шея взята целиком"
+
+
+def test_clothing_line_takes_what_it_can_when_the_frame_is_cropped():
+    """
+    Кадр обрезан под подбородком — обычное дело для присланного фото. Берём
+    столько шеи, сколько есть, и не отказываем.
+    """
+    frame = _portrait()[:300]
+
+    ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert meta["neck_source"] == "skin"
+    assert segmentation._NECK_MIN_RATIO <= ratio <= 0.5
+
+
+def test_turtleneck_leaves_almost_no_neck():
+    """
+    Свитер под горло: кожа кончается сразу под подбородком. Поиск отработал
+    верно — шеи в кадре действительно нет, — и срез встаёт по нижней границе.
+    """
+    frame = _portrait(collar_at=262)
+
+    ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert meta["neck_source"] == "skin"
+    assert ratio == segmentation._NECK_MIN_RATIO
+
+
+def test_clothing_line_falls_back_when_there_is_nothing_to_measure():
+    """
+    Кадр кончается на самом подбородке — мерить нечего. Отказывать нельзя,
+    фотографии присылают заказчики: берём запасной отступ и идём дальше.
+    """
+    frame = _portrait()[:260]
+
+    ratio, meta = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert meta["neck_source"] == "fallback"
+    assert ratio == segmentation._NECK_FALLBACK
+
+
+def test_clothing_line_is_clamped():
+    """
+    Голая по пояс фотография не повод забирать грудь: поиск ограничен сверху,
+    иначе в аппликацию поедет всё, что телесного цвета.
+    """
+    frame = _portrait()
+
+    ratio, _ = segmentation.clothing_line(frame, _alpha_for(frame), face_mesh())
+
+    assert ratio <= segmentation._NECK_MAX_RATIO
+
+
+def test_cutout_reports_where_the_cut_came_from(monkeypatch):
+    """
+    По метаданным должно быть видно, найдена линия одежды или взят запасной
+    отступ: результат на глаз одинаковый, а причина разбора полётов разная.
+    """
+    frame = _portrait(collar_at=320)
+    monkeypatch.setattr(segmentation, "silhouette", lambda image, model: _alpha_for(frame))
+
+    head = segmentation.cutout_head(frame, face_mesh(), "stub")
+
+    assert head.meta["neck_source"] == "skin"
+    assert head.meta["neck_ratio"] > 0.3, "шея взята, а не отрезана по челюсти"

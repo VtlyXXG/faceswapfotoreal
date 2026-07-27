@@ -36,7 +36,8 @@ class InpaintControlNetRefiner:
     name = "inpaint_controlnet"
 
     def refine(self, request: RefineRequest, profile: RefineProfile) -> RefineResult:
-        if request.mask is None:
+        seam = request.masks.get("seam")
+        if not seam:
             raise fal_api.MaskMissingError("Инпейнтингу нужна маска, но она не построена")
 
         if profile.strength > profile.safe_strength:
@@ -53,27 +54,58 @@ class InpaintControlNetRefiner:
 
         image_url = fal_api.upload(client, request.collage, request.collage_mime)
         identity_url = fal_api.upload(client, request.reference, request.reference_mime)
-        mask_url = fal_api.upload(client, request.mask, "image/png")
-
-        arguments = {
-            "image_url": image_url,
-            "mask_url": mask_url,
-            "reference_image_url": identity_url,
-            "prompt": profile.prompt,
-            "strength": profile.strength,
-            "guidance_scale": profile.guidance_scale,
-            "num_inference_steps": profile.steps,
-            "output_format": fmt,
-        }
 
         maps = self._controls(client, request, profile)
-        if maps:
-            # Ключ добавляется только когда карты есть: у эндпоинта без
-            # ControlNet пустой список — такой же лишний ключ, как и полный
-            arguments[profile.control_field] = maps
+        passes = []
+
+        # Сначала фон, потом стык: второй проход сводит вклейку с тем, что
+        # вокруг, и «вокруг» к этому моменту должно быть уже нарисовано. Иначе
+        # он будет старательно сводить края с мылом.
+        background = request.masks.get("background")
+        if profile.background and background:
+            passes.append(
+                (
+                    "background",
+                    background,
+                    profile.background.strength,
+                    profile.background.prompt or profile.prompt,
+                    profile.background.guidance_scale,
+                    profile.background.steps,
+                )
+            )
+        passes.append(
+            ("seam", seam, profile.strength, profile.prompt, profile.guidance_scale, profile.steps)
+        )
 
         meta = {**profile.report(), "output_format": fmt, "controls_sent": len(maps)}
-        return RefineResult(*fal_api.invoke(client, profile.endpoint, arguments, meta))
+        image = b""
+
+        for zone, mask, strength, prompt, guidance, steps in passes:
+            arguments = {
+                "image_url": image_url,
+                "mask_url": fal_api.upload(client, mask, "image/png"),
+                "reference_image_url": identity_url,
+                "prompt": prompt,
+                "strength": strength,
+                "guidance_scale": guidance,
+                "num_inference_steps": steps,
+                "output_format": fmt,
+            }
+            if maps:
+                # Ключ добавляется только когда карты есть: у эндпоинта без
+                # ControlNet пустой список — такой же лишний ключ, как и полный
+                arguments[profile.control_field] = maps
+
+            image, call_meta = fal_api.invoke(
+                client, profile.endpoint, arguments, {**meta, "zone": zone}
+            )
+            # Результат прохода становится входом следующего. Ссылкой, а не
+            # байтами: обложка весит 25-30 МБ, и гонять её в CDN второй раз
+            # только ради того, чтобы получить ту же ссылку, незачем
+            image_url = call_meta.get("image_url") or fal_api.upload(client, image, "image/png")
+            meta = {**meta, **call_meta, f"seed_{zone}": call_meta.get("seed")}
+
+        return RefineResult(image=image, meta={**meta, "zones": [name for name, *_ in passes]})
 
     def _controls(self, client, request: RefineRequest, profile: RefineProfile) -> list[dict]:
         """

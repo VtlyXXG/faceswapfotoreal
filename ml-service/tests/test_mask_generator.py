@@ -20,15 +20,34 @@ def _head_alpha(radius: int = 130) -> np.ndarray:
 
 
 def _blend(**overrides) -> np.ndarray:
+    """Зона 2 — стыки."""
     kwargs = {
         "head_alpha": _head_alpha(),
         "face_polygon": mask_generator.face_polygon(face_mesh()),
         "neck_line": ((120, 296), (280, 296)),
-        "erased": np.zeros(_SHAPE, dtype=np.uint8),
         "face_height": _FACE_HEIGHT,
     }
     kwargs.update(overrides)
-    return mask_generator.blend_mask(_SHAPE, **kwargs)
+    return mask_generator.seam_mask(_SHAPE, **kwargs)
+
+
+def _erased(radius: int = 190) -> np.ndarray:
+    """Дыра от чужой причёски: что стёрто и не закрыто вклейкой."""
+    old_hair = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.circle(old_hair, (200, 190), radius, 255, -1)
+    return np.where(_head_alpha() > 0, 0, old_hair).astype(np.uint8)
+
+
+def _hole(**overrides) -> np.ndarray:
+    """Зона 3 — дыра в фоне."""
+    kwargs = {
+        "head_alpha": _head_alpha(),
+        "face_polygon": mask_generator.face_polygon(face_mesh()),
+        "erased": _erased(),
+        "face_height": _FACE_HEIGHT,
+    }
+    kwargs.update(overrides)
+    return mask_generator.hole_mask(_SHAPE, **kwargs)
 
 
 # --- Геометрия полигона ---
@@ -114,26 +133,38 @@ def test_hair_contour_is_open():
     assert mask[top > 0].max() == 255
 
 
-def test_neck_seam_is_covered_wider_than_the_hair_edge():
+def test_neck_seam_is_a_narrow_strip():
     """
-    Оторванную шею не сглаживают, а закрывают: модель должна дорисовать там
-    воротник или тень, и полосы в ширину контура волос на это не хватит.
+    Полоса на стыке шеи узкая и лежит на месте. Шея донора теперь доезжает до
+    воротника, и закрывать оторванный край больше не нужно — нужно место под
+    переход тона и контактную тень, не больше.
     """
     mask = _blend()
 
-    column = mask[:, 200]
-    seam = np.nonzero(column[250:] > 127)[0]
-    assert len(seam) > _FACE_HEIGHT * 0.3
+    # Непрерывный кусок, накрывающий сам стык (y=296): ниже по этой же колонке
+    # идёт кольцо вдоль контура волос, и складывать их вместе нельзя
+    open_rows = mask[:, 200] > 127
+    assert open_rows[296], "стык обязан быть открыт"
+    top = bottom = 296
+    while top > 0 and open_rows[top - 1]:
+        top -= 1
+    while bottom < len(open_rows) - 1 and open_rows[bottom + 1]:
+        bottom += 1
+
+    assert (bottom - top) <= _FACE_HEIGHT * 0.25, "полоса не должна расползаться"
 
 
-def test_erased_area_is_included():
-    """Стёртая причёска персонажа затянута локально — мазок кладёт модель."""
-    erased = np.zeros(_SHAPE, dtype=np.uint8)
-    erased[40:70, 40:70] = 255
+def test_hole_is_not_in_the_seam_zone():
+    """
+    Дыра от чужой причёски ушла в зону 3. Пока она попадала сюда, маска стыка
+    раздувалась на пол-неба — при том, что сделать с этим небом на strength
+    0.26 модель всё равно ничего не могла.
+    """
+    mask = _blend()
 
-    mask = _blend(erased=erased)
-
-    assert mask[50:60, 50:60].max() == 255
+    # Далеко от вклейки, но внутри стёртой области
+    assert mask[190, 30] == 0
+    assert _erased()[190, 30] > 0, "проверяем именно стёртое место"
 
 
 def test_untouched_background_stays_black():
@@ -214,14 +245,15 @@ def test_gradient_widens_the_zone_but_not_the_core():
     Градиент шире растушёвки и мягче: полутонов должно стать заметно больше, а
     полностью открытых пикселей — не больше прежнего.
     """
-    plateau = _blend()
+    raw = _blend(feather_ratio=0.0)  # плато без растушёвки — это и есть сам стык
     ramped = _blend(gradient_ratio=0.2)
 
     def halftones(mask):
         return int(np.count_nonzero((mask > 10) & (mask < 245)))
 
-    assert halftones(ramped) > halftones(plateau)
-    assert int(np.count_nonzero(ramped == 255)) <= int(np.count_nonzero(plateau == 255))
+    assert halftones(ramped) > halftones(raw)
+    # Полностью открыт остаётся ровно стык: конус только добавляет склон
+    assert int(np.count_nonzero(ramped == 255)) <= int(np.count_nonzero(raw == 255))
 
 
 def test_gradient_still_spares_the_face():
@@ -241,3 +273,54 @@ def test_gradient_still_spares_the_face():
 def test_zero_gradient_keeps_the_previous_mask():
     """Ноль — прежнее поведение ровно: старый режим должен остаться доступным."""
     assert np.array_equal(_blend(), _blend(gradient_ratio=0.0))
+
+
+# --- Зона 3: дыра в фоне ---
+
+
+def test_hole_covers_what_the_new_head_does_not():
+    """
+    Ради этой зоны всё и затевалось: у героя грива до плеч, у заказчика ёжик, и
+    вокруг вклейки остаётся кусок неба, стёртый вместе с чужими волосами.
+    """
+    mask = _hole()
+
+    assert mask.max() == 255
+    assert mask[190, 40] == 255, "дальний край дыры открыт целиком"
+
+
+def test_hole_keeps_away_from_the_new_hair():
+    """
+    Зона идёт на strength 0.85 и всё под собой стирает. Подпусти её к контуру
+    новых волос — и она их съест; полоса у контура принадлежит зоне 2.
+    """
+    mask = _hole(margin_ratio=0.15)
+
+    alpha = _head_alpha()
+    near = cv2.dilate(alpha, np.ones((9, 9), np.uint8)) > 0
+
+    assert mask[near].max() == 0
+
+
+def test_hole_spares_the_face_too():
+    """Лицо вычитается из обеих зон: 0.85 по чертам — это другой человек."""
+    mask = _hole(erased=np.full(_SHAPE, 255, dtype=np.uint8), margin_ratio=0.0)
+
+    face = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(face_mesh())], 255)
+    core = cv2.erode(face, np.ones((9, 9), np.uint8)) > 0
+
+    assert mask[core].max() == 0
+
+
+def test_hole_is_empty_without_erasing():
+    """Персонаж со стрижкой: стирать нечего, второго вызова быть не должно."""
+    mask = _hole(erased=np.zeros(_SHAPE, dtype=np.uint8))
+
+    assert mask.max() == 0
+
+
+@pytest.mark.parametrize("ratios", [{"margin_ratio": -0.1}, {"feather_ratio": -0.1}])
+def test_hole_negative_ratios_are_rejected(ratios):
+    with pytest.raises(InvalidImageError):
+        _hole(**ratios)

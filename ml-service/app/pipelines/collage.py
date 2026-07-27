@@ -442,7 +442,13 @@ def _erase_template_head(
         # персонажа под подбородком — та самая, на которую садится вклеенная
         # голова. Прямая на уровне подбородка забирает ухо целиком и шею не трогает.
         region, _, _ = segmentation.head_region(
-            points, target.shape[:2], neck_ratio=neck_ratio, follow_jaw=False
+            points,
+            target.shape[:2],
+            neck_ratio=neck_ratio,
+            follow_jaw=False,
+            # Стираем голову персонажа, а не его шею: она остаётся на
+            # месте и служит фоном под шею донора
+            neck_column=False,
         )
         silhouette = np.asarray(segmentation.silhouette(target, model))
     except MLServiceError as exc:
@@ -507,7 +513,7 @@ def build(
     model_cover: str = "u2net",
     width_ratio: float = segmentation._WIDTH_RATIO,
     hair_ratio: float = segmentation._HAIR_RATIO,
-    neck_ratio: float = segmentation._NECK_RATIO,
+    neck_ratio: float | None = segmentation._NECK_RATIO,
     erode_ratio: float = segmentation._ERODE_RATIO,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
@@ -524,6 +530,7 @@ def build(
     :param emotion: имя трансформера мимики; пусто — нейтральное выражение
     :param model_photo: модель сегментации для фотографии
     :param model_cover: модель сегментации для обложки
+    :param neck_ratio: докуда брать шею; None — искать линию одежды донора
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :param colour_match: доля приведения тона кожи к шаблону, 0..1
     :param erase_template_head: стирать ли голову персонажа из-под вклейки
@@ -610,6 +617,11 @@ def build(
         "colour_match": colour_match,
         "segmenter": head.meta["model"],
         "erode_px": head.meta["erode_px"],
+        # Докуда взята шея и по какому признаку. Первое, на что смотреть, если
+        # голова на развороте оказалась висящей в воздухе или, наоборот, в
+        # аппликацию приехал воротник
+        "neck_ratio": head.meta["neck_ratio"],
+        "neck_source": head.meta["neck_source"],
         # Насколько силуэт заполнил отведённый эллипс головы. Близко к нулю —
         # сегментатор промахнулся, близко к единице — причёска упёрлась в
         # границу области, и часть волос могла остаться за кадром вклейки.

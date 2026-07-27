@@ -55,14 +55,42 @@ _BROW_MID = 9  # переносица между бровями
 _HAIR_RATIO = 2.3  # вверх от подбородка
 _WIDTH_RATIO = 1.6  # ширина эллипса в долях ширины лица (скула → скула)
 
-# Отступ среза вниз от линии челюсти, доля высоты лица. Ноль — режем ровно по
-# челюсти. Прежние 0.45 оставляли под подбородком полосу шеи, а вместе с ней в
-# аппликацию заезжали воротник и плечи донора: на рисованной обложке чёрная
-# футболка под нарисованным платьем видна сразу. Положительное значение
-# опускает срез ниже челюсти, если модели не хватает материала на воротник.
-_NECK_RATIO = 0.0
+# Срез шеи. Резать по челюсти оказалось ошибкой: голова садилась на обложку без
+# шеи и висела в воздухе. Шея нужна — и не куском фиксированной длины, а до
+# линии одежды донора, чтобы она легла внахлёст на воротник персонажа и переход
+# тона кожи было где вести.
+#
+# Линия одежды ищется по цвету (см. clothing_line): от подбородка вниз идёт
+# кожа, а воротник — это первое, что на неё не похоже. По силуэту её не найти:
+# рембг не отличает шею от футболки, а на плечах силуэт расширяется на той же
+# высоте, что и шея, — сужения, по которому можно было бы опознать воротник, в
+# кадре просто нет.
+_NECK_RATIO = None  # None — искать линию одежды; число — жёсткий отступ
+_NECK_FALLBACK = 0.55  # если линия не нашлась: столько шеи берём вслепую
+_NECK_MIN_RATIO = 0.05  # ближе к подбородку срез не имеет смысла
+_NECK_MAX_RATIO = 1.10  # дальше — уже грудь, а не шея
+_COLLAR_MARGIN = 0.05  # отступ вверх от найденной линии: воротник не забираем
+
+# Допуск по хроме LAB, на который цвет шеи может отличаться от цвета лица.
+# Яркость в проверку не входит вовсе: тень под подбородком гасит L вдвое, а
+# каналы a и b держит — на них кожа и отличается от ткани.
+_SKIN_CHROMA = (9.0, 12.0)
+# Разрыв в полосе кожи, который можно перешагнуть, доля высоты лица. Тень под
+# подбородком даёт первые 3-5% не-кожи; обрывать поиск на ней означало бы
+# срезать шею целиком.
+_SKIN_GAP_RATIO = 0.10
+
+# Ширина шеи в долях расстояния между углами челюсти. Ниже челюсти область
+# сужается до этой полосы: прямой срез во всю ширину эллипса забирает вместе с
+# шеей плечи и воротник — они лежат на той же высоте, что и шея, по бокам.
+_NECK_WIDTH_RATIO = 0.85
+_JAW_LEFT, _JAW_RIGHT = 172, 397  # углы нижней челюсти
+# Насколько эллипс шеи длиннее самой шеи. Он срезается по линии одежды, и запас
+# нужен, чтобы у воротника шея не сходилась на нет.
+_NECK_TAPER = 1.35
 
 # Подрезка края силуэта, доля высоты лица. 0.006 — это 2-3 пикселя на типичном
+
 # портрете (лицо 350-450 px). Сегментатор ведёт границу по внешнему краю
 # волос, и последние пиксели там наполовину состоят из фона фотографии: без
 # эрозии этот фон переезжает на обложку тонкой грязной каймой вокруг причёски.
@@ -142,34 +170,133 @@ def silhouette(image: Any, model: str) -> Any:
         ) from exc
 
 
+def _axis(points: list[tuple[int, int]]) -> tuple[Any, Any, Any, float]:
+    """Система координат головы: подбородок, ось вверх, перпендикуляр, высота лица."""
+    import numpy as np
+
+    chin = np.array(points[_CHIN], dtype=np.float64)
+    brow = np.array(points[_BROW_MID], dtype=np.float64)
+
+    axis = brow - chin
+    face_height = float(np.linalg.norm(axis))
+    if face_height < 1.0:
+        raise MLServiceError("Вырожденная геометрия лица: голову не выделить")
+
+    up = axis / face_height
+    return chin, up, np.array([-up[1], up[0]]), face_height
+
+
+def clothing_line(
+    image: Any,
+    alpha: Any,
+    points: list[tuple[int, int]],
+    fallback: float = _NECK_FALLBACK,
+) -> tuple[float, dict]:
+    """
+    Ищет линию одежды донора: докуда вниз от подбородка идёт кожа.
+
+    Признак — цвет, а не форма. По силуэту воротник не найти: сегментатор не
+    отличает шею от футболки, а сужения силуэта на шее может не быть вовсе —
+    плечи начинаются на той же высоте, и через них полоса переднего плана
+    тянется до края кадра.
+
+    Проверяются только каналы a и b: тень под подбородком гасит яркость вдвое,
+    а хрому кожи держит. Первые проценты пути эта тень всё же не проходит
+    проверку, поэтому короткие разрывы перешагиваются — иначе срез встал бы
+    вплотную к подбородку, ради избавления от чего всё и затевалось.
+
+    Отказывать нельзя ни в одном случае: фотографии присылают заказчики. Кадр
+    обрезан под подбородком — берём, сколько есть; свитер под горло — fallback.
+
+    :param image: BGR-кадр донора
+    :param alpha: его же бинарный силуэт
+    :param points: сетка mediapipe того же кадра
+    :return: (отступ вниз от подбородка в долях высоты лица, метаданные поиска)
+    """
+    import cv2
+    import numpy as np
+
+    chin, up, _, face_height = _axis(points)
+    height, width = np.asarray(alpha).shape[:2]
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    face = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(points)], 255)
+    core = cv2.erode(face, np.ones((15, 15), np.uint8)) > 0
+    if not core.any():
+        return fallback, {"neck_source": "fallback"}
+
+    # Медиана, а не среднее: в контур лица попадают глаза, брови и губы, и
+    # среднее уехало бы на них
+    reference = np.median(lab[core], axis=0)
+
+    depth = int(round(_NECK_MAX_RATIO * face_height))
+    gap = max(1, int(round(_SKIN_GAP_RATIO * face_height)))
+
+    last_skin = 0
+    for step in range(depth + 1):
+        x, y = np.rint(chin - up * float(step)).astype(int)
+        if not (0 <= x < width and 0 <= y < height):
+            break
+
+        pixel = lab[y, x]
+        skin = (
+            np.asarray(alpha)[y, x] > 127
+            and abs(float(pixel[1]) - reference[1]) < _SKIN_CHROMA[0]
+            and abs(float(pixel[2]) - reference[2]) < _SKIN_CHROMA[1]
+        )
+        if skin:
+            last_skin = step
+        elif step - last_skin > gap:
+            break
+
+    meta = {"skin_px": last_skin, "skin_gap_px": gap}
+    if last_skin == 0:
+        return fallback, {**meta, "neck_source": "fallback"}
+
+    return _clamp_neck(last_skin / face_height - _COLLAR_MARGIN), {
+        **meta,
+        "neck_source": "skin",
+    }
+
+
+def _clamp_neck(ratio: float) -> float:
+    return float(min(_NECK_MAX_RATIO, max(_NECK_MIN_RATIO, ratio)))
+
+
 def head_region(
     points: list[tuple[int, int]],
     shape: tuple[int, int],
     width_ratio: float = _WIDTH_RATIO,
     hair_ratio: float = _HAIR_RATIO,
-    neck_ratio: float = _NECK_RATIO,
+    neck_ratio: float = _NECK_FALLBACK,
     follow_jaw: bool = True,
+    neck_column: bool = True,
 ) -> tuple[Any, tuple[tuple[int, int], tuple[int, int]], float]:
     """
-    Область головы по сетке лица: эллипс со срезанным по челюсти низом.
+    Область головы по сетке лица: эллипс, срез снизу и колонна шеи.
 
     Эллипс поворачивается вместе с головой (угол берётся по линии глаз), иначе
     у наклонённой головы он срезал бы висок с одной стороны и захватывал фон с
     другой.
 
-    Низ отрезается по дуге челюсти из сетки, а не прямой поперёк кадра. Прямая
-    через подбородок оставляла бы по бокам от него два треугольника шеи —
-    челюсть поднимается к ушам, а линия нет; прямая ниже подбородка тянула бы
-    за собой воротник и плечи. Дуга снимает и то и другое: под срезом не
-    остаётся ни пикселя шеи, а уши и волосы выше линии челюсти сохраняются.
+    Собирается из двух частей, и обе нужны:
 
-    Прямой срез (`follow_jaw=False`) нужен там, где голову не вырезают, а
-    наоборот стирают: дуга поднимается к ушам и оставляет их кончики, а прямая
-    на уровне подбородка забирает ухо целиком и не трогает шею под подбородком.
+      1. **голова** — эллипс, срезанный по дуге челюсти. Дуга, а не прямая:
+         плечи лежат на той же высоте, что и подбородок, и прямой срез забирает
+         их вместе с воротником — на обложку приезжают два оранжевых угла
+         футболки;
+      2. **шея** — узкая колонна от лица вниз до линии одежды. Ширина берётся
+         от углов челюсти: другой мерки шеи в сетке лица нет.
 
-    :param neck_ratio: отступ среза вниз от челюсти (или от подбородка при
-        follow_jaw=False), доля высоты лица
+    Раньше низ резался по челюсти и на этом всё заканчивалось. Голова получалась
+    чистой, но садилась на обложку без шеи и висела в воздухе — переход тона от
+    кожи к телу персонажа вести было негде.
+
+    :param neck_ratio: докуда опускается колонна шеи, доля высоты лица от
+        подбородка (при neck_column=False — просто отступ среза вниз)
     :param follow_jaw: вести срез по дуге челюсти или прямой поперёк оси лица
+    :param neck_column: добавлять ли колонну шеи под челюстью
     :return: (маска области uint8, отрезок среза шеи, высота лица в пикселях)
     """
     import cv2
@@ -211,10 +338,14 @@ def head_region(
     side = np.array([-up[1], up[0]])  # перпендикуляр к оси лица
     reach = float(max(height, width)) * 2.0
 
+    # Дуга опускается на neck_down только когда колонны нет: с колонной шею
+    # добавляет она, а дуге остаётся отрезать голову от плеч по своему месту
+    arc_drop = 0.0 if neck_column else neck_down
+
     if follow_jaw:
         jaw = (
             np.array([points[i] for i in mask_generator._JAW_ARC], dtype=np.float64)
-            - up * neck_down
+            - up * arc_drop
         )
         # Куда продлевать концы дуги, зависит от того, с какой стороны лица
         # лежит её начало: порядок обхода в сетке фиксирован, знак
@@ -223,7 +354,7 @@ def head_region(
         first, last = jaw[0] + outward * reach, jaw[-1] - outward * reach
         cut = [first, *jaw, last]
     else:
-        flat = chin - up * neck_down
+        flat = chin - up * arc_drop
         cut = [flat + side * reach, flat - side * reach]
 
     below = np.array(
@@ -232,15 +363,63 @@ def head_region(
     )
     cv2.fillPoly(region, [below], 0)  # дуга невыпуклая — fillConvexPoly здесь соврёт
 
-    # Отрезок среза — по ширине эллипса на уровне подбородка. Это самое
-    # заметное место шва, и маска второго шага кладёт полосу именно сюда.
+    # Колонна шеи: возвращает под челюсть полосу до линии одежды. Верх уводится
+    # внутрь лица, чтобы между головой и шеей не осталось щели там, где дуга
+    # челюсти поднимается к ушам.
+    #
+    # Не прямоугольник, а эллипс со срезанным низом. Прямоугольник давал по
+    # бокам шеи две вертикальные прямые во всю её длину — на живописи такая
+    # линия читается как наклейка, и мягким инпейнтингом её не убрать: прямая
+    # длиной в треть лица слишком заметна для strength 0.26. У эллипса бока
+    # сужаются к воротнику, как и положено шее.
+    neck_half = _NECK_WIDTH_RATIO * _jaw_width(points) / 2
+    if neck_column and neck_down > 0 and neck_half > 0:
+        top = chin + up * (0.2 * face_height)
+        bottom = chin - up * neck_down
+        span = float(np.linalg.norm(top - bottom))
+
+        # Эллипс намеренно длиннее нужного и срезается по линии одежды: иначе
+        # у самого воротника шея сходилась бы на нет
+        neck_centre = (top + bottom) / 2.0
+        cv2.ellipse(
+            region,
+            (int(neck_centre[0]), int(neck_centre[1])),
+            (int(round(neck_half)), int(round(span * _NECK_TAPER / 2))),
+            roll,
+            0,
+            360,
+            255,
+            -1,
+        )
+        flat = np.array(
+            [
+                bottom + side * reach,
+                bottom - side * reach,
+                bottom - side * reach - up * reach,
+                bottom + side * reach - up * reach,
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(region, flat, 0)
+
+    # Отрезок среза — по ширине шеи, а не эллипса: шов проходит там, где шея
+    # донора встречается с телом персонажа, и полоса маски ложится туда же.
     neck_point = chin - up * neck_down
-    half = width_ratio * face_width / 2
+    half = max(neck_half, width_ratio * face_width / 6)
     neck_line = (
         tuple(np.round(neck_point + side * half).astype(int)),
         tuple(np.round(neck_point - side * half).astype(int)),
     )
     return region, neck_line, face_height
+
+
+def _jaw_width(points: list[tuple[int, int]]) -> float:
+    """Расстояние между углами нижней челюсти — мерка ширины шеи."""
+    import numpy as np
+
+    left = np.array(points[_JAW_LEFT], dtype=np.float64)
+    right = np.array(points[_JAW_RIGHT], dtype=np.float64)
+    return float(np.linalg.norm(right - left))
 
 
 def clean_alpha(alpha: Any, erode_px: int) -> Any:
@@ -294,29 +473,37 @@ def cutout_head(
     model: str,
     width_ratio: float = _WIDTH_RATIO,
     hair_ratio: float = _HAIR_RATIO,
-    neck_ratio: float = _NECK_RATIO,
+    neck_ratio: float | None = _NECK_RATIO,
     erode_ratio: float = _ERODE_RATIO,
 ) -> Head:
     """
-    Голова целиком: силуэт сегментатора, ограниченный областью головы.
+    Голова с шеей: силуэт сегментатора, ограниченный областью головы.
 
     :param image: BGR numpy.ndarray
     :param points: сетка mediapipe того же кадра
     :param model: имя модели rembg
+    :param neck_ratio: отступ среза вниз от подбородка; None — искать линию
+        одежды по силуэту (`clothing_line`)
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :return: Head с альфой, отрезком среза шеи и высотой лица
     """
     import numpy as np
 
-    region, neck_line, face_height = head_region(
-        points, image.shape[:2], width_ratio, hair_ratio, neck_ratio
-    )
-
     # Эрозия меряется от лица, а не в абсолютных пикселях: одни и те же «два
     # пикселя» на превью съедают прядь целиком, а на 4K не делают ничего.
+    _, _, _, face_height = _axis(points)
     erode_px = max(1, round(face_height * erode_ratio)) if erode_ratio > 0 else 0
     alpha = clean_alpha(silhouette(image, model), erode_px)
 
+    # Силуэт нужен до построения области: по нему ищется линия одежды, а по ней
+    # проходит срез. Порядок обратный прежнему, где область строилась вслепую.
+    neck_meta: dict = {"neck_source": "fixed"}
+    if neck_ratio is None:
+        neck_ratio, neck_meta = clothing_line(image, alpha, points)
+
+    region, neck_line, face_height = head_region(
+        points, image.shape[:2], width_ratio, hair_ratio, neck_ratio
+    )
     head = largest_component(np.where(region > 0, alpha, 0).astype(np.uint8))
 
     area = int(np.count_nonzero(head > 127))
@@ -324,6 +511,8 @@ def cutout_head(
         "model": model,
         "face_height": round(face_height, 1),
         "erode_px": erode_px,
+        "neck_ratio": round(float(neck_ratio), 3),
+        **neck_meta,
         "head_px": area,
         # Насколько силуэт заполнил отведённый эллипс. Близко к нулю — значит
         # сегментатор не нашёл человека (или нашёл не там), и вклеивать нечего.
