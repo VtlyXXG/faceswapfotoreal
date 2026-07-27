@@ -26,12 +26,20 @@ log = get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    provider = registry.status()["provider"]
     log.info(
-        "ml-service %s стартует: провайдер=%s, ключ=%s",
+        "ml-service %s стартует: профиль=%s, провайдер=%s, ключ=%s",
         __version__,
-        settings.fal_model,
-        "задан" if registry.status()["provider"]["key_present"] else "НЕ ЗАДАН",
+        provider["profile"],
+        provider["model"],
+        "задан" if provider["key_present"] else "НЕ ЗАДАН",
     )
+    if provider["profile_error"]:
+        # Профиль второго шага не собрался — заказы будут падать. Ронять
+        # процесс из-за этого нельзя (чинится переменной окружения, и
+        # /health/ready уже отвечает degraded), но в логе старта это первое,
+        # что должно броситься в глаза
+        log.error("профиль обработки не собран: %s", provider["profile_error"])
 
     yield
 

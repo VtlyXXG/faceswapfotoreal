@@ -168,8 +168,76 @@ def test_zero_ratios_leave_only_the_raw_seam():
 
 @pytest.mark.parametrize(
     "ratios",
-    [{"edge_ratio": -0.1}, {"neck_ratio": -0.1}, {"feather_ratio": -0.1}, {"guard_ratio": -0.1}],
+    [
+        {"edge_ratio": -0.1},
+        {"neck_ratio": -0.1},
+        {"feather_ratio": -0.1},
+        {"guard_ratio": -0.1},
+        {"gradient_ratio": -0.1},
+    ],
 )
 def test_negative_ratios_are_rejected(ratios):
     with pytest.raises(InvalidImageError):
         _blend(**ratios)
+
+
+# --- Градиент: маска для высокого strength ---
+
+
+def test_gradient_keeps_the_seam_fully_open():
+    """
+    Вершина конуса — сам стык. Если градиент сбивает её ниже 255, зона, ради
+    которой всё затевалось, открывается модели лишь частично.
+    """
+    seam = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.circle(seam, (200, 200), 60, 255, 4)
+
+    ramped = mask_generator.gradient(seam, _FACE_HEIGHT, 0.2)
+
+    assert ramped[seam > 0].min() == 255
+
+
+def test_gradient_falls_off_with_distance():
+    """Склон линейный и заданной ширины: 16 пикселей при 0.2 от лица в 80."""
+    seam = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.circle(seam, (200, 200), 60, 255, 4)
+
+    ramped = mask_generator.gradient(seam, _FACE_HEIGHT, 0.2)
+
+    # Наружу от кольца радиуса 60: чем дальше, тем темнее, за 16 px — ноль
+    assert ramped[200, 200 + 66] > ramped[200, 200 + 72] > 0
+    assert ramped[200, 200 + 80] == 0
+
+
+def test_gradient_widens_the_zone_but_not_the_core():
+    """
+    Градиент шире растушёвки и мягче: полутонов должно стать заметно больше, а
+    полностью открытых пикселей — не больше прежнего.
+    """
+    plateau = _blend()
+    ramped = _blend(gradient_ratio=0.2)
+
+    def halftones(mask):
+        return int(np.count_nonzero((mask > 10) & (mask < 245)))
+
+    assert halftones(ramped) > halftones(plateau)
+    assert int(np.count_nonzero(ramped == 255)) <= int(np.count_nonzero(plateau == 255))
+
+
+def test_gradient_still_spares_the_face():
+    """
+    Защита лица вычитается последней и при градиенте тоже: черты обязаны
+    получить ровный ноль, иначе strength 0.5 перерисует их первыми.
+    """
+    mask = _blend(gradient_ratio=0.2)
+
+    face = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(face_mesh())], 255)
+    core = cv2.erode(face, np.ones((15, 15), np.uint8)) > 0
+
+    assert mask[core].max() == 0
+
+
+def test_zero_gradient_keeps_the_previous_mask():
+    """Ноль — прежнее поведение ровно: старый режим должен остаться доступным."""
+    assert np.array_equal(_blend(), _blend(gradient_ratio=0.0))

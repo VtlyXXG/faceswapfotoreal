@@ -13,7 +13,8 @@ from importlib.util import find_spec
 from pathlib import Path
 
 from app.config import settings
-from app.pipelines import expression, fal_api
+from app.core.errors import MLServiceError
+from app.pipelines import expression, fal_api, refine
 
 
 def _installed(module: str) -> bool:
@@ -46,7 +47,25 @@ def reset() -> None:
     """Симметрична warmup: освобождать тоже нечего."""
 
 
+def _active():
+    """
+    Активный профиль второго шага и причина, если собрать его не вышло.
+
+    Профиль складывается из пресета и переопределений окружения, то есть может
+    оказаться несобираемым — например, карты ControlNet при эндпоинте, который
+    их не принимает. Узнать об этом на /health/ready лучше, чем на первом живом
+    заказе: тот отвалится уже после трёх загрузок в CDN.
+    """
+    try:
+        return refine.profiles.from_settings(), None
+    except MLServiceError as exc:
+        return None, exc.message
+
+
 def status() -> dict:
+    profile, profile_error = _active()
+    mask = profile.mask if profile else None
+
     return {
         "runtime": {
             "mediapipe": _installed("mediapipe"),
@@ -54,20 +73,29 @@ def status() -> dict:
             "fal_client": _installed("fal_client"),
             "rembg": _installed("rembg"),
         },
+        # Профиль виден целиком намеренно: strength, веса карт и ширина
+        # градиента — главные ручки пайплайна, и подбирают их из окружения на
+        # живом сервисе. Пустые значения означают, что профиль не собрался, —
+        # тогда всё, что о нём известно, лежит в profile_error
         "provider": {
-            "model": settings.fal_model,
+            "model": profile.endpoint if profile else None,
             "key_present": fal_api.key_present(),
             "key_env": settings.fal_key_env,
-            # Виден в /health/ready намеренно: strength — главная ручка
-            # пайплайна, и подбирают её из окружения на живом сервисе
-            "strength": settings.fal_strength,
+            "strength": profile.strength if profile else None,
+            "profile": settings.refine_profile,
+            "strategy": profile.strategy if profile else None,
+            "controls": [f"{c.kind}:{c.weight}" for c in profile.controls] if profile else [],
+            "profile_error": profile_error,
+            "profiles": refine.profiles.available(),
+            "strategies": refine.available(),
         },
         "mask": {
             "detector": "mediapipe/face_mesh",
-            "edge_ratio": settings.mask_edge_ratio,
-            "neck_ratio": settings.mask_neck_ratio,
-            "guard_ratio": settings.mask_guard_ratio,
-            "feather_ratio": settings.mask_feather_ratio,
+            "edge_ratio": mask.edge_ratio if mask else None,
+            "neck_ratio": mask.neck_ratio if mask else None,
+            "guard_ratio": mask.guard_ratio if mask else None,
+            "feather_ratio": mask.feather_ratio if mask else None,
+            "gradient_ratio": mask.gradient_ratio if mask else None,
         },
         # Первый шаг пайплайна виден отдельно: по этим числам сразу понятно,
         # выполняется ли перенос головы локально и с какими допусками.

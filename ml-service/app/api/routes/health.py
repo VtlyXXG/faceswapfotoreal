@@ -46,6 +46,10 @@ async def readiness(response: Response) -> ReadinessResponse:
         missing.append("не установлен rembg — голову с волосами вырезать нечем")
     if not state["provider"]["key_present"]:
         missing.append(f"не задан {state['provider']['key_env']}")
+    if state["provider"]["profile_error"]:
+        # Несобираемый профиль второго шага — это отказ: заказ дойдёт до fal,
+        # потратит три загрузки в CDN и завернётся там же
+        missing.append(state["provider"]["profile_error"])
 
     ready = not missing
     response.status_code = 200 if ready else 503

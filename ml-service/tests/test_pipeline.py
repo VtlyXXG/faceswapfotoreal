@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from app.pipelines import collage as collage_builder
-from app.pipelines import fal_api
+from app.pipelines import refine
 from app.pipelines.face_swap import pipeline
 from app.utils.image import decode_image, encode_image
 
@@ -40,12 +40,13 @@ def sent(monkeypatch) -> dict:
             meta={"scale": 0.5, "emotion": "neutral", "face_height_target": 20.0},
         )
 
-    def _refine(**kwargs):
-        captured.update(kwargs)
-        return b"RESULT", {"model": "fal/test", "mime_type": "image/png"}
+    def _run(request, profile):
+        captured["request"] = request
+        captured["profile"] = profile
+        return refine.RefineResult(image=b"RESULT", meta={"model": "fal/test"})
 
     monkeypatch.setattr(collage_builder, "build", _build)
-    monkeypatch.setattr(fal_api, "refine_collage", _refine)
+    monkeypatch.setattr(pipeline.refine, "run", _run)
 
     cover_png, _ = encode_image(cover, "png")
     source_png, _ = encode_image(np.zeros((32, 32, 3), dtype=np.uint8), "png")
@@ -56,22 +57,45 @@ def sent(monkeypatch) -> dict:
 
 
 def test_fal_receives_the_collage_not_the_cover(sent):
-    uploaded = decode_image(sent["captured"]["collage"])
+    uploaded = decode_image(sent["captured"]["request"].collage)
 
     assert tuple(uploaded[32, 32]) == _COLLAGE_COLOUR
 
 
 def test_photo_goes_as_reference_only(sent):
-    assert sent["captured"]["reference_mime"] == "image/png"
-    assert sent["captured"]["mask"], "маска обязательна: без неё инпейнтинга нет"
+    request = sent["captured"]["request"]
+
+    assert request.reference_mime == "image/png"
+    assert request.mask, "маска обязательна: без неё инпейнтинга нет"
+
+
+def test_collage_goes_as_pixels_too(sent):
+    """
+    Карты управления строятся по пикселям коллажа. Декодировать PNG второй раз
+    ради этого незачем — массив уезжает вместе с байтами.
+    """
+    assert sent["captured"]["request"].collage_image is not None
 
 
 def test_mask_covers_the_seam_and_spares_the_face(sent):
-    mask = decode_image(sent["captured"]["mask"])[..., 0]
+    mask = decode_image(sent["captured"]["request"].mask)[..., 0]
 
     assert mask.shape == (64, 64)
     assert mask.max() == 255, "зона обработки должна быть непустой"
     assert mask[32, 32] == 0, "центр лица модели недоступен"
+
+
+def test_mask_and_strength_come_from_one_profile(sent):
+    """
+    Ширина градиента маски и strength подбираются вместе. Если маску собирать
+    по одним числам, а запрос по другим, разъедутся они молча — и объяснить
+    результат будет нечем.
+    """
+    profile = sent["captured"]["profile"]
+
+    assert profile.name == "stylise"
+    assert profile.mask.gradient_ratio > 0
+    assert 0.45 <= profile.strength <= 0.55
 
 
 def test_emotion_reaches_the_collage_step(sent):

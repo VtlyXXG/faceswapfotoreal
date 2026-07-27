@@ -209,6 +209,50 @@ def face_guard(
     return guard
 
 
+def gradient(mask: Any, face_height: float, gradient_ratio: float) -> Any:
+    """
+    Превращает маску-плато в конус: 255 на стыке, линейный спад в обе стороны.
+
+    Зачем это понадобилось. Пока strength держали около 0.2, форма маски внутри
+    почти не имела значения: модель всё равно едва касалась пикселей, и разница
+    между «обрабатывается на 100%» и «на 60%» была неразличима. На 0.45-0.55
+    она перерисовывает открытое по-настоящему, и плато означает, что вся
+    область под ним переписана одинаково сильно — а по его границе идёт
+    ступенька ровно той высоты, на которую подняли strength.
+
+    Спад строится через distanceTransform, а не гауссианом: гауссиан размывает
+    и сам стык, теряя на нём полные 255, а расстояние даёт честный конус —
+    вершина точно на стыке, склон точно заданной ширины.
+
+    :param mask: бинарная (или почти) маска стыка
+    :param gradient_ratio: ширина склона, доля высоты лица
+    :return: маска uint8 с градиентом
+    """
+    import cv2
+    import numpy as np
+
+    if gradient_ratio < 0:
+        raise InvalidImageError(
+            "Ширина градиента не может быть отрицательной",
+            {"gradient_ratio": gradient_ratio},
+        )
+
+    reach = round(face_height * gradient_ratio)
+    if reach <= 0:
+        return mask
+
+    core = (np.asarray(mask) > 127).astype(np.uint8)
+    if not core.any():
+        return mask
+
+    # Расстояние до стыка считается по фону: DIST_L2 с маской 3x3 — приближение,
+    # но на ширинах в десятки пикселей его погрешность меньше пикселя
+    distance = cv2.distanceTransform(1 - core, cv2.DIST_L2, 3)
+    slope = np.clip(1.0 - distance / float(reach), 0.0, 1.0)
+
+    return np.maximum(core * 255, (slope * 255).astype(np.uint8))
+
+
 def blend_mask(
     shape: tuple[int, int],
     head_alpha: Any,
@@ -220,6 +264,7 @@ def blend_mask(
     neck_ratio: float = _NECK_RATIO,
     guard_ratio: float = _GUARD_RATIO,
     feather_ratio: float = _FEATHER_RATIO,
+    gradient_ratio: float = 0.0,
 ) -> Any:
     """
     Зона инпейнтинга для вклеенной аппликации: контур волос, шея, следы стирания.
@@ -234,15 +279,22 @@ def blend_mask(
     :param neck_line: отрезок среза шеи в координатах шаблона
     :param erased: маска стёртой причёски персонажа (может быть пустой)
     :param face_height: высота лица на шаблоне, база для всех долей
+    :param gradient_ratio: ширина градиента от стыка наружу; 0 — прежнее плато
+        со спадом по краю. Нужен на высоком strength, см. `gradient`
     :return: одноканальная маска uint8 размера shape
     """
     import cv2
     import numpy as np
 
-    if edge_ratio < 0 or neck_ratio < 0 or feather_ratio < 0:
+    if edge_ratio < 0 or neck_ratio < 0 or feather_ratio < 0 or gradient_ratio < 0:
         raise InvalidImageError(
             "Доли маски не могут быть отрицательными",
-            {"edge": edge_ratio, "neck": neck_ratio, "feather": feather_ratio},
+            {
+                "edge": edge_ratio,
+                "neck": neck_ratio,
+                "feather": feather_ratio,
+                "gradient": gradient_ratio,
+            },
         )
 
     solid = (np.asarray(head_alpha) > 127).astype(np.uint8)
@@ -260,11 +312,16 @@ def blend_mask(
 
     mask = np.maximum(np.maximum(ring, neck), np.asarray(erased, dtype=np.uint8))
 
-    # soften, а не просто размытие: кольцо вдоль волос узкое, и симметричный
-    # гауссиан сбил бы его пик заметно ниже 255 — зона стыка открылась бы
-    # модели лишь частично. Здесь спад целиком уходит наружу, а сам стык
-    # остаётся полностью доступным.
-    mask = soften(mask, face_height, 0.0, feather_ratio)
+    if gradient_ratio > 0:
+        # Градиент заменяет растушёвку, а не дополняет: и то и другое описывает
+        # край зоны, только конус делает это шире и линейно
+        mask = gradient(mask, face_height, gradient_ratio)
+    else:
+        # soften, а не просто размытие: кольцо вдоль волос узкое, и симметричный
+        # гауссиан сбил бы его пик заметно ниже 255 — зона стыка открылась бы
+        # модели лишь частично. Здесь спад целиком уходит наружу, а сам стык
+        # остаётся полностью доступным.
+        mask = soften(mask, face_height, 0.0, feather_ratio)
 
     # Вычитание защиты — последним действием: что бы ни попало в зону раньше,
     # лицо из неё выпадает. Порядок здесь и есть гарантия, ради которой всё
@@ -279,6 +336,7 @@ def blend_mask(
             "face_height": round(face_height, 1),
             "edge_px": edge,
             "neck_px": thickness,
+            "gradient_px": round(face_height * gradient_ratio),
             "open_px": int(np.count_nonzero(mask > 127)),
         },
     )

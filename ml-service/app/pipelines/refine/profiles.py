@@ -1,0 +1,373 @@
+"""
+Все гиперпараметры второго шага в одном месте.
+
+Здесь лежат числа, а не логика: сила инпейнтинга, пороги Canny, веса ControlNet,
+доли маски, идентификаторы эндпоинтов и промпт. Раньше они были размазаны по
+config.py, fal_api.py и mask_generator.py, и подобрать связку означало править
+три файла и помнить, какое значение с каким сочетается.
+
+Профиль — замороженный dataclass, то есть просто набор чисел с именем. Из него
+нельзя получить картинку, он ничего не вызывает и ни от чего не зависит; его
+можно распечатать в лог, сравнить с другим и положить в /health/ready целиком.
+Стратегия (`refine/base.py`) получает профиль аргументом и решает, что с ним
+делать, — поэтому «переключить подход» означает выбрать другое имя, а не
+переписать вызов.
+
+Три пресета сейчас:
+
+  seam                — проверенный консервативный: strength 0.20, маска-плато
+                        только по стыку, без ControlNet. Режим, на котором
+                        пайплайн работал до сих пор; страховка и база сравнения.
+  stylise             — по умолчанию: strength 0.5, градиентная маска. Модель
+                        получает право на настоящую стилизацию — мазок кисти по
+                        всей аппликации и тени по промпту.
+  stylise_controlnet  — то же плюс карты Canny и Depth. **Требует эндпоинта,
+                        принимающего ControlNet**: kontext-inpaint его не
+                        принимает, а лишний ключ fal не игнорирует, а
+                        заворачивает весь запрос. Поэтому endpoint у пресета
+                        пустой — его задают через ML_REFINE_ENDPOINT, — и
+                        поэтому же он не выбран по умолчанию: непроверенный
+                        идентификатор эндпоинта означал бы отказ на каждом
+                        заказе.
+
+Свой профиль добавляется без правки этого файла:
+
+    profiles.register(replace(profiles.get("stylise"), name="soft", strength=0.4))
+
+Переопределения из окружения (ML_REFINE_*) накладываются поверх выбранного
+пресета в `from_settings` — ими подбирают значения на живом сервисе, не
+выкладывая релиз.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+
+from app.config import settings
+from app.core.errors import InvalidImageError
+
+# Идентификатор эндпоинта инпейнтинга по маске. Специализированные лицевые
+# модели fal здесь не подходят: easel-ai/advanced-face-swap ищет лицо своим
+# детектором и на рисованной обложке его не находит, а flux-pulid и
+# ip-adapter-face-id — чистый text-to-image, без mask_url и базового кадра.
+_INPAINT_ENDPOINT = "fal-ai/flux-kontext-lora/inpaint"
+
+# Эндпоинты, про которые известно, что ControlNet они не принимают. Лишний ключ
+# в аргументах fal не игнорирует, а заворачивает весь запрос, поэтому такая
+# связка ловится до сети — см. RefineProfile.validate.
+_NO_CONTROL_ENDPOINTS = frozenset({_INPAINT_ENDPOINT})
+
+
+@dataclass(frozen=True)
+class ControlSpec:
+    """
+    Одна карта управления для ControlNet.
+
+    :param kind: имя карты для эндпоинта (canny, depth)
+    :param source: чем карта строится. `canny` — локально по коллажу через
+        cv2.Canny; `image` — картой служит сам коллаж, карту глубины считает
+        эндпоинт. Локального инференса глубины у сервиса нет (MiDaS потянул бы
+        torch, а от локальных весов уходили осознанно), поэтому depth идёт
+        вторым способом.
+    :param weight: вес карты. Больше — жёстче держится геометрия оригинала,
+        меньше — свободнее мазок.
+    :param start: доля шагов денойза, с которой карта включается
+    :param end: доля шагов, на которой отключается. Тени берутся с depth в
+        начале денойза, когда решается крупная форма; к концу карта только
+        мешает класть мазок.
+    :param low: нижний порог Canny (только для source="canny")
+    :param high: верхний порог Canny
+    """
+
+    kind: str
+    source: str = "canny"
+    weight: float = 0.6
+    start: float = 0.0
+    end: float = 0.8
+    low: int = 100
+    high: int = 200
+
+
+@dataclass(frozen=True)
+class MaskProfile:
+    """
+    Геометрия маски стыка, доли высоты лица на шаблоне.
+
+    :param edge_ratio: половина ширины кольца вдоль контура волос
+    :param neck_ratio: толщина полосы на срезе шеи
+    :param guard_ratio: растушёвка защиты лица — она вычитается из маски
+    :param feather_ratio: спад по краям зоны
+    :param gradient_ratio: ширина градиента от стыка наружу. Ноль — прежняя
+        маска-плато со спадом по краю. Больше нуля — маска становится конусом:
+        255 ровно на стыке и линейный спад на эту долю в обе стороны. На
+        strength 0.2 разницы почти нет, на 0.5 плато означает, что вся область
+        под ним перерисовывается одинаково сильно, и по границе плато идёт
+        ступенька — заметная ровно настолько, насколько поднят strength.
+    """
+
+    edge_ratio: float = 0.05
+    neck_ratio: float = 0.35
+    guard_ratio: float = 0.06
+    feather_ratio: float = 0.06
+    gradient_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class RefineProfile:
+    """
+    Полный набор гиперпараметров второго шага.
+
+    :param strategy: имя стратегии в реестре `refine`. Здесь и происходит
+        переключение подхода: inpaint_controlnet сегодня, identity_embedding
+        (проброс лицевых эмбеддингов) — когда появится эндпоинт, который их
+        принимает вместе с маской.
+    :param safe_strength: граница, выше которой в лог уходит предупреждение.
+        Это не запрет: значение подбирают из окружения, и отказывать из-за
+        превышения нельзя — но в логе разбора полётов оно должно быть видно.
+    :param control_field: имя ключа, в котором эндпоинт ждёт список карт.
+        Схемы у эндпоинтов разные, а лишний ключ заворачивает весь запрос.
+    """
+
+    name: str
+    strategy: str
+    endpoint: str
+    prompt: str
+    strength: float
+    guidance_scale: float
+    steps: int
+    safe_strength: float
+    mask: MaskProfile = field(default_factory=MaskProfile)
+    controls: tuple[ControlSpec, ...] = ()
+    control_field: str = "controlnets"
+
+    def validate(self) -> RefineProfile:
+        """
+        Проверяет профиль до сети.
+
+        Отдельным шагом, а не в __post_init__: профиль собирают и из пресетов, и
+        из окружения, и промежуточные состояния законны. Смысл проверки в том,
+        чтобы неверная связка стоила 500 с внятным текстом, а не отказа fal
+        после трёх загрузок в CDN.
+        """
+        if not self.endpoint:
+            raise InvalidImageError(
+                "Профилю не задан эндпоинт — укажите его в ML_REFINE_ENDPOINT",
+                {"profile": self.name},
+            )
+        if not 0.0 <= self.strength <= 1.0:
+            raise InvalidImageError(
+                "strength должен лежать в диапазоне 0..1",
+                {"profile": self.name, "strength": self.strength},
+            )
+        if self.steps < 1:
+            raise InvalidImageError(
+                "Число шагов инференса должно быть положительным",
+                {"profile": self.name, "steps": self.steps},
+            )
+        if self.controls and not self.control_field:
+            raise InvalidImageError(
+                "Заданы карты ControlNet, но не задано имя ключа для них",
+                {"profile": self.name},
+            )
+        if self.controls and self.endpoint in _NO_CONTROL_ENDPOINTS:
+            raise InvalidImageError(
+                "Этот эндпоинт не принимает ControlNet — укажите другой в "
+                "ML_REFINE_ENDPOINT либо отключите карты через ML_REFINE_CONTROLS=none",
+                {
+                    "profile": self.name,
+                    "endpoint": self.endpoint,
+                    "controls": [c.kind for c in self.controls],
+                },
+            )
+        for control in self.controls:
+            if control.source not in ("canny", "image"):
+                raise InvalidImageError(
+                    "Неизвестный способ построения карты управления",
+                    {"kind": control.kind, "source": control.source},
+                )
+        return self
+
+    def report(self) -> dict:
+        """Плоская сводка для логов и /health/ready."""
+        return {
+            "profile": self.name,
+            "strategy": self.strategy,
+            "endpoint": self.endpoint,
+            "strength": self.strength,
+            "guidance_scale": self.guidance_scale,
+            "steps": self.steps,
+            "gradient_ratio": self.mask.gradient_ratio,
+            "controls": [f"{c.kind}:{c.weight}" for c in self.controls],
+        }
+
+
+# Промпт консервативного режима: маска открывает только стык, поэтому и речь
+# идёт только о границе.
+_SEAM_PROMPT = (
+    "A photograph of a head has been collaged onto this painted illustration. "
+    "Work only along the seam that is masked: blend the outer edge of the hair "
+    "into the painted background, and cover the cut at the neck — paint a collar, "
+    "a shadow or a strand of hair there so that no torn edge remains. "
+    "Match the brush strokes, canvas and paper grain, colour palette, line work "
+    "and the direction and temperature of the light of the surrounding artwork. "
+    "Keep the hair colour, length and shape exactly as they are, keep the face "
+    "untouched — do not redraw, move or reshape anything, this must stay the very "
+    "same person. "
+    "Seamless hand-painted cover art: no cut-out edge, no halo around the hair, "
+    "no visible collage border, no second head or duplicated hair."
+)
+
+# Промпт режима стилизации. Отличие не косметическое: на strength 0.5 модель
+# действительно перерисовывает то, что открыто маской, поэтому от неё требуется
+# не «сгладить шов», а положить мазок по всей аппликации и поставить тени.
+# Просьба про тень под подбородком продублирована картой глубины: словами модель
+# ставит её куда придётся, картой — туда, где объём.
+_STYLISE_PROMPT = (
+    "A photograph of a head has been collaged onto this painted illustration. "
+    "Repaint it as part of the artwork: same brush strokes, same canvas grain, "
+    "same palette and line work as the surrounding illustration. "
+    "Relight the head to match the scene — put a soft contact shadow under the "
+    "chin and along the jaw where the head meets the body, shade the side of the "
+    "hair that faces away from the light source of the painting, and let the rim "
+    "light fall on the same side as everywhere else in the picture. "
+    "Blend the outer edge of the hair into the background and cover the cut at "
+    "the neck with a collar, a shadow or a strand of hair. "
+    "Keep the identity intact: same facial proportions, same eyes, nose and "
+    "mouth, same hair colour and length — this must stay the very same person. "
+    "Seamless hand-painted cover art: no cut-out edge, no halo around the hair, "
+    "no visible collage border, no second head or duplicated hair."
+)
+
+
+_PRESETS: dict[str, RefineProfile] = {}
+
+
+def register(profile: RefineProfile) -> None:
+    """Добавляет профиль в реестр. Повторное имя — замена."""
+    _PRESETS[profile.name] = profile
+
+
+def available() -> list[str]:
+    return sorted(_PRESETS)
+
+
+def get(name: str) -> RefineProfile:
+    profile = _PRESETS.get((name or "").strip().lower())
+    if profile is None:
+        raise InvalidImageError(
+            f"Неизвестный профиль обработки «{name}»",
+            {"profile": name, "available": available()},
+        )
+    return profile
+
+
+def _controls_from_env(raw: str, base: tuple[ControlSpec, ...]) -> tuple[ControlSpec, ...]:
+    """
+    Разбирает ML_REFINE_CONTROLS: «none» — выключить все, «canny,depth» —
+    оставить перечисленные. Веса и пороги остаются из пресета: подбирать их
+    строкой в окружении — верный способ получить набор, который никто потом не
+    воспроизведёт.
+    """
+    wanted = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not wanted or wanted == ["none"]:
+        return ()
+
+    known = {control.kind: control for control in base}
+    unknown = [kind for kind in wanted if kind not in known]
+    if unknown:
+        raise InvalidImageError(
+            "В ML_REFINE_CONTROLS перечислены карты, которых нет в профиле",
+            {"unknown": unknown, "available": sorted(known)},
+        )
+    return tuple(known[kind] for kind in wanted)
+
+
+def from_settings() -> RefineProfile:
+    """
+    Активный профиль: пресет из ML_REFINE_PROFILE плюс переопределения ML_REFINE_*.
+
+    Пустое значение переопределения означает «взять из пресета» — именно
+    поэтому они объявлены как None, а не как числа с дефолтами: иначе
+    невозможно отличить «оператор поставил 0.2» от «оператор не трогал».
+    """
+    profile = get(settings.refine_profile)
+
+    changes: dict = {}
+    if settings.refine_endpoint:
+        changes["endpoint"] = settings.refine_endpoint
+    if settings.refine_prompt:
+        changes["prompt"] = settings.refine_prompt
+    if settings.refine_strength is not None:
+        changes["strength"] = settings.refine_strength
+    if settings.refine_guidance_scale is not None:
+        changes["guidance_scale"] = settings.refine_guidance_scale
+    if settings.refine_steps is not None:
+        changes["steps"] = settings.refine_steps
+    if settings.refine_strategy:
+        changes["strategy"] = settings.refine_strategy
+    if settings.refine_controls:
+        changes["controls"] = _controls_from_env(settings.refine_controls, profile.controls)
+    if settings.refine_gradient_ratio is not None:
+        changes["mask"] = replace(profile.mask, gradient_ratio=settings.refine_gradient_ratio)
+
+    return replace(profile, **changes).validate() if changes else profile.validate()
+
+
+register(
+    RefineProfile(
+        name="seam",
+        strategy="inpaint_controlnet",
+        endpoint=_INPAINT_ENDPOINT,
+        prompt=_SEAM_PROMPT,
+        # Ниже 0.15 мазок не набирается и стык остаётся виден, выше 0.28 плывёт
+        # контур причёски. Режим существовал ровно ради этой узкой полосы.
+        strength=0.20,
+        guidance_scale=2.5,
+        # Реально исполняется доля strength от шагов: 50 × 0.20 = 10 шагов денойза
+        steps=50,
+        safe_strength=0.28,
+        mask=MaskProfile(),
+    )
+)
+
+register(
+    RefineProfile(
+        name="stylise",
+        strategy="inpaint_controlnet",
+        endpoint=_INPAINT_ENDPOINT,
+        prompt=_STYLISE_PROMPT,
+        # Середина запрошенного диапазона 0.45-0.55. На этих значениях модель
+        # уже действительно перерисовывает открытое маской — отсюда и градиент
+        # маски: плато на такой силе даёт ступеньку по своей границе.
+        strength=0.50,
+        guidance_scale=3.5,
+        steps=50,
+        # Предупреждение начинается за верхней границей запрошенного диапазона:
+        # 0.45-0.55 — рабочий режим, а не повод сорить в лог на каждом заказе
+        safe_strength=0.55,
+        mask=MaskProfile(gradient_ratio=0.12),
+    )
+)
+
+register(
+    replace(
+        get("stylise"),
+        name="stylise_controlnet",
+        # Не kontext-inpaint: тот карты не принимает. flux-general — тот самый
+        # эндпоинт, через который пробовали ip_adapters (см. README, таблицу
+        # отвергнутых моделей), то есть модульные ключи он берёт. Точную форму
+        # списка карт — имя ключа и имена полей внутри — проверять первым же
+        # боевым прогоном: схему у fal мы уже один раз узнавали постфактум.
+        endpoint="fal-ai/flux-general/inpainting",
+        controls=(
+            # Canny держит рисунок: контур причёски, линию челюсти, разрез глаз.
+            # Он же главный предохранитель личности на высоком strength.
+            ControlSpec(kind="canny", source="canny", weight=0.65, start=0.0, end=0.8),
+            # Depth отвечает за тени: карта объёма подсказывает, где голова
+            # выступает над плечами, и модель кладёт контактную тень туда, а не
+            # куда пришлось по промпту. Карту считает эндпоинт — локального
+            # инференса глубины у сервиса нет.
+            ControlSpec(kind="depth", source="image", weight=0.45, start=0.0, end=0.5),
+        ),
+    )
+)

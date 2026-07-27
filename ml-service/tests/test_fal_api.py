@@ -1,17 +1,13 @@
 """
-Вызов fal: схема аргументов эндпоинта и обработка ошибок транспорта.
+Транспорт до fal: загрузка, вызов, разбор ответа.
 
-Схему фиксируем тестами намеренно. Именно на ней уже обожглись вживую: fal
-принял запрос, но упал на несуществующем имени весов, и выяснилось это только
-после боевого прогона. Опечатка в ключе аргумента ловится здесь бесплатно.
-
-Второй шаг двухшагового пайплайна: сюда уходит уже собранный коллаж, а не
-чистая обложка. Отсюда и требование к strength — см. test_strength_stays_low.
+Схема аргументов проверяется не здесь, а в test_refine.py — вместе со
+стратегией, которая её собирает. Этому модулю всё равно, что уезжает: его дело
+довезти и не потерять ошибку по дороге.
 """
 
 import pytest
 
-from app.config import settings
 from app.pipelines import fal_api
 
 
@@ -36,25 +32,11 @@ class _FakeClient:
 
 @pytest.fixture
 def client(monkeypatch):
-    fake = _FakeClient()
-    monkeypatch.setattr(fal_api, "_client", lambda: fake)
     monkeypatch.setattr(fal_api, "_download", lambda image: b"PNGDATA")
-    return fake
+    return _FakeClient()
 
 
-def _call(**overrides):
-    kwargs = {
-        "collage": b"collage-bytes",
-        "collage_mime": "image/png",
-        "reference": b"source-bytes",
-        "reference_mime": "image/jpeg",
-        "mask": b"mask-bytes",
-    }
-    kwargs.update(overrides)
-    return fal_api.refine_collage(**kwargs)
-
-
-# --- Транспорт ---
+# --- Загрузка ---
 
 
 def test_upload_failure_becomes_fal_error():
@@ -69,7 +51,7 @@ def test_upload_failure_becomes_fal_error():
             raise RuntimeError("403 Forbidden")
 
     with pytest.raises(fal_api.FalError) as exc_info:
-        fal_api._upload(_Broken(), b"x" * 10, "image/png")
+        fal_api.upload(_Broken(), b"x" * 10, "image/png")
 
     error = exc_info.value
     assert error.status_code == 502
@@ -79,80 +61,42 @@ def test_upload_failure_becomes_fal_error():
     assert error.details["bytes"] == 10
 
 
-# --- Схема запроса ---
+# --- Вызов ---
 
 
-def test_arguments_match_endpoint_schema(client):
-    _call(output_format="png")
-
-    assert client.model == settings.fal_model
-    args = client.arguments
-    # Три обязательных ссылки эндпоинта
-    assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
-    assert args["prompt"] == settings.fal_prompt
-    assert args["strength"] == settings.fal_strength
-    assert args["guidance_scale"] == settings.fal_guidance_scale
-    assert args["num_inference_steps"] == settings.fal_steps
-
-
-def test_strength_stays_low(client):
+def test_invoke_passes_arguments_through(client):
     """
-    Смысл второго шага — не тронуть вклеенные пиксели. Дефолт обязан лежать в
-    диапазоне «мазок есть, черты и волосы целы»: выше него модель перерисовывает
-    лицо и плывёт контур причёски, а аппликация пропадает впустую.
+    Аргументы собирает стратегия, транспорт их не трогает: любая «умная»
+    правка здесь означала бы, что схему эндпоинта знают два места сразу.
     """
-    _call()
+    arguments = {"image_url": "https://cdn/1", "strength": 0.5, "custom": [1, 2]}
 
-    assert 0.15 <= client.arguments["strength"] <= 0.25
+    fal_api.invoke(client, "fal-ai/whatever", arguments)
 
-
-def test_collage_goes_first_and_reference_second(client):
-    """
-    Порядок ссылок важен: под инпейнтинг идёт коллаж, фотография — только
-    референс. Перепутать их местами — значит вернуться к прежней схеме, где
-    лицо рисовалось с нуля, причём молча.
-    """
-    _call()
-
-    args = client.arguments
-    assert args["image_url"] == "https://cdn/1", "первым загружается коллаж"
-    assert args["reference_image_url"] == "https://cdn/2", "вторым — фото заказчика"
-    assert client.uploads[0] == (b"collage-bytes", "image/png")
+    assert client.model == "fal-ai/whatever"
+    assert client.arguments == arguments
 
 
-@pytest.mark.parametrize("key", ["ip_adapter_scale", "ip_adapters", "negative_prompt"])
-def test_arguments_carry_no_unsupported_keys(client, key):
-    """
-    Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
-    а заворачивает весь запрос. Баланс «личность ↔ стиль» здесь задаётся
-    strength и guidance_scale, ip-адаптера у этой модели нет.
-    """
-    _call()
+def test_invoke_failure_becomes_fal_error(client):
+    def _boom(model, arguments, with_logs=False):
+        raise RuntimeError("model exploded")
 
-    assert key not in client.arguments
+    client.subscribe = _boom
 
+    with pytest.raises(fal_api.FalError) as exc_info:
+        fal_api.invoke(client, "fal-ai/whatever", {})
 
-def test_uploads_collage_reference_and_mask(client):
-    _call()
-
-    assert len(client.uploads) == 3
-    assert (b"mask-bytes", "image/png") in client.uploads
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.details["model"] == "fal-ai/whatever"
 
 
-def test_missing_mask_fails_before_network(client):
-    with pytest.raises(fal_api.MaskMissingError) as exc_info:
-        _call(mask=None)
+def test_invoke_reports_model_seed_and_mime(client):
+    _, meta = fal_api.invoke(client, "fal-ai/whatever", {}, {"strength": 0.5})
 
-    assert exc_info.value.status_code == 500
-    assert client.uploads == [], "до загрузки в CDN дойти не должно"
-    assert client.arguments is None, "до вызова модели дойти не должно"
-
-
-def test_jpeg_alias(client):
-    _call(output_format="jpg")
-
-    # Эндпоинт знает только jpeg, но наружу принимаем и jpg
-    assert client.arguments["output_format"] == "jpeg"
+    assert meta["model"] == "fal-ai/whatever"
+    assert meta["strength"] == 0.5, "метаданные стратегии проходят насквозь"
+    assert meta["seed"] == 7
+    assert meta["mime_type"] == "image/png"
 
 
 # --- Разбор ответа ---
@@ -176,14 +120,3 @@ def test_extract_image_takes_first_of_images():
 def test_extract_image_rejects_empty_response(response):
     with pytest.raises(fal_api.FalError):
         fal_api._extract_image(response)
-
-
-def test_meta_reports_model_params_and_seed(client):
-    _, meta = _call()
-
-    assert meta["model"] == settings.fal_model
-    assert meta["strength"] == settings.fal_strength
-    assert meta["guidance_scale"] == settings.fal_guidance_scale
-    assert meta["steps"] == settings.fal_steps
-    assert meta["seed"] == 7
-    assert meta["mime_type"] == "image/png"

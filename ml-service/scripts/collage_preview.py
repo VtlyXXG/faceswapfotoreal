@@ -45,7 +45,7 @@ import numpy as np  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.pipelines import collage as collage_builder  # noqa: E402
-from app.pipelines import mask_generator, segmentation  # noqa: E402
+from app.pipelines import mask_generator, refine, segmentation  # noqa: E402
 
 
 def _memoise_silhouette() -> None:
@@ -102,6 +102,10 @@ def main() -> int:
     )
     parser.add_argument("--erase-neck-ratio", type=float, default=settings.collage_erase_neck_ratio)
     parser.add_argument("--erase-pad-ratio", type=float, default=settings.collage_erase_pad_ratio)
+    # Профиль второго шага: маска рисуется по его числам, сам вызов не делается
+    parser.add_argument(
+        "--profile", choices=refine.profiles.available(), default=settings.refine_profile
+    )
     args = parser.parse_args()
 
     for path in (args.source, args.target):
@@ -169,6 +173,10 @@ def main() -> int:
         erase_pad_ratio=args.erase_pad_ratio,
     )
 
+    # Маска строится по тому же профилю, что уехал бы в fal: её градиент и
+    # strength подбираются вместе, и смотреть на маску от другого набора чисел
+    # бессмысленно
+    profile = refine.profiles.get(args.profile)
     mask = mask_generator.blend_mask(
         target.shape[:2],
         collage.head_alpha,
@@ -176,10 +184,11 @@ def main() -> int:
         collage.neck_line,
         collage.erased,
         collage.meta["face_height_target"],
-        edge_ratio=settings.mask_edge_ratio,
-        neck_ratio=settings.mask_neck_ratio,
-        guard_ratio=settings.mask_guard_ratio,
-        feather_ratio=settings.mask_feather_ratio,
+        edge_ratio=profile.mask.edge_ratio,
+        neck_ratio=profile.mask.neck_ratio,
+        guard_ratio=profile.mask.guard_ratio,
+        feather_ratio=profile.mask.feather_ratio,
+        gradient_ratio=profile.mask.gradient_ratio,
     )
 
     # Шаблон без головы персонажа, до наложения вклейки. Именно по нему видно,
@@ -212,6 +221,7 @@ def main() -> int:
         "target": str(args.target),
         "neck_ratio": args.neck_ratio,
         "erode_ratio": args.erode_ratio,
+        "refine": profile.report(),
         "face_height_photo": round(face_height, 1),
         "cutout": head.meta,
         "collage": collage.meta,

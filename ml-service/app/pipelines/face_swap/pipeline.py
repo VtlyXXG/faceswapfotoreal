@@ -7,10 +7,17 @@
      Голова заказчика — лицо вместе с причёской — вырезается по силуэту
      сегментатора и вклеивается в шаблон преобразованием подобия. Геометрия
      переносится один в один, цвет и структура волос сохраняются.
-  2. **Сведение стыка** (`fal_api.py`, на fal.ai). Коллаж уходит в инпейнтинг
-     по маске с экстремально низким strength. Маска накрывает только внешний
-     контур волос, срез шеи и следы стирания чужой причёски — лицо из неё
-     вычтено явно, модель до него физически не дотягивается.
+  2. **Стилизация** (`refine/`, на fal.ai). Коллаж уходит в инпейнтинг по
+     градиентной маске. Маска накрывает внешний контур волос, срез шеи и следы
+     стирания чужой причёски — лицо из неё вычтено явно, модель до него
+     физически не дотягивается.
+
+Оркестратор не знает, чем именно выполняется второй шаг. Он берёт профиль
+(`refine.profiles.from_settings()`), собирает по нему маску и отдаёт запрос в
+`refine.run` — а инпейнтинг там с ControlNet, проброс лицевых эмбеддингов или
+что-то третье, решает поле `strategy` в профиле. Ровно поэтому маска строится
+по тому же профилю: ширина её градиента и strength подбираются вместе, и
+разъехаться они не должны.
 
 Прежние схемы и почему они не подошли: при strength 0.82 модель рисовала лицо
 заново по референсу и портретного сходства не давала; версия с переносом одного
@@ -29,7 +36,7 @@ from dataclasses import dataclass, field
 from app.config import settings
 from app.core.logging import get_logger
 from app.pipelines import collage as collage_builder
-from app.pipelines import fal_api, mask_generator
+from app.pipelines import mask_generator, refine
 from app.utils.image import decode_image, encode_image
 
 log = get_logger(__name__)
@@ -94,6 +101,12 @@ def run(request: SwapRequest) -> SwapResult:
         erase_pad_ratio=settings.collage_erase_pad_ratio,
     )
 
+    # Все гиперпараметры второго шага приходят одним набором — профилем. Здесь
+    # он берётся один раз и передаётся дальше целиком: и маска, и стратегия
+    # обязаны собираться из одних и тех же чисел, иначе градиент маски и
+    # strength разъезжаются молча.
+    profile = refine.profiles.from_settings()
+
     # Маска — только стык: контур волос, срез шеи и следы стирания чужой
     # причёски. Лицо из неё вычитается внутри blend_mask.
     mask = mask_generator.blend_mask(
@@ -103,10 +116,11 @@ def run(request: SwapRequest) -> SwapResult:
         collage.neck_line,
         collage.erased,
         collage.meta["face_height_target"],
-        edge_ratio=settings.mask_edge_ratio,
-        neck_ratio=settings.mask_neck_ratio,
-        guard_ratio=settings.mask_guard_ratio,
-        feather_ratio=settings.mask_feather_ratio,
+        edge_ratio=profile.mask.edge_ratio,
+        neck_ratio=profile.mask.neck_ratio,
+        guard_ratio=profile.mask.guard_ratio,
+        feather_ratio=profile.mask.feather_ratio,
+        gradient_ratio=profile.mask.gradient_ratio,
     )
     mask_png, _ = encode_image(mask, "png")
 
@@ -115,17 +129,23 @@ def run(request: SwapRequest) -> SwapResult:
     # бессмысленно.
     collage_png, collage_mime = encode_image(collage.image, "png")
 
-    # Шаг 2. Референсом остаётся исходное фото: при strength ~0.2 оно почти ни
-    # на что не влияет, но подсказывает модели, чьё лицо она обводит мазком.
-    image, call_meta = fal_api.refine_collage(
-        collage=collage_png,
-        collage_mime=collage_mime,
-        reference=request.source,
-        reference_mime=_sniff_mime(request.source),
-        mask=mask_png,
-        output_format=request.output_format,
+    # Шаг 2. Референсом остаётся исходное фото: оно подсказывает модели, чьё
+    # лицо она обводит. Коллаж уезжает и массивом тоже — по нему стратегия
+    # строит карты управления, а декодировать PNG второй раз незачем.
+    result = refine.run(
+        refine.RefineRequest(
+            collage=collage_png,
+            collage_mime=collage_mime,
+            reference=request.source,
+            reference_mime=_sniff_mime(request.source),
+            mask=mask_png,
+            collage_image=collage.image,
+            output_format=request.output_format,
+        ),
+        profile,
     )
 
+    image, call_meta = result.image, dict(result.meta)
     mime_type = call_meta.pop("mime_type", "image/png")
 
     log.info(

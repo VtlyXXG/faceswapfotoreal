@@ -1,24 +1,18 @@
 """
-Шаг 2 замены лица: стилизация готового коллажа на fal.ai.
+Транспорт до fal.ai — и только он.
 
-Разделение ролей прежнее: этот модуль знает только про транспорт до fal —
-загрузку входных изображений, схему аргументов и скачивание результата. Что
-именно и по какой маске обрабатывается, решает pipeline.py.
+Модуль знает, как положить файл в CDN, как дождаться инференса и как забрать
+результат. Чего он не знает: какой эндпоинт вызывается, с какими аргументами и
+зачем. Это решает стратегия из `refine/` — она получает профиль с числами и
+собирает схему запроса сама.
 
-Эндпоинт один: fal-ai/flux-kontext-lora/inpaint — image_url (коллаж) +
-mask_url (наша маска) + reference_image_url (фото заказчика). Второй бэкенд,
-easel-ai/advanced-face-swap, был снят: он ищет лицо своим детектором и на
-рисованных обложках его не видит — детектор обучен на фотографиях.
+Раньше здесь же лежала и схема, и strength, и промпт. Разделение понадобилось,
+когда подходов к стилизации стало больше одного: у инпейнтинга с ControlNet и у
+проброса лицевых эмбеддингов общего ровно столько, сколько в этом файле, —
+загрузка, subscribe, скачивание.
 
-Изменилась не схема вызова, а его смысл. Раньше сюда уходила чистая обложка и
-модель рисовала лицо заново по референсу; теперь приходит готовая аппликация
-(collage.py), а маска открывает только стык — контур волос и срез шеи. От
-модели требуется один верхний слой: мазок по границе и закрытый срез шеи.
-Отсюда и strength в районе 0.2 — при нём шум не доходит до уровня, на котором
-меняются черты лица или цвет волос.
-
-Схема аргументов зафиксирована тестами: эндпоинт отвергает лишние ключи, а
-узнаётся это только после боевого прогона.
+Ошибки транспорта заворачиваются в FalError: без обёртки httpx-исключение
+улетело бы наружу как 500 text/plain и сломало JSON-контракт с Node.js API.
 """
 
 from __future__ import annotations
@@ -30,11 +24,6 @@ from app.core.errors import MLServiceError
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
-
-# Верх диапазона, на котором вклеенная голова ещё переживает инпейнтинг. Выше
-# начинает плыть контур причёски и меняться её цвет — то, ради сохранения чего
-# и появилась аппликация.
-_SAFE_STRENGTH = 0.28
 
 
 class FalError(MLServiceError):
@@ -65,7 +54,8 @@ def key_present() -> bool:
     return bool(os.environ.get(settings.fal_key_env, "").strip())
 
 
-def _client():
+def client():
+    """Клиент fal. Отсутствие ключа — состояние окружения, а не дефект запроса."""
     if not key_present():
         raise FalNotConfiguredError(
             f"Не задана переменная окружения {settings.fal_key_env}",
@@ -82,7 +72,7 @@ def _client():
         ) from exc
 
 
-def _upload(client, data: bytes, content_type: str) -> str:
+def upload(client, data: bytes, content_type: str) -> str:
     """
     Кладёт изображение в CDN fal и возвращает ссылку.
 
@@ -91,8 +81,7 @@ def _upload(client, data: bytes, content_type: str) -> str:
     способ для файлов больше нескольких килобайт.
 
     Загрузка идёт до инференса и падает первой: отказ авторизации, исчерпанный
-    баланс и обрыв сети приходят именно сюда. Без обёртки httpx-исключение
-    улетело бы наружу как 500 text/plain и сломало JSON-контракт с Node.js API.
+    баланс и обрыв сети приходят именно сюда.
     """
     try:
         return client.upload(data, content_type)
@@ -101,24 +90,6 @@ def _upload(client, data: bytes, content_type: str) -> str:
             f"Не удалось загрузить изображение в CDN fal: {exc}",
             {"content_type": content_type, "bytes": len(data)},
         ) from exc
-
-
-def _arguments(*, image_url: str, mask_url: str, identity_url: str, fmt: str) -> dict:
-    """
-    Полная схема запроса. Ключей вне списка входных параметров эндпоинта здесь
-    быть не должно: ip_adapter_scale и negative_prompt он не принимает, и
-    попытка передать их заворачивает весь запрос.
-    """
-    return {
-        "image_url": image_url,
-        "mask_url": mask_url,
-        "reference_image_url": identity_url,
-        "prompt": settings.fal_prompt,
-        "strength": settings.fal_strength,
-        "guidance_scale": settings.fal_guidance_scale,
-        "num_inference_steps": settings.fal_steps,
-        "output_format": fmt,
-    }
 
 
 def _extract_image(result: dict) -> dict:
@@ -132,61 +103,26 @@ def _extract_image(result: dict) -> dict:
     return image
 
 
-def refine_collage(
-    *,
-    collage: bytes,
-    collage_mime: str,
-    reference: bytes,
-    reference_mime: str,
-    mask: bytes | None = None,
-    output_format: str = "png",
-) -> tuple[bytes, dict]:
+def invoke(client, endpoint: str, arguments: dict, meta: dict | None = None) -> tuple[bytes, dict]:
     """
-    Стилизует готовый коллаж под иллюстрацию, не трогая геометрию лица.
+    Вызывает эндпоинт и возвращает готовое изображение.
 
-    :param collage: шаблон с уже вклеенным лицом заказчика
-    :param reference: фотография заказчика — референс личности
-    :param mask: одноканальная маска PNG, белое — зона обработки
-    :return: (байты готового изображения, метаданные вызова)
+    Схему аргументов собирает вызывающая стратегия — здесь она проходит
+    насквозь. Так и задумано: у разных подходов к стилизации схемы разные, а
+    транспорт один.
+
+    :param meta: что стратегия хочет видеть в метаданных вызова
+    :return: (байты изображения, метаданные с seed и mime)
     """
-    if mask is None:
-        raise MaskMissingError("Инпейнтингу нужна маска, но она не построена")
-
-    if settings.fal_strength > _SAFE_STRENGTH:
-        # Не отказ: значение переопределяется из окружения именно для подбора.
-        # Но выше этой границы шум съедает вклеенные пиксели, и весь смысл
-        # двухшагового пайплайна пропадает — в логе это должно быть видно.
-        log.warning(
-            "strength выше безопасного для коллажа — черты лица могут поехать",
-            extra={"strength": settings.fal_strength, "safe_max": _SAFE_STRENGTH},
-        )
-
-    client = _client()
-    fmt = "jpeg" if output_format in ("jpg", "jpeg") else "png"
-
-    image_url = _upload(client, collage, collage_mime)
-    identity_url = _upload(client, reference, reference_mime)
-    mask_url = _upload(client, mask, "image/png")
-
-    arguments = _arguments(
-        image_url=image_url, mask_url=mask_url, identity_url=identity_url, fmt=fmt
-    )
-    meta: dict = {
-        "model": settings.fal_model,
-        "strength": settings.fal_strength,
-        "guidance_scale": settings.fal_guidance_scale,
-        "steps": settings.fal_steps,
-        "output_format": fmt,
-    }
-
-    log.info("запрос замены лица к fal", extra=dict(meta))
+    meta = {"model": endpoint, **(meta or {})}
+    log.info("запрос к fal", extra={**meta, "arguments": sorted(arguments)})
 
     try:
-        result = client.subscribe(settings.fal_model, arguments=arguments, with_logs=False)
+        result = client.subscribe(endpoint, arguments=arguments, with_logs=False)
     except Exception as exc:  # noqa: BLE001 — любая ошибка транспорта или модели
         raise FalError(
             f"Замена лица на fal не выполнена: {exc}",
-            {"model": settings.fal_model},
+            {"model": endpoint},
         ) from exc
 
     image = _extract_image(result)

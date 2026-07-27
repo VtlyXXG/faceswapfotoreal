@@ -34,21 +34,37 @@ class RuntimeStatus(BaseModel):
 
 
 class ProviderStatus(BaseModel):
-    model: str
+    """
+    Второй шаг: чем и с какими числами он выполняется.
+
+    Числовые поля необязательны, потому что профиль может не собраться —
+    например, если в окружении включили ControlNet при эндпоинте, который его не
+    принимает. Тогда вместо чисел приходит profile_error, и это ровно то, что
+    нужно видеть в /health/ready.
+    """
+
+    model: str | None = Field(default=None, description="Идентификатор эндпоинта")
     key_present: bool
     key_env: str
     # Главная ручка пайплайна: подбирается из окружения на живом сервисе
-    strength: float
+    strength: float | None = None
+    profile: str = Field(description="Имя набора гиперпараметров")
+    strategy: str | None = Field(default=None, description="Подход: инпейнтинг, эмбеддинги, …")
+    controls: list[str] = Field(default_factory=list, description="Карты ControlNet и их веса")
+    profile_error: str | None = Field(default=None, description="Почему профиль не собрался")
+    profiles: list[str] = Field(default_factory=list)
+    strategies: list[str] = Field(default_factory=list)
 
 
 class MaskStatus(BaseModel):
     detector: str
     # Доли высоты лица: кольцо вдоль контура волос, полоса на срезе шеи,
-    # защита лица и общий спад по краям зоны
-    edge_ratio: float
-    neck_ratio: float
-    guard_ratio: float
-    feather_ratio: float
+    # защита лица, общий спад по краям зоны и ширина градиента
+    edge_ratio: float | None = None
+    neck_ratio: float | None = None
+    guard_ratio: float | None = None
+    feather_ratio: float | None = None
+    gradient_ratio: float | None = None
 
 
 class CollageStatus(BaseModel):

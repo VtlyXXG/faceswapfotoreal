@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -103,74 +104,57 @@ class Settings(BaseSettings):
     fal_key_env: str = "FAL_KEY"
     fal_timeout_s: int = 600
 
-    # Инпейнтинг по нашей маске MediaPipe. Личность больше не доверяется
-    # модели — она приходит готовым коллажем; от эндпоинта нужны только маска и
-    # управляемый strength. Единственный рабочий вариант из опробованных.
+    # Гиперпараметры второго шага сюда не переехали, и это осознанно: они
+    # связаны между собой (strength, ширина градиента маски, веса ControlNet
+    # подбираются вместе) и живут набором — профилем — в
+    # app/pipelines/refine/profiles.py. Здесь только выбор профиля и точечные
+    # переопределения для подбора на живом сервисе.
     #
-    # Специализированные лицевые модели fal здесь не подходят. easel-ai/
-    # advanced-face-swap ищет лицо сам и на рисованных обложках просто его не
-    # находит: детектор обучен на фотографиях. Связки «identity-модель +
-    # инпейнтинг по маске» на fal нет вовсе — и flux-pulid, и ip-adapter-face-id
-    # это чистый text-to-image, без mask_url и без базового изображения.
-    # negative_prompt эндпоинт тоже не принимает: все отрицания идут в промпт.
-    fal_model: str = "fal-ai/flux-kontext-lora/inpaint"
+    # seam — проверенный консервативный режим: strength 0.20, маска-плато по
+    #   стыку, без ControlNet.
+    # stylise — стилизация: strength 0.5, градиентная маска, Canny + Depth.
+    refine_profile: str = "stylise"
 
-    # Маска накрывает только стык, лица в ней нет вовсе — поэтому промпт
-    # описывает работу по границе: край волос, срез шеи, следы стирания чужой
-    # причёски. Отрицания идут прямо в текст: negative_prompt эндпоинт не берёт.
-    fal_prompt: str = (
-        "A photograph of a head has been collaged onto this painted illustration. "
-        "Work only along the seam that is masked: blend the outer edge of the hair "
-        "into the painted background, and cover the cut at the neck — paint a collar, "
-        "a shadow or a strand of hair there so that no torn edge remains. "
-        "Match the brush strokes, canvas and paper grain, colour palette, line work "
-        "and the direction and temperature of the light of the surrounding artwork. "
-        "Keep the hair colour, length and shape exactly as they are, keep the face "
-        "untouched — do not redraw, move or reshape anything, this must stay the very "
-        "same person. "
-        "Seamless hand-painted cover art: no cut-out edge, no halo around the hair, "
-        "no visible collage border, no second head or duplicated hair."
-    )
-
-    # Ключевой параметр всего пайплайна.
-    #
-    # strength — насколько сильно зашумляется область под маской. Под ней лежат
-    #   оригинальные пиксели фотографии, и задача ровно одна: не дать модели до
-    #   них добраться. Рабочий диапазон 0.15–0.25 — шума хватает на мазок кисти
-    #   и сведение стыка, но не на изменение черт лица и не на перекраску волос.
-    #   Выше ~0.28 (см. _SAFE_STRENGTH в fal_api.py) начинает плыть контур
-    #   причёски; дефолт эндпоинта 0.88 перерисовал бы голову с нуля. Ниже 0.15
-    #   мазок не набирается и стык остаётся виден.
-    fal_strength: float = 0.20
-    # guidance_scale — насколько строго выполняется промпт. Давить модель
-    #   больше не надо: фотография здесь основа кадра, а не соперник. 2.5
-    #   (дефолт эндпоинта) на низком strength даёт более чистый результат, выше
-    #   лезут артефакты контраста на считанных шагах денойза.
-    fal_guidance_scale: float = 2.5
-    # Шагов больше прежних 40, потому что реально исполняется лишь доля
-    # strength от них: 50 × 0.20 = 10 шагов денойза. При 30-40 их остаётся
-    # 6-8, и переход по контуру волос набраться уже не успевает.
-    fal_steps: int = 50
-
-    # --- Маска стыка ---
-    # Инпейнтингу отдаётся только граница аппликации, всё остальное чёрное.
-    # Доли — от высоты лица на шаблоне, подробности в mask_generator.py.
-    #
-    # edge — половина ширины кольца вдоль контура волос.
-    mask_edge_ratio: float = 0.05
-    # neck — толщина полосы на срезе шеи. Заметно шире кольца: оторванную шею
-    #   надо не сгладить, а закрыть — воротником, тенью, прядью.
-    mask_neck_ratio: float = 0.35
-    # guard — растушёвка защиты лица. Контур лица вычитается из маски последним
-    #   действием: черты получают полный ноль и модели недоступны вовсе.
-    mask_guard_ratio: float = 0.06
-    # feather — спад 255 → 0 по краям всей зоны.
-    mask_feather_ratio: float = 0.06
+    # Пустое значение или None означает «взять из профиля». Именно поэтому
+    # None, а не число: иначе не отличить «оператор поставил 0.2» от «оператор
+    # не трогал».
+    refine_strategy: str = ""
+    refine_endpoint: str = ""
+    refine_prompt: str = ""
+    refine_strength: float | None = None
+    refine_guidance_scale: float | None = None
+    refine_steps: int | None = None
+    # Ширина градиента маски, доля высоты лица. На высоком strength маска-плато
+    # даёт видимую ступеньку по своей границе.
+    refine_gradient_ratio: float | None = None
+    # Какие карты ControlNet оставить: «canny,depth» или «none». Веса и пороги
+    # остаются из профиля — подбирать их строкой в окружении означает получить
+    # набор, который потом никто не воспроизведёт.
+    refine_controls: str = ""
 
     # 4K-обложки занимают 25-30 МБ; значение продублировано в .env.example
     max_upload_mb: int = 40
 
     allowed_origins: str = "http://localhost:3000"
+
+    @field_validator(
+        "refine_strength",
+        "refine_guidance_scale",
+        "refine_steps",
+        "refine_gradient_ratio",
+        mode="before",
+    )
+    @classmethod
+    def _blank_means_from_profile(cls, value: object) -> object:
+        """
+        Пустая строка — это «не задано», а не ноль.
+
+        В .env.example переопределения профиля перечислены с пустыми значениями:
+        так видно, что ручка есть. Без этого разбора pydantic честно попытается
+        сделать из "" число и уронит сервис на старте — на конфиге, который
+        оператор считает пустым.
+        """
+        return None if isinstance(value, str) and not value.strip() else value
 
     @property
     def origins(self) -> list[str]:
