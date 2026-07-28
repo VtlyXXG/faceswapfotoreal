@@ -116,8 +116,10 @@ class MaskProfile:
         перерисовывается одинаково сильно, и по его границе идёт ступенька.
     :param hole_margin_ratio: отступ зоны фона от вклеенной головы. Зона 3 идёт
         на высоком strength и всё под собой стирает — до контура новых волос её
-        подпускать нельзя.
-    :param hole_feather_ratio: спад по краям зоны фона
+        подпускать нельзя. Но и меньше edge_ratio: зоны обязаны ПЕРЕКРЫВАТЬСЯ, а
+        не стыковаться, иначе между ними остаётся полоса сырой заливки, которую
+        не трогает ни один проход. Связь проверяется в `validate`.
+    :param hole_feather_ratio: спад по краям зоны фона; ведётся только наружу
     """
 
     edge_ratio: float = 0.04
@@ -125,7 +127,7 @@ class MaskProfile:
     guard_ratio: float = 0.06
     feather_ratio: float = 0.04
     gradient_ratio: float = 0.0
-    hole_margin_ratio: float = 0.05
+    hole_margin_ratio: float = 0.02
     hole_feather_ratio: float = 0.05
 
 
@@ -222,6 +224,19 @@ class RefineProfile:
                     "profile": self.name,
                     "background": self.background.strength,
                     "seam": self.strength,
+                },
+            )
+        if self.mask.hole_margin_ratio >= self.mask.edge_ratio:
+            # Зона 3 отступает от вклейки дальше, чем достаёт кольцо зоны 2.
+            # Между ними останется полоса, которую не трогает ни один проход, —
+            # и в ней сырая заливка на месте чужой причёски. Ровно этот зазор
+            # выглядел на обложке грязным контуром вокруг головы.
+            raise InvalidImageError(
+                "Зоны маски не перекрываются: отступ зоны фона больше кольца стыка",
+                {
+                    "profile": self.name,
+                    "hole_margin": self.mask.hole_margin_ratio,
+                    "edge": self.mask.edge_ratio,
                 },
             )
         if self.controls and not self.control_field:

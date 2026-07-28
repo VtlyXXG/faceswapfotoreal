@@ -573,12 +573,15 @@ def test_geometry_is_logged_as_plain_numbers(same_pose, photo, cover):
     logger = logging.getLogger("app.pipelines.collage")
     handler = _Catch()
     logger.addHandler(handler)
-    previous, logger.level = logger.level, logging.INFO
+    # Именно setLevel, а не присваивание .level: он сбрасывает кэш isEnabledFor,
+    # в котором после первого же build лежит «INFO выключен»
+    previous = logger.level
+    logger.setLevel(logging.INFO)
     try:
         _build(photo, cover)
     finally:
         logger.removeHandler(handler)
-        logger.level = previous
+        logger.setLevel(previous)
 
     line = next(m for m in lines if "[geometry]" in m)
     for field in ("scale=", "mark=", "marks=", "anchor=", "neck=", "face:", "head:"):
@@ -632,3 +635,99 @@ def test_multiplier_keeps_the_face_proportions(same_pose, photo, cover):
 def test_non_positive_multiplier_is_refused(same_pose, photo, cover, value):
     with pytest.raises(InvalidImageError):
         _build(photo, cover, scale_multiplier=value)
+
+
+# --- Цветокоррекция по зонам ---
+
+
+def _flat(top: tuple, bottom: tuple) -> np.ndarray:
+    """Кадр из двух ровных половин: «лицо» сверху, «шея» снизу."""
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    image[:50] = top
+    image[50:] = bottom
+    return image
+
+
+def _halves() -> tuple[np.ndarray, np.ndarray]:
+    top = np.zeros((100, 100), dtype=np.uint8)
+    top[:50] = 255
+    bottom = np.zeros((100, 100), dtype=np.uint8)
+    bottom[50:] = 255
+    return top, bottom
+
+
+def test_each_skin_zone_reaches_its_own_reference():
+    """
+    Лицо на фотографии освещено, шея под подбородком лежит в собственной тени.
+    Одна поправка на всю кожу подгоняет статистику по площади — то есть по
+    лицу, — и шея остаётся фотографически тёмной.
+    """
+    donor = _flat((200, 200, 200), (40, 40, 40))  # светлое лицо, тёмная шея
+    template = _flat((150, 150, 150), (120, 120, 120))
+    face, neck = _halves()
+
+    result = collage._match_skin(donor, template, [(face, face), (neck, neck)], 1.0, 1.0)
+
+    # На ровной заливке разброс нулевой, значит поправка — чистый сдвиг среднего
+    assert result[10, 50, 0] == pytest.approx(150, abs=3), "лицо пришло к лицу"
+    assert result[90, 50, 0] == pytest.approx(120, abs=3), "шея пришла к шее"
+
+
+def test_one_zone_for_everything_leaves_the_neck_off():
+    """
+    Проверка от противного: та самая ошибка, из-за которой шея отрывалась по
+    цвету. Одна зона на всю кожу подгоняет статистику по площади — по лицу, — и
+    шея приходит куда угодно, только не к шее персонажа.
+    """
+    donor = _flat((200, 200, 200), (40, 40, 40))
+    template = _flat((150, 150, 150), (120, 120, 120))
+    face, neck = _halves()
+
+    single = collage._match_skin(donor, template, [(np.maximum(face, neck), face)], 1.0, 1.0)
+    split = collage._match_skin(donor, template, [(face, face), (neck, neck)], 1.0, 1.0)
+
+    assert abs(int(split[90, 50, 0]) - 120) < abs(int(single[90, 50, 0]) - 120)
+
+
+def test_reference_comes_from_the_character_not_from_under_the_paste():
+    """
+    Эталон берётся по коже персонажа. Пока он считался по пикселям ПОД маской
+    донора, после сдвига и уменьшения там оказывались воротник и фон, и «тон
+    кожи шаблона» вычислялся по чему угодно, кроме кожи.
+    """
+    donor = _flat((200, 200, 200), (200, 200, 200))
+    # Под вклейкой — тёмная одежда, а кожа персонажа светлая и лежит в стороне
+    template = _flat((20, 20, 20), (20, 20, 20))
+    template[:, 70:] = (180, 180, 180)
+
+    zone = np.zeros((100, 100), dtype=np.uint8)
+    zone[:, :50] = 255
+    reference = np.zeros((100, 100), dtype=np.uint8)
+    reference[:, 70:] = 255
+
+    result = collage._match_skin(donor, template, [(zone, reference)], 1.0, 1.0)
+
+    assert result[50, 20, 0] == pytest.approx(180, abs=5), "тон взят с кожи персонажа"
+
+
+def test_skin_zones_split_the_paste_at_the_chin(same_pose, photo, cover):
+    """Шея должна попадать в коррекцию: до разделения зон она в неё не входила."""
+    result = _build(photo, cover)
+
+    assert result.meta["skin_face_px"] > 0
+    assert result.meta["skin_neck_px"] > 0, "шея обязана попасть в цветокоррекцию"
+
+
+def test_mask_base_follows_the_paste_not_the_character(same_pose, photo, cover):
+    """
+    Доли масок меряются от вклеенного лица. При множителе меньше единицы голова
+    меньше персонажной, и кольца, посчитанные от лица персонажа, оказались бы
+    шире нужного — ровно там, где потом виден грязный контур.
+    """
+    plain = _build(photo, cover)
+    smaller = _build(photo, cover, scale_multiplier=0.7)
+
+    assert smaller.meta["face_height_target"] == plain.meta["face_height_target"]
+    assert smaller.meta["face_height_paste"] == pytest.approx(
+        plain.meta["face_height_paste"] * 0.7, rel=0.05
+    )

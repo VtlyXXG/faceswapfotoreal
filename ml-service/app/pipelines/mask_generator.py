@@ -71,7 +71,10 @@ _FEATHER_RATIO = 0.04
 # Отступ зоны фона от вклеенной головы, доля высоты лица. Зона 3 работает на
 # strength 0.85 и всё под собой стирает — до контура новых волос её подпускать
 # нельзя, там начинается зона 2 со своей мягкой силой.
-_HOLE_MARGIN_RATIO = 0.05
+# Меньше edge: зоны обязаны перекрываться, а не стыковаться. Между погасшей
+# зоной 3 и начавшейся зоной 2 иначе остаётся полоса сырой заливки — грязный
+# контур вокруг головы, который не трогает ни один из проходов.
+_HOLE_MARGIN_RATIO = 0.02
 _HOLE_FEATHER_RATIO = 0.05
 
 
@@ -316,12 +319,25 @@ def hole_mask(
         return mask
 
     # Спад внутрь: наружу расширять зону нельзя, она и так граничит с холстом,
-    # который трогать не просили
+    # который трогать не просили.
+    #
+    # Но только по ВНЕШНЕЙ границе. По внутренней зона упирается во вклейку, и
+    # спад там означал бы полосу, не накрытую ни одной зоной: зона 3 уже
+    # погасла, зона 2 ещё не началась, и между ними остаётся сырая заливка —
+    # тот самый грязный контур вокруг головы. Внутренний край поэтому
+    # восстанавливается на полную после растушёвки; накроет его кольцо зоны 2,
+    # которое по построению заходит сюда же.
     feather = round(face_height * feather_ratio)
     if feather > 0:
         trim = feather + 1
         shrink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * trim + 1, 2 * trim + 1))
-        mask = cv2.GaussianBlur(cv2.erode(mask, shrink), (2 * feather + 1, 2 * feather + 1), 0)
+        soft = cv2.GaussianBlur(cv2.erode(mask, shrink), (2 * feather + 1, 2 * feather + 1), 0)
+
+        reach = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * (margin + 2 * feather) + 1,) * 2
+        )
+        inner = cv2.dilate((np.asarray(head_alpha) > 0).astype(np.uint8), reach) * 255
+        mask = np.maximum(soft, np.minimum(mask, inner))
 
     guard = face_guard(shape, face_polygon, face_height, guard_ratio)
     return (mask.astype(np.float32) * (1.0 - guard.astype(np.float32) / 255.0)).astype(np.uint8)

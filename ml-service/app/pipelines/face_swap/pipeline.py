@@ -111,7 +111,11 @@ def run(request: SwapRequest) -> SwapResult:
     profile = refine.profiles.from_settings()
 
     shape = target_image.shape[:2]
-    face_height = collage.meta["face_height_target"]
+    # Доли масок меряются от ВКЛЕЕННОГО лица, а не от лица персонажа: маски
+    # описывают стык вокруг вклейки. При ML_HEAD_SCALE_MULTIPLIER < 1 голова
+    # меньше персонажной, и кольца, посчитанные от неё, были бы шире нужного —
+    # ровно там, где потом виден грязный контур.
+    face_height = collage.meta["face_height_paste"]
 
     # Зона 2 — стыки: узкое кольцо по контуру новых волос и узкая полоса там,
     # где шея донора входит в тело персонажа. Лицо вычитается внутри.

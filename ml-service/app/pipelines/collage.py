@@ -66,6 +66,10 @@ _SCALE_MARKS = {
     "face_height": (152, 9),  # подбородок → переносица
 }
 
+# Докуда брать шею персонажа в эталон тона кожи, доля высоты его лица. Ниже
+# начинается одежда, и её цвет эталоном кожи быть не может.
+_REFERENCE_NECK_RATIO = 0.3
+
 # На сколько высот лица разрешено опустить вклейку, чтобы шея дотянулась до
 # воротника. Сдвиг нужен, когда шеи на фотографии мало: голова, посаженная
 # строго по лицу, повисает над воротником. Но и уводить лицо далеко от того
@@ -438,53 +442,167 @@ def _transform_points(points: Any, matrix: Any) -> Any:
     return np.rint(pts @ matrix[:, :2].T + matrix[:, 2]).astype(np.int32)
 
 
-def _match_skin(donor: Any, template: Any, skin: Any, ratio: float) -> Any:
+def _half_plane(origin: Any, up: Any, side: Any, shape: tuple[int, int]) -> Any:
     """
-    Подгоняет тон кожи под лицо шаблона: среднее и разброс по каналам LAB.
+    Полуплоскость ниже точки, в системе координат лица.
+
+    Ниже подбородка в области головы по построению нет ничего, кроме колонны
+    шеи: волосы и лицо остались выше. Поэтому пересечение с альфой и есть шея.
+    """
+    import cv2
+    import numpy as np
+
+    chin = np.asarray(origin, dtype=np.float64)
+    reach = float(max(shape)) * 2.0
+
+    below = np.zeros(shape, dtype=np.uint8)
+    cv2.fillConvexPoly(
+        below,
+        np.array(
+            [
+                chin + side * reach,
+                chin - side * reach,
+                chin - side * reach - up * reach,
+                chin + side * reach - up * reach,
+            ],
+            dtype=np.int32,
+        ),
+        255,
+    )
+    return below
+
+
+def _skin_zones(
+    face_polygon: Any,
+    alpha: Any,
+    chin: Any,
+    axis: tuple,
+    shape: tuple[int, int],
+) -> tuple[Any, Any]:
+    """
+    Кожа донора после переноса, разделённая на лицо и шею.
+
+    Раздельно, а не одной маской, потому что тон у них разный по природе: лицо
+    на фотографии освещено, шея под подбородком лежит в собственной тени. Единая
+    поправка на всю кожу подгоняет статистику по площади, то есть по лицу, и
+    шея остаётся с фотографической тенью — на замере это 43-46 единиц яркости
+    LAB мимо кожи персонажа при 4 единицах по коже в целом.
+
+    :param chin: подбородок вклейки в координатах шаблона
+    :param axis: (up, side) шаблона — обе головы после переноса совмещены
+    :return: (маска лица, маска шеи)
+    """
+    import cv2
+    import numpy as np
+
+    face = np.zeros(shape, dtype=np.uint8)
+    cv2.fillPoly(face, [np.asarray(face_polygon, dtype=np.int32)], 255)
+    face = np.minimum(face, np.asarray(alpha))
+
+    below = _half_plane(chin, axis[0], axis[1], shape)
+    neck = np.where((np.asarray(alpha) > 0) & (below > 0) & (face == 0), 255, 0).astype(np.uint8)
+    return face, neck
+
+
+def _skin_reference(points: list, shape: tuple[int, int], face_height: float) -> tuple[Any, Any]:
+    """
+    Кожа персонажа — эталон тона, отдельно лицо и отдельно шея.
+
+    Раздельно по той же причине, по которой разделена кожа донора: у героя лицо
+    освещено, а шея под подбородком в тени, и подгонять донорскую шею под
+    статистику нарисованного лица означает получить светлую шею там, где нужен
+    контактный переход к телу.
+
+    :return: (эталон лица, эталон шеи)
+    """
+    import cv2
+    import numpy as np
+
+    face = np.zeros(shape, dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(points)], 255)
+
+    # Шея персонажа: узкая колонна под его подбородком. Ниже воротника не лезем —
+    # там начинается одежда, и её цвет эталоном тона кожи быть не может
+    column, _, _ = segmentation.head_region(
+        points, shape, neck_ratio=_REFERENCE_NECK_RATIO, follow_jaw=True, neck_column=True
+    )
+    chin, up, side, _ = segmentation._axis(points)
+    neck = np.minimum(column, _half_plane(chin, up, side, shape))
+
+    # Кромку выбрасываем: на границе лица с фоном пиксели наполовину фоновые, и
+    # в статистику тона кожи им нельзя
+    trim = max(1, round(face_height * 0.02))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * trim + 1, 2 * trim + 1))
+    return cv2.erode(face, kernel), cv2.erode(neck, kernel)
+
+
+def _match_skin(donor: Any, template: Any, zones: list, ratio: float, blur: float) -> Any:
+    """
+    Подгоняет тон кожи под кожу персонажа: среднее и разброс по каналам LAB.
 
     LAB, а не BGR: там яркость отделена от цвета, поэтому подгонка тона кожи не
     задевает светотеневой рисунок лица — а он и есть геометрия, которую нельзя
     трогать.
 
-    Ключевое отличие от прежней версии — коррекция взвешивается маской кожи и
-    **не касается волос**. Их цвет переносится ради того, чтобы он остался
-    цветом заказчика; подтянуть его к палитре персонажа означало бы перекрасить
-    донора в нарисованного героя.
+    Коррекция взвешивается масками кожи и **не касается волос**. Их цвет
+    переносится ради того, чтобы он остался цветом заказчика; подтянуть его к
+    палитре персонажа означало бы перекрасить донора в нарисованного героя.
 
-    :param skin: маска кожи uint8, она же вес коррекции
+    Зон несколько, и каждая считается по своему эталону. Одна поправка на всю
+    кожу подгоняет статистику по площади, то есть по лицу, и оставляет шею с
+    фотографической тенью: на замере 43-46 единиц яркости мимо кожи персонажа
+    при 4 единицах по коже в целом.
+
+    Эталон берётся отдельной маской, а не той же самой. Раньше статистика
+    шаблона считалась по маске донора — по пикселям, которые лежат ПОД вклейкой.
+    Пока вклейка садилась ровно на лицо персонажа, это работало; стоило добавить
+    множитель размера и сдвиг шеи, как под маской донора оказались шея, воротник
+    и фон, и «тон кожи шаблона» стал считаться по чему угодно, кроме кожи.
+
+    :param zones: последовательность (маска зоны у донора, маска эталона у
+        персонажа) — обе бинарные, в координатах шаблона
+    :param blur: размытие веса зоны: граница поправки не должна быть видна
     """
     import cv2
     import numpy as np
 
-    selection = skin > 127
-    if ratio <= 0 or not selection.any():
+    if ratio <= 0:
         return donor
 
     src = cv2.cvtColor(donor, cv2.COLOR_BGR2LAB).astype(np.float32)
     dst = cv2.cvtColor(template, cv2.COLOR_BGR2LAB).astype(np.float32)
+    result = donor.astype(np.float32)
 
-    matched = src.copy()
-    for channel in range(3):
-        src_values = src[..., channel][selection]
-        dst_values = dst[..., channel][selection]
+    for region, reference in zones:
+        selection = np.asarray(region) > 127
+        sample = np.asarray(reference) > 127
+        if not selection.any() or not sample.any():
+            continue
 
-        # Разброс растягивается только если он есть: на ровной заливке остаётся
-        # один сдвиг среднего — тон подогнать всё равно нужно.
-        src_std = float(src_values.std())
-        gain = float(dst_values.std()) / src_std if src_std > 1e-6 else 1.0
+        matched = src.copy()
+        for channel in range(3):
+            src_values = src[..., channel][selection]
+            dst_values = dst[..., channel][sample]
 
-        matched[..., channel] = (src[..., channel] - float(src_values.mean())) * gain + float(
-            dst_values.mean()
-        )
+            # Разброс растягивается только если он есть: на ровной заливке
+            # остаётся один сдвиг среднего — тон подогнать всё равно нужно.
+            src_std = float(src_values.std())
+            gain = float(dst_values.std()) / src_std if src_std > 1e-6 else 1.0
 
-    # Смешивание в BGR, а не в LAB, ровно ради волос: обратный перевод
-    # LAB → BGR не побитовый, и пиксели с нулевым весом уехали бы на единицу-две
-    # просто оттого, что их прогнали через цветовое пространство. «Волосы не
-    # тронуты» должно означать «не тронуты», а не «почти».
-    corrected = cv2.cvtColor(np.clip(matched, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
-    weight = (skin.astype(np.float32) / 255.0 * ratio)[..., None]
-    blended = donor.astype(np.float32) * (1.0 - weight) + corrected.astype(np.float32) * weight
-    return np.clip(blended, 0, 255).astype(np.uint8)
+            matched[..., channel] = (src[..., channel] - float(src_values.mean())) * gain + float(
+                dst_values.mean()
+            )
+
+        # Смешивание в BGR, а не в LAB, ровно ради волос: обратный перевод
+        # LAB → BGR не побитовый, и пиксели с нулевым весом уехали бы на
+        # единицу-две просто оттого, что их прогнали через цветовое
+        # пространство. «Волосы не тронуты» должно означать «не тронуты».
+        corrected = cv2.cvtColor(np.clip(matched, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+        weight = cv2.GaussianBlur(np.asarray(region), (0, 0), max(1.0, blur))
+        weight = (weight.astype(np.float32) / 255.0 * ratio)[..., None]
+        result = result * (1.0 - weight) + corrected.astype(np.float32) * weight
+
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 def _pyramid_fill(image: Any, unknown: Any) -> Any:
@@ -735,7 +853,6 @@ def build(
     :param erase_neck_ratio: насколько опустить срез ниже челюсти персонажа
     :param erase_pad_ratio: запас вокруг силуэта персонажа
     """
-    import cv2
     import numpy as np
 
     if not 0.0 <= colour_match <= 1.0:
@@ -807,18 +924,50 @@ def build(
 
     face_polygon = _transform_points(mask_generator.face_polygon(face.points), matrix)
 
+    # Высота ВКЛЕЕННОГО лица. От неё меряются растушёвка края и все доли масок:
+    # они описывают стык вокруг вклейки, а не лицо персонажа. Пока множитель
+    # размера был единицей, разница была в проценты; на 0.7 вклеенное лицо
+    # оказывается на треть меньше, и кольца масок становятся на треть шире
+    # нужного — как раз там, где и появляется грязный контур.
+    paste_face_height = float(face_polygon[:, 1].max() - face_polygon[:, 1].min())
+
     # Край аппликации: чуть размыть, чтобы контур волос не пилило антиалиасингом.
     # Эрозия перед размытием сдвигает весь спад внутрь силуэта — снаружи от
     # вырезанного контура не остаётся ни одного полупрозрачного пикселя, то есть
     # ни одного пикселя фона фотографии.
-    alpha = _feather_inwards(alpha, template_face_height, feather_ratio)
+    alpha = _feather_inwards(alpha, paste_face_height, feather_ratio)
 
-    # Кожа = лицо внутри силуэта. Волосы сюда не попадают, и коррекция их не
-    # трогает — в этом весь смысл переноса причёски.
-    skin = np.zeros((height, width), dtype=np.uint8)
-    cv2.fillPoly(skin, [face_polygon], 255)
-    skin = cv2.GaussianBlur(np.minimum(skin, alpha), (0, 0), max(1.0, template_face_height * 0.03))
-    warped = _match_skin(warped, target, skin, colour_match)
+    # Кожа = лицо И ШЕЯ внутри силуэта. Волосы сюда не попадают, и коррекция их
+    # не трогает — в этом весь смысл переноса причёски.
+    #
+    # Шею добавили не для полноты: она приезжает с фотографии со своим тоном и
+    # ложится встык на нарисованное тело. Пока коррекция накрывала только лицо,
+    # шея оставалась фотографической, и переход к телу читался ступенькой в
+    # четыре десятка единиц яркости LAB.
+    _, up_target, side_target, _ = segmentation._axis(target_points)
+    paste_chin = _transform_points(
+        np.array([face.points[segmentation._CHIN]], dtype=np.float64), matrix
+    )[0]
+    skin_face, skin_neck = _skin_zones(
+        face_polygon, alpha, paste_chin, (up_target, side_target), (height, width)
+    )
+
+    # Эталон — кожа ПЕРСОНАЖА, его лицо и шея по отдельности. Не «то, что лежит
+    # под вклейкой»: после сдвига и уменьшения там оказываются воротник и фон.
+    ref_face, ref_neck = _skin_reference(target_points, (height, width), template_face_height)
+    warped = _match_skin(
+        warped,
+        target,
+        [
+            (skin_face, ref_face),
+            # Шея сравнивается с шеей персонажа; если её не видно из-за
+            # воротника, эталоном остаётся лицо — оно всё равно ближе к коже,
+            # чем ткань
+            (skin_neck, ref_neck if np.count_nonzero(ref_neck) else ref_face),
+        ],
+        colour_match,
+        paste_face_height * 0.03,
+    )
 
     base, erased, erase_meta = (
         _erase_template_head(
@@ -865,6 +1014,10 @@ def build(
         "head_fill": head.meta["fill"],
         "head_px": int(np.count_nonzero(alpha > 127)),
         "face_height_target": round(template_face_height, 1),
+        # Высота вклеенного лица: база для всех долей масок второго шага
+        "face_height_paste": round(paste_face_height, 1),
+        "skin_face_px": int(np.count_nonzero(skin_face > 127)),
+        "skin_neck_px": int(np.count_nonzero(skin_neck > 127)),
         **erase_meta,
     }
     log.info("аппликация собрана", extra={**meta, "image_size": f"{width}x{height}"})
@@ -879,7 +1032,7 @@ def build(
     log.info(
         "[geometry] scale=%.3f mark=%s x%.2f marks=%s | anchor=%.1f px (%s) | "
         "neck=%.3f (%s) | face: donor %.0f px -> template %.0f px (x%.3f) | "
-        "head: pasted %d px, character %s px (%s) | erased=%s",
+        "head: pasted %d px, character %s px (%s) | skin: face %d px, neck %d px | erased=%s",
         scale,
         scale_mark,
         scale_multiplier,
@@ -894,6 +1047,10 @@ def build(
         meta["head_px"],
         template_head if template_head is not None else "?",
         f"x{meta['head_px'] / template_head:.2f}" if template_head else "?",
+        # Ноль в шее означает, что коррекция тона до неё не дошла: именно так
+        # выглядела «оторванная по цвету» шея до разделения зон
+        int(np.count_nonzero(skin_face > 127)),
+        int(np.count_nonzero(skin_neck > 127)),
         erase_meta.get("erased_ratio"),
     )
 

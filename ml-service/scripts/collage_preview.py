@@ -216,7 +216,7 @@ def main() -> int:
     # strength подбираются вместе, и смотреть на маску от другого набора чисел
     # бессмысленно
     profile = refine.profiles.get(args.profile)
-    face_height = collage.meta["face_height_target"]
+    face_height = collage.meta["face_height_paste"]
     mask = mask_generator.seam_mask(
         target.shape[:2],
         collage.head_alpha,

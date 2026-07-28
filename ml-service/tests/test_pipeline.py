@@ -37,7 +37,13 @@ def sent(monkeypatch) -> dict:
             face_polygon=polygon,
             neck_line=((10, 52), (54, 52)),
             erased=np.zeros((64, 64), dtype=np.uint8),
-            meta={"scale": 0.5, "emotion": "neutral", "face_height_target": 20.0},
+            meta={
+                "scale": 0.5,
+                "emotion": "neutral",
+                "face_height_target": 20.0,
+                # Доли масок меряются от вклеенного лица, а не от лица персонажа
+                "face_height_paste": 20.0,
+            },
         )
 
     def _run(request, profile):
