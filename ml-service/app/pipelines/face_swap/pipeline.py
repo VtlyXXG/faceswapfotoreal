@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from app.config import settings
 from app.core.logging import get_logger
 from app.pipelines import collage as collage_builder
@@ -98,6 +100,8 @@ def run(request: SwapRequest) -> SwapResult:
         anchor_neck=settings.head_anchor_neck,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
+        colour_direction=settings.collage_colour_direction,
+        body_reach=settings.collage_body_reach,
         erase_template_head=settings.collage_erase_template_head,
         erase_method=settings.collage_erase_method,
         erase_neck_ratio=settings.collage_erase_neck_ratio,
@@ -169,6 +173,12 @@ def run(request: SwapRequest) -> SwapResult:
             masks["background"] = encode_image(hole, "png")[0]
         else:
             log.info("зона фона пропущена: дыра мала", extra={"hole_share": round(share, 5)})
+
+    # Финальный проход идёт по всему кадру: маска сплошная. Эндпоинт всё равно
+    # инпейнтинговый и без mask_url не работает, поэтому «без маски» здесь
+    # выражается белым полем.
+    if profile.unify is not None:
+        masks["unify"] = encode_image(np.full(shape, 255, dtype=np.uint8), "png")[0]
 
     # PNG, а не JPEG: коллаж — это оригинальные пиксели фотографии, и терять их
     # на артефактах сжатия перед единственным шагом, который их сохраняет,

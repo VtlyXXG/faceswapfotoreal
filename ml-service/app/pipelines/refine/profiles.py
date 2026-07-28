@@ -130,7 +130,7 @@ class MaskProfile:
     """
 
     edge_ratio: float = 0.03
-    edge_outer_ratio: float = 0.16
+    edge_outer_ratio: float = 0.05
     neck_ratio: float = 0.12
     guard_ratio: float = 0.06
     feather_ratio: float = 0.04
@@ -190,6 +190,35 @@ class StylisePass:
 
 
 @dataclass(frozen=True)
+class UnifyPass:
+    """
+    Финальный проход по всему кадру — ради общей фактуры холста.
+
+    Предыдущие проходы работают по маскам, то есть каждый оставляет за собой
+    границу: под маской поверхность одна, вне её другая. По отдельности эти
+    границы слабые, вместе складываются в тот самый «эффект аппликации», когда
+    видно не шов, а разницу материала.
+
+    Здесь маски нет вовсе — обрабатывается весь разворот целиком, и именно
+    поэтому сила должна быть маленькой. 0.15-0.20 хватает, чтобы поверх всего
+    легло единое зерно холста; выше начинает уходить портретное сходство, и
+    уходит оно сразу везде, потому что защиты лица на этом проходе нет.
+
+    Цена прохода — не только вызов: он трогает и те части обложки, которых
+    пайплайн до сих пор не касался вовсе. Текст и мелкие детали на развороте
+    после него уже не побитово те же.
+    """
+
+    strength: float = 0.18
+    guidance_scale: float = 2.0
+    steps: int = 50
+    prompt: str = ""
+    # Выше этого значения проход перестаёт быть «единой фактурой» и становится
+    # перерисовкой всего разворота
+    safe_strength: float = 0.22
+
+
+@dataclass(frozen=True)
 class RefineProfile:
     """
     Полный набор гиперпараметров второго шага.
@@ -221,6 +250,9 @@ class RefineProfile:
     # Проход по самой вклейке: перевод фотографии в живопись. None — вклейка
     # остаётся фотографической, как было до сих пор
     stylise: StylisePass | None = None
+    # Финальный проход по всему кадру: общее зерно холста. None — каждая зона
+    # остаётся со своей поверхностью
+    unify: UnifyPass | None = None
 
     def validate(self) -> RefineProfile:
         """
@@ -262,7 +294,7 @@ class RefineProfile:
                     "seam": self.strength,
                 },
             )
-        if self.mask.hole_margin_ratio >= self.mask.edge_outer_ratio:
+        if self.mask.hole_margin_ratio >= self.mask.edge_outer_ratio + self.mask.gradient_ratio:
             # Зона 3 отступает от вклейки дальше, чем достаёт кольцо зоны 2.
             # Между ними останется полоса, которую не трогает ни один проход, —
             # и в ней сырая заливка на месте чужой причёски. Ровно этот зазор
@@ -273,12 +305,18 @@ class RefineProfile:
                     "profile": self.name,
                     "hole_margin": self.mask.hole_margin_ratio,
                     "edge_outer": self.mask.edge_outer_ratio,
+                    "gradient": self.mask.gradient_ratio,
                 },
             )
         if self.stylise and not 0.0 <= self.stylise.strength <= 1.0:
             raise InvalidImageError(
                 "strength прохода стилизации должен лежать в диапазоне 0..1",
                 {"profile": self.name, "strength": self.stylise.strength},
+            )
+        if self.unify and not 0.0 <= self.unify.strength <= 1.0:
+            raise InvalidImageError(
+                "strength финального прохода должен лежать в диапазоне 0..1",
+                {"profile": self.name, "strength": self.unify.strength},
             )
         if self.controls and not self.control_field:
             raise InvalidImageError(
@@ -316,6 +354,7 @@ class RefineProfile:
             "controls": [f"{c.kind}:{c.weight}" for c in self.controls],
             "background_strength": self.background.strength if self.background else None,
             "stylise_strength": self.stylise.strength if self.stylise else None,
+            "unify_strength": self.unify.strength if self.unify else None,
         }
 
 
@@ -370,6 +409,18 @@ _STYLISE_ZONE_PROMPT = (
     "and size of the eyes, nose and mouth, same gaze, same hair colour, length and "
     "shape. Do not redraw, move, rotate or reshape any feature — this must remain "
     "the very same recognisable person, only painted instead of photographed."
+)
+
+# Промпт финального прохода. Он идёт по всему кадру без маски, поэтому говорит
+# только про поверхность и ничего — про содержание: любая просьба «нарисуй» на
+# полном кадре означает «перерисуй разворот».
+_UNIFY_PROMPT = (
+    "A single hand-painted children's book illustration. Unify the whole image "
+    "under one surface: the same oil paint, the same visible brush strokes, the "
+    "same canvas weave and the same varnish across every part of the picture, so "
+    "that nothing looks pasted in or photographic. "
+    "Change nothing else: keep every character, face, pose, object and colour "
+    "exactly where and as they are — this is a texture pass, not a redraw."
 )
 
 # Промпт зоны фона. Здесь модель не сводит, а рисует заново: под маской лежит
@@ -525,13 +576,19 @@ register(
         safe_strength=0.28,
         # Градиент вместо плато, но зона узкая: только контур волос и полоса на
         # стыке шеи. Всё, что шире, уходит в зону фона со своей силой.
-        mask=MaskProfile(gradient_ratio=0.05),
+        # Сплошное кольцо узкое, а до зоны фона дотягивается градиент: на
+        # полной силе кольцо замыливало бы только что восстановленный фон —
+        # крыло птеродактиля рядом с головой, — а под градиентом оно его едва
+        # касается.
+        mask=MaskProfile(gradient_ratio=0.10),
         # Зона 3: дыра от чужой причёски рисуется заново и отдельным вызовом.
         # 0.85 — сила, на которой модель действительно генерирует содержимое, а
         # не подкрашивает; ниже ~0.7 из-под неё проступает мыло от заливки.
         background=BackgroundPass(prompt=_BACKGROUND_PROMPT),
         # Зона 4: перевод самой вклейки из фотографии в живопись
         stylise=StylisePass(prompt=_STYLISE_ZONE_PROMPT),
+        # И финальное зерно холста поверх всего разворота
+        unify=UnifyPass(prompt=_UNIFY_PROMPT),
     )
 )
 

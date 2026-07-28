@@ -134,6 +134,7 @@ def main() -> int:
         choices=collage_builder._ERASE_METHODS,
         default=settings.collage_erase_method,
     )
+    # Пусто — стирать до линии одежды персонажа
     parser.add_argument("--erase-neck-ratio", type=float, default=settings.collage_erase_neck_ratio)
     parser.add_argument("--erase-pad-ratio", type=float, default=settings.collage_erase_pad_ratio)
     # Профиль второго шага: маска рисуется по его числам, сам вызов не делается
@@ -250,7 +251,7 @@ def main() -> int:
     # оставила ли затирка тёмное кольцо или пятна на месте ушей: в готовом
     # коллаже середина закрыта, и разглядеть там нечего
     target_points = mask_generator.face_landmarks(target)
-    base, _, _ = collage_builder._erase_template_head(
+    base, _, _, _ = collage_builder._erase_template_head(
         target,
         target_points,
         collage.head_alpha,

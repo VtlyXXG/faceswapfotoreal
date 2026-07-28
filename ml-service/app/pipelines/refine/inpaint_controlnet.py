@@ -92,6 +92,32 @@ class InpaintControlNetRefiner:
             ("seam", seam, profile.strength, profile.prompt, profile.guidance_scale, profile.steps)
         )
 
+        # И последним — общая фактура по всему кадру. Именно последним: он
+        # затирает границы, оставленные предыдущими проходами, и любой проход
+        # после него завёл бы новую.
+        unify = request.masks.get("unify")
+        if profile.unify and unify:
+            if profile.unify.strength > profile.unify.safe_strength:
+                # Маски на этом проходе нет вовсе, защиты лица тоже: сила выше
+                # порога перерисовывает весь разворот, включая портрет
+                log.warning(
+                    "strength финального прохода выше безопасного — сходство под угрозой",
+                    extra={
+                        "strength": profile.unify.strength,
+                        "safe_max": profile.unify.safe_strength,
+                    },
+                )
+            passes.append(
+                (
+                    "unify",
+                    unify,
+                    profile.unify.strength,
+                    profile.unify.prompt or profile.prompt,
+                    profile.unify.guidance_scale,
+                    profile.unify.steps,
+                )
+            )
+
         meta = {**profile.report(), "output_format": fmt, "controls_sent": len(maps)}
         image = b""
 

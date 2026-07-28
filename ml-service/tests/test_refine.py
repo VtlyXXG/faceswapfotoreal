@@ -575,9 +575,13 @@ def test_zones_must_overlap():
     контуром вокруг головы.
     """
     profile = profiles.get("blend")
-    broken = replace(
-        profile, mask=replace(profile.mask, hole_margin_ratio=profile.mask.edge_outer_ratio)
-    )
+    # До зоны фона дотягивается не сплошное кольцо, а градиент за ним —
+    # проверка считает их вместе
+    reach = profile.mask.edge_outer_ratio + profile.mask.gradient_ratio
+    broken = replace(profile, mask=replace(profile.mask, hole_margin_ratio=reach))
 
     with pytest.raises(InvalidImageError):
         broken.validate()
+
+    ok = replace(profile, mask=replace(profile.mask, hole_margin_ratio=reach * 0.9))
+    assert ok.validate() is ok, "перекрытие через градиент допустимо"

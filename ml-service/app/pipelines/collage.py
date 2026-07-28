@@ -66,6 +66,21 @@ _SCALE_MARKS = {
     "face_height": (152, 9),  # подбородок → переносица
 }
 
+# Допуск по хроме LAB, по которому на шаблоне отбирается открытая кожа
+# персонажа. Шире, чем у поиска воротника: там решается, где кожа кончается, и
+# ошибка стоит куска шеи; здесь — что подкрасить, и лишний десяток пикселей на
+# границе руки ничего не портит.
+_BODY_CHROMA = (12.0, 16.0)
+
+# Радиус, в котором подкрашивается тело персонажа, в высотах его лица от низа
+# вклейки. Не «сколько нужно», а «докуда безопасно»: дальше начинаются
+# декорации, а отличить их от кожи ни цветом, ни связностью нельзя (см.
+# _body_skin). Больше — чинится больше тела, но растёт риск перекрасить фон.
+_BODY_REACH_RATIO = 1.2
+
+# Доля силуэта персонажа, выше которой «открытая кожа» перестаёт быть кожей.
+_BODY_SUSPICIOUS = 0.15
+
 # Докуда брать шею персонажа в эталон тона кожи, доля высоты его лица. Ниже
 # начинается одежда, и её цвет эталоном кожи быть не может.
 _REFERENCE_NECK_RATIO = 0.3
@@ -91,6 +106,12 @@ _FEATHER_RATIO = 0.01
 # этого их и переносят. 1.0 — полностью тон шаблона, 0.0 — как на фотографии.
 _COLOUR_MATCH = 0.8
 
+# Куда подтягивать тон кожи. `to_donor` — тело персонажа к вклейке: голова
+# остаётся реалистичной, и подкрасить нарисованные руки под неё дешевле, чем
+# перекрашивать фотографию под рисунок. На портрете разница в тоне бросается в
+# глаза, на руках — нет. `to_template` — прежнее направление.
+_COLOUR_DIRECTION = "to_donor" 
+
 # Ниже этого масштаба уменьшать фотографию в один проход warpAffine нельзя:
 # билинейная выборка пропускает пиксели и волосы рассыпаются на алиасинг.
 _PRESCALE_THRESHOLD = 0.99
@@ -104,12 +125,18 @@ _INPAINT_RADIUS_RATIO = 0.04
 _ERASE_METHOD = "pyramid"
 _ERASE_METHODS = ("pyramid", "telea", "ns")
 
-# Насколько прямой срез области стирания опускается ниже подбородка персонажа,
-# доля высоты лица. Небольшой запас на погрешность сетки — и только: ниже лежит
-# шея персонажа, а она нужна. Вклеенная голова обрезана по челюсти, своей шеи у
-# неё нет, и садится она ровно на нарисованную; сотрёшь — под подбородком
-# останется дыра, которую модели придётся заполнять воротником с нуля.
-_ERASE_NECK_RATIO = 0.05
+# Докуда опускается область стирания, доля высоты лица персонажа. None — до его
+# линии одежды: стирается и нарисованная шея тоже.
+#
+# Раньше здесь стояло 0.05 — «шея персонажа нужна, на неё садится вклеенная
+# голова». Решение поменялось: у донора теперь своя шея целиком, и сажать её
+# поверх нарисованной значит получить две шеи и шов на горле — самое заметное
+# место портрета. Стык по линии одежды прячется куда лучше: там его закрывают
+# воротник и плечи.
+_ERASE_NECK_RATIO = None
+# Запасной вариант, если линию одежды персонажа найти не удалось. Настолько
+# ниже подбородка шея кончается почти на любой обложке.
+_ERASE_NECK_FALLBACK = 0.55
 
 # Предел, внутри которого достраивается область стирания. Эллипс по пропорциям
 # человеческой головы для рисованного героя мал: причёска бывает вдвое шире его
@@ -543,6 +570,64 @@ def _skin_reference(points: list, shape: tuple[int, int], face_height: float) ->
     return cv2.erode(face, kernel), cv2.erode(neck, kernel)
 
 
+def _body_skin(
+    template: Any,
+    silhouette: Any,
+    points: list,
+    busy: Any,
+    face_height: float,
+    anchor: Any = None,
+    reach_ratio: float = _BODY_REACH_RATIO,
+) -> Any:
+    """
+    Открытая кожа персонажа рядом с вклейкой: воротник, грудь, плечи.
+
+    Ищется по хроме — эталон берётся с его же лица, — внутри силуэта и **в
+    ограниченной окрестности вклейки**. Последнее ограничение неприятное, но
+    обойти его нечем: на этих обложках персонажа от декораций не отделить.
+    Замерено на spread_05: шип динозавра отстоит от тона лица на |Δa|=8, а
+    собственная рука мальчика — на 17, то есть по цвету декорация ближе к коже,
+    чем кожа. Связность тоже не помогает: сегментатор отдаёт персонажа и
+    динозавра одним компонентом на 100% силуэта.
+
+    Поэтому коррекция сознательно локальная: она чинит то, ради чего затевалась
+    — стык шеи с телом, где разнотон бросается в глаза, — и не трогает того, в
+    чём не уверена. Радиус растёт `reach_ratio`, но вместе с ним растёт и шанс
+    подкрасить динозавра.
+
+    :param busy: что исключить — вклейка и стёртая голова
+    :param anchor: точка, от которой меряется окрестность (низ вклейки)
+    """
+    import cv2
+    import numpy as np
+
+    reference_face, _ = _skin_reference(points, template.shape[:2], face_height)
+    core = np.asarray(reference_face) > 127
+    if not core.any():
+        return np.zeros(template.shape[:2], dtype=np.uint8)
+
+    lab = cv2.cvtColor(template, cv2.COLOR_BGR2LAB).astype(np.float32)
+    reference = np.median(lab[core], axis=0)
+
+    close = (np.abs(lab[..., 1] - reference[1]) < _BODY_CHROMA[0]) & (
+        np.abs(lab[..., 2] - reference[2]) < _BODY_CHROMA[1]
+    )
+    near = np.ones(template.shape[:2], dtype=bool)
+    if anchor is not None and reach_ratio > 0:
+        ys, xs = np.mgrid[0 : template.shape[0], 0 : template.shape[1]]
+        reach = reach_ratio * face_height
+        near = ((xs - float(anchor[0])) ** 2 + (ys - float(anchor[1])) ** 2) <= reach**2
+
+    skin = np.where(
+        close & near & (np.asarray(silhouette) > 0) & (np.asarray(busy) == 0), 255, 0
+    )
+
+    # Крошка по краям — не кожа, а погрешность порога
+    trim = max(1, round(face_height * 0.01))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * trim + 1, 2 * trim + 1))
+    return cv2.morphologyEx(skin.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+
+
 def _match_skin(donor: Any, template: Any, zones: list, ratio: float, blur: float) -> Any:
     """
     Подгоняет тон кожи под кожу персонажа: среднее и разброс по каналам LAB.
@@ -739,7 +824,7 @@ def _erase_template_head(
     face_height: float,
     model: str,
     method: str = _ERASE_METHOD,
-    neck_ratio: float = _ERASE_NECK_RATIO,
+    neck_ratio: float | None = _ERASE_NECK_RATIO,
     pad_ratio: float = _ERASE_PAD_RATIO,
 ) -> tuple[Any, Any, dict]:
     """
@@ -769,12 +854,26 @@ def _erase_template_head(
     :param method: способ восстановления фона (pyramid, telea, ns)
     :param neck_ratio: насколько опустить срез ниже челюсти персонажа
     :param pad_ratio: запас вокруг силуэта персонажа
-    :return: (изображение с затянутой дырой, маска стирания, метаданные)
+    :return: (изображение с затянутой дырой, силуэт персонажа, маска стирания,
+        метаданные)
     """
     import cv2
     import numpy as np
 
     empty = np.zeros(target.shape[:2], dtype=np.uint8)
+
+    # Докуда стирать: до линии одежды персонажа, чтобы шея донора села прямо в
+    # воротник. Ищется тем же способом, что и у донора, но по сплошной альфе —
+    # сегментатор ради этого не запускается
+    collar_meta: dict = {"erase_neck_source": "fixed"}
+    if neck_ratio is None:
+        solid = np.full(target.shape[:2], 255, dtype=np.uint8)
+        found, meta_collar = segmentation.clothing_line(
+            target, solid, points, fallback=_ERASE_NECK_FALLBACK
+        )
+        neck_ratio = found
+        collar_meta = {"erase_neck_source": meta_collar["neck_source"]}
+
     try:
         # Срез прямой, а не по дуге челюсти: дуга поднимается к ушам и
         # оставляет их кончики красными лепестками по бокам вклейки, а если
@@ -796,7 +895,7 @@ def _erase_template_head(
             "причёску персонажа стереть не удалось — сегментатор не нашёл голову",
             extra={"cause": exc.message},
         )
-        return target, empty, {"erased_ratio": None}
+        return target, empty, empty, {"erased_ratio": None}
 
     pad = max(1, round(face_height * pad_ratio))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * pad + 1, 2 * pad + 1))
@@ -831,7 +930,7 @@ def _erase_template_head(
         # «голова нулевой площади». Тот же случай, что и отказ выше: пропускаем
         # шаг с предупреждением, а не роняем заказ.
         log.warning("причёску персонажа стереть не удалось — силуэт пуст")
-        return target, empty, {"erased_ratio": None}
+        return target, foreign, empty, {"erased_ratio": None}
 
     head_px = int(np.count_nonzero(hole))
 
@@ -848,6 +947,8 @@ def _erase_template_head(
         "erased_ratio": round(ratio, 3),
         "template_head_px": head_px,
         "erase_method": method,
+        "erase_neck_ratio": round(float(neck_ratio), 3),
+        **collar_meta,
     }
 
     filled = _restore_background(target, hole, foreign, face_height, method)
@@ -860,7 +961,7 @@ def _erase_template_head(
             "стёрта большая часть головы персонажа — фон придётся домысливать",
             extra=meta,
         )
-    return filled, erased, meta
+    return filled, foreign, erased, meta
 
 
 def build(
@@ -878,9 +979,11 @@ def build(
     anchor_neck: bool = True,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
+    colour_direction: str = _COLOUR_DIRECTION,
+    body_reach: float = _BODY_REACH_RATIO,
     erase_template_head: bool = True,
     erase_method: str = _ERASE_METHOD,
-    erase_neck_ratio: float = _ERASE_NECK_RATIO,
+    erase_neck_ratio: float | None = _ERASE_NECK_RATIO,
     erase_pad_ratio: float = _ERASE_PAD_RATIO,
 ) -> Collage:
     """
@@ -899,7 +1002,10 @@ def build(
         художественная, а не геометрическая: 1.0 — лицо донора точно совпадает
         с лицом персонажа
     :param anchor_neck: опускать ли вклейку до воротника, если шея не дотянулась
-    :param colour_match: доля приведения тона кожи к шаблону, 0..1
+    :param colour_match: доля приведения тона кожи, 0..1
+    :param colour_direction: куда подтягивать тон. `to_donor` — тело персонажа
+        к вклейке, `to_template` — вклейку к персонажу
+    :param body_reach: радиус подкраски тела, в высотах лица от низа вклейки
     :param erase_template_head: стирать ли голову персонажа из-под вклейки
     :param erase_method: чем затягивать её место (pyramid, telea, ns)
     :param erase_neck_ratio: насколько опустить срез ниже челюсти персонажа
@@ -1004,24 +1110,31 @@ def build(
         face_polygon, alpha, paste_chin, (up_target, side_target), (height, width)
     )
 
-    # Эталон — кожа ПЕРСОНАЖА, его лицо и шея по отдельности. Не «то, что лежит
-    # под вклейкой»: после сдвига и уменьшения там оказываются воротник и фон.
-    ref_face, ref_neck = _skin_reference(target_points, (height, width), template_face_height)
-    warped = _match_skin(
-        warped,
-        target,
-        [
-            (skin_face, ref_face),
-            # Шея сравнивается с шеей персонажа; если её не видно из-за
-            # воротника, эталоном остаётся лицо — оно всё равно ближе к коже,
-            # чем ткань
-            (skin_neck, ref_neck if np.count_nonzero(ref_neck) else ref_face),
-        ],
-        colour_match,
-        paste_face_height * 0.03,
-    )
+    if colour_direction == "to_template":
+        # Прежнее направление: вклейка подтягивается к персонажу. Эталон — его
+        # кожа, лицо и шея по отдельности. Не «то, что лежит под вклейкой»:
+        # после сдвига и уменьшения там оказываются воротник и фон.
+        ref_face, ref_neck = _skin_reference(target_points, (height, width), template_face_height)
+        warped = _match_skin(
+            warped,
+            target,
+            [
+                (skin_face, ref_face),
+                # Шея сравнивается с шеей персонажа; если её не видно из-за
+                # воротника, эталоном остаётся лицо — оно всё равно ближе к
+                # коже, чем ткань
+                (skin_neck, ref_neck if np.count_nonzero(ref_neck) else ref_face),
+            ],
+            colour_match,
+            paste_face_height * 0.03,
+        )
+    elif colour_direction != "to_donor":
+        raise InvalidImageError(
+            "Неизвестное направление цветокоррекции",
+            {"direction": colour_direction, "available": ["to_donor", "to_template"]},
+        )
 
-    base, erased, erase_meta = (
+    base, template_body, erased, erase_meta = (
         _erase_template_head(
             target,
             target_points,
@@ -1033,8 +1146,55 @@ def build(
             erase_pad_ratio,
         )
         if erase_template_head
-        else (target, np.zeros((height, width), dtype=np.uint8), {"erased_ratio": None})
+        else (
+            target,
+            np.zeros((height, width), dtype=np.uint8),
+            np.zeros((height, width), dtype=np.uint8),
+            {"erased_ratio": None},
+        )
     )
+
+    body_px = 0
+    if colour_direction == "to_donor" and colour_match > 0:
+        # Обратное направление: тело персонажа подтягивается к вклейке. Раз
+        # голова остаётся реалистичной, дешевле подкрасить нарисованные руки и
+        # грудь под неё, чем перекрашивать фотографию под рисунок — на портрете
+        # разница в тоне бросается в глаза, на руках нет.
+        busy = np.maximum(np.asarray(alpha), np.asarray(erased))
+        # Окрестность отсчитывается от низа вклейки: именно там шея входит в
+        # тело, и именно там разнотон виден
+        bottom = _lowest_after_transform(face.alpha, matrix, -up_target)
+        body = _body_skin(
+            base,
+            template_body,
+            target_points,
+            busy,
+            template_face_height,
+            anchor=bottom,
+            reach_ratio=body_reach,
+        )
+        body_px = int(np.count_nonzero(body))
+        if body_px > _BODY_SUSPICIOUS * float(np.count_nonzero(template_body) or 1):
+            # Кожи не бывает столько. Значит, порог по хроме поймал одежду или
+            # декорацию: на этих обложках бежевый жилет отстоит от тона лица на
+            # |Δa|=4, а собственная рука персонажа — на 17, то есть по цвету
+            # ткань ближе к коже, чем кожа. Отказываться нельзя (просили именно
+            # это направление), но в логе такое должно быть видно
+            log.warning(
+                "под подкраску тела попало подозрительно много — проверьте одежду",
+                extra={
+                    "body_skin_px": body_px,
+                    "silhouette_px": int(np.count_nonzero(template_body)),
+                },
+            )
+        if body_px:
+            base = _match_skin(
+                base,
+                warped,
+                [(body, np.maximum(skin_face, skin_neck))],
+                colour_match,
+                template_face_height * 0.03,
+            )
 
     weight = (alpha.astype(np.float32) / 255.0)[..., None]
     image = (warped.astype(np.float32) * weight + base.astype(np.float32) * (1.0 - weight)).astype(
@@ -1047,6 +1207,8 @@ def build(
         "rotation_deg": round(float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0]))), 2),
         "emotion": (emotion or expression.NEUTRAL).strip().lower(),
         "colour_match": colour_match,
+        "colour_direction": colour_direction,
+        "body_skin_px": body_px,
         "segmenter": head.meta["model"],
         "erode_px": head.meta["erode_px"],
         # Докуда взята шея и по какому признаку. Первое, на что смотреть, если

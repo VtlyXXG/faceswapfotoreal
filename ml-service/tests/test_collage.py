@@ -188,8 +188,9 @@ def test_scaled_donor_keeps_its_proportions(monkeypatch, head_silhouette, photo,
 
 
 def test_colour_match_pulls_skin_towards_the_cover(same_pose, photo, cover):
-    plain = _build(photo, cover, colour_match=0.0)
-    matched = _build(photo, cover, colour_match=1.0)
+    """Прежнее направление осталось доступным: вклейка подтягивается к персонажу."""
+    plain = _build(photo, cover, colour_match=0.0, colour_direction="to_template")
+    matched = _build(photo, cover, colour_match=1.0, colour_direction="to_template")
 
     skin = np.zeros(cover.shape[:2], dtype=np.uint8)
     cv2.fillPoly(skin, [matched.face_polygon], 255)
@@ -198,12 +199,67 @@ def test_colour_match_pulls_skin_towards_the_cover(same_pose, photo, cover):
     assert abs(float(matched.image[core].mean()) - 60) < abs(float(plain.image[core].mean()) - 60)
 
 
+def test_reverse_direction_leaves_the_paste_alone(same_pose, photo, cover):
+    """
+    Направление по умолчанию — обратное: голова остаётся реалистичной, и
+    подкрашивается тело персонажа, а не фотография. Значит, пиксели вклейки
+    коррекция трогать не должна вовсе.
+    """
+    plain = _build(photo, cover, colour_match=0.0)
+    matched = _build(photo, cover, colour_match=1.0)
+
+    core = cv2.erode(matched.head_alpha, np.ones((7, 7), np.uint8)) > 250
+    assert np.array_equal(matched.image[core], plain.image[core])
+    assert matched.meta["colour_direction"] == "to_donor"
+
+
+def test_reverse_direction_recolours_the_painted_body(monkeypatch, photo):
+    """
+    Открытая кожа персонажа — руки и грудь — подтягивается к тону вклейки.
+    Ищется она по хроме внутри его силуэта: по всему кадру в «кожу» попал бы
+    песок и бок динозавра, у которых тон бывает ровно тот же.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    # Обложка: телесное тело персонажа снизу, фон того же оттенка по краям
+    cover = np.zeros((400, 400, 3), dtype=np.uint8)
+    cover[:] = (60, 60, 60)
+    cover[300:, 120:280] = (120, 130, 150)  # кожа персонажа, темнее донорской
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        if model == "cover":
+            cv2.circle(alpha, (200, 190), 120, 255, -1)
+            alpha[300:, 120:280] = 255
+        else:
+            cv2.circle(alpha, (200, 190), 130, 255, -1)
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    plain = collage.build(photo, cover, model_photo="photo", model_cover="cover", colour_match=0.0)
+    matched = collage.build(
+        photo, cover, model_photo="photo", model_cover="cover", colour_match=1.0
+    )
+
+    body = (slice(340, 380), slice(160, 240))
+    assert matched.meta["body_skin_px"] > 0, "кожа персонажа должна найтись"
+    # Тело поехало в сторону донорского тона, а не осталось прежним
+    assert not np.array_equal(matched.image[body], plain.image[body])
+    assert float(matched.image[body].mean()) > float(plain.image[body].mean())
+
+
+def test_unknown_colour_direction_is_refused(same_pose, photo, cover):
+    with pytest.raises(InvalidImageError):
+        _build(photo, cover, colour_direction="sideways")
+
+
 def test_colour_match_leaves_the_hair_alone(same_pose, photo, cover):
     """
     Волосы переносят ради того, чтобы они остались волосами заказчика.
     Подтянуть их к палитре персонажа — значит перекрасить донора.
     """
-    matched = _build(photo, cover, colour_match=1.0)
+    matched = _build(photo, cover, colour_match=1.0, colour_direction="to_template")
 
     assert tuple(int(v) for v in matched.image[110, 200]) == _HAIR
 
@@ -731,3 +787,74 @@ def test_mask_base_follows_the_paste_not_the_character(same_pose, photo, cover):
     assert smaller.meta["face_height_paste"] == pytest.approx(
         plain.meta["face_height_paste"] * 0.7, rel=0.05
     )
+
+
+# --- Стык по линии одежды ---
+
+
+def test_character_neck_is_erased_down_to_the_collar(monkeypatch, photo):
+    """
+    Шея донора садится прямо в воротник, а нарисованная шея персонажа
+    стирается. Сажать одну шею поверх другой значит получить две шеи и шов на
+    горле — самое заметное место портрета; стык по линии одежды прячут
+    воротник и плечи.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+
+    # Обложка: кожа под подбородком до y=330, ниже одежда
+    cover = np.zeros((400, 400, 3), dtype=np.uint8)
+    cover[:] = (60, 60, 60)
+    cv2.rectangle(cover, (140, 150), (260, 400), (170, 180, 210), -1)
+    cv2.rectangle(cover, (100, 330), (300, 400), (40, 90, 220), -1)
+
+    def _silhouette(image, model):
+        alpha = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.circle(alpha, (200, 190), 120 if model == "cover" else 130, 255, -1)
+        alpha[260:400, 140:260] = 255
+        return alpha
+
+    monkeypatch.setattr(segmentation, "silhouette", _silhouette)
+
+    result = collage.build(
+        photo, cover, model_photo="photo", model_cover="cover", colour_match=0.0
+    )
+
+    assert result.meta["erase_neck_source"] == "collar"
+    # Затирка дошла до воротника, а не остановилась под подбородком
+    assert result.meta["erase_neck_ratio"] > 0.5
+
+
+def test_erase_depth_can_be_fixed_by_hand(monkeypatch, photo, cover):
+    """Число вместо поиска: обложка, где линию одежды видно только человеку."""
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+    monkeypatch.setattr(
+        segmentation,
+        "silhouette",
+        lambda image, model: cv2.circle(
+            np.zeros(image.shape[:2], np.uint8), (200, 190), 150, 255, -1
+        ),
+    )
+
+    result = collage.build(photo, cover, colour_match=0.0, erase_neck_ratio=0.2)
+
+    assert result.meta["erase_neck_ratio"] == 0.2
+    assert result.meta["erase_neck_source"] == "fixed"
+
+
+def test_body_correction_stays_near_the_paste(same_pose, photo, cover):
+    """
+    Радиус — не «сколько нужно», а «докуда безопасно». На этих обложках кожу
+    персонажа от декораций не отделить ни цветом, ни связностью, поэтому
+    коррекция сознательно локальная.
+    """
+    near = _build(photo, cover, colour_match=1.0, body_reach=0.5)
+    far = _build(photo, cover, colour_match=1.0, body_reach=3.0)
+
+    assert near.meta["body_skin_px"] <= far.meta["body_skin_px"]
+
+
+def test_body_correction_can_be_switched_off(same_pose, photo, cover):
+    """Радиус ноль — тело не трогаем вовсе, вклейка всё равно остаётся своей."""
+    result = _build(photo, cover, colour_match=1.0, body_reach=0.0)
+
+    assert result.meta["body_skin_px"] == 0
