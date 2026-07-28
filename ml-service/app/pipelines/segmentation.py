@@ -65,6 +65,11 @@ _WIDTH_RATIO = 1.6  # ширина эллипса в долях ширины л�
 # рембг не отличает шею от футболки, а на плечах силуэт расширяется на той же
 # высоте, что и шея, — сужения, по которому можно было бы опознать воротник, в
 # кадре просто нет.
+# Брать ли шею донора. False — срез строго по челюсти: перенесённая
+# фотографичная шея на нарисованной груди читалась дешёвой аппликацией, и
+# спрятать этот стык нечем — воротник рисованный, кожа фотографическая. Шею на
+# обложке теперь рисует заново инпейнтинг.
+_TAKE_NECK = False
 _NECK_RATIO = None  # None — искать линию одежды; число — жёсткий отступ
 _NECK_FALLBACK = 0.55  # если линия не нашлась: столько шеи берём вслепую
 _NECK_MIN_RATIO = 0.05  # ближе к подбородку срез не имеет смысла
@@ -487,6 +492,7 @@ def cutout_head(
     hair_ratio: float = _HAIR_RATIO,
     neck_ratio: float | None = _NECK_RATIO,
     erode_ratio: float = _ERODE_RATIO,
+    take_neck: bool = _TAKE_NECK,
 ) -> Head:
     """
     Голова с шеей: силуэт сегментатора, ограниченный областью головы.
@@ -495,7 +501,9 @@ def cutout_head(
     :param points: сетка mediapipe того же кадра
     :param model: имя модели rembg
     :param neck_ratio: отступ среза вниз от подбородка; None — искать линию
-        одежды по силуэту (`clothing_line`)
+        одежды по силуэту (`clothing_line`). Игнорируется при take_neck=False
+    :param take_neck: брать ли шею донора. False — срез строго по челюсти, и
+        шею на обложке рисует заново инпейнтинг
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :return: Head с альфой, отрезком среза шеи и высотой лица
     """
@@ -510,11 +518,24 @@ def cutout_head(
     # Силуэт нужен до построения области: по нему ищется линия одежды, а по ней
     # проходит срез. Порядок обратный прежнему, где область строилась вслепую.
     neck_meta: dict = {"neck_source": "fixed"}
-    if neck_ratio is None:
+    if not take_neck:
+        # Срез строго по челюсти: шея донора не переносится вовсе. Фотографичная
+        # шея на нарисованной груди читалась дешёвой аппликацией — разница
+        # текстур там колоссальная, а спрятать её нечем: воротник рисованный,
+        # кожа фотографическая. Вместо переноса шею на обложке рисует заново
+        # инпейнтинг, зоной под подбородком.
+        neck_ratio, neck_meta = 0.0, {"neck_source": "jaw"}
+    elif neck_ratio is None:
         neck_ratio, neck_meta = clothing_line(image, alpha, points)
 
     region, neck_line, face_height = head_region(
-        points, image.shape[:2], width_ratio, hair_ratio, neck_ratio
+        points,
+        image.shape[:2],
+        width_ratio,
+        hair_ratio,
+        neck_ratio,
+        follow_jaw=True,
+        neck_column=take_neck,
     )
     head = largest_component(np.where(region > 0, alpha, 0).astype(np.uint8))
 

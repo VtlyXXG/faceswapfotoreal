@@ -190,6 +190,23 @@ class StylisePass:
 
 
 @dataclass(frozen=True)
+class NeckPass:
+    """
+    Проход по зоне 6 — шея и открытая грудь персонажа.
+
+    Донора режут строго по челюсти, шея с фотографии не переносится. Значит,
+    шею на обложке надо нарисовать: от подбородка вклейки до воротника, в
+    материале обложки и в тон подбородку. Работа генеративная — восстанавливать
+    там нечего, — отсюда и сила, сравнимая с зоной фона.
+    """
+
+    strength: float = 0.75
+    guidance_scale: float = 3.5
+    steps: int = 50
+    prompt: str = ""
+
+
+@dataclass(frozen=True)
 class UnifyPass:
     """
     Финальный проход по всему кадру — ради общей фактуры холста.
@@ -253,6 +270,9 @@ class RefineProfile:
     # Финальный проход по всему кадру: общее зерно холста. None — каждая зона
     # остаётся со своей поверхностью
     unify: UnifyPass | None = None
+    # Проход по шее и груди персонажа. None — шея остаётся нарисованной как
+    # была, что имеет смысл только если шею донора переносят
+    neck: NeckPass | None = None
 
     def validate(self) -> RefineProfile:
         """
@@ -355,6 +375,7 @@ class RefineProfile:
             "background_strength": self.background.strength if self.background else None,
             "stylise_strength": self.stylise.strength if self.stylise else None,
             "unify_strength": self.unify.strength if self.unify else None,
+            "neck_strength": self.neck.strength if self.neck else None,
         }
 
 
@@ -409,6 +430,20 @@ _STYLISE_ZONE_PROMPT = (
     "and size of the eyes, nose and mouth, same gaze, same hair colour, length and "
     "shape. Do not redraw, move, rotate or reshape any feature — this must remain "
     "the very same recognisable person, only painted instead of photographed."
+)
+
+# Промпт зоны шеи. Она рисуется с нуля, поэтому сказано и что нарисовать, и от
+# чего отталкиваться: подбородок сверху — единственный ориентир по тону.
+_NECK_PROMPT = (
+    "Paint the neck and the upper chest of this character in oil on canvas. "
+    "The head above is already finished: continue the jaw and the chin straight "
+    "down into a neck, take the skin tone, warmth and lighting from that face, and "
+    "let the neck meet the collar and the shoulders below as one continuous "
+    "painted form. Add the natural shadow under the chin and along the side of the "
+    "neck that this light would cast. "
+    "Same brush strokes, same canvas grain and same palette as the rest of the "
+    "artwork. One neck, anatomically plain and calm: no collar line across the "
+    "throat, no seam, no second chin, no jewellery, no photographic skin."
 )
 
 # Промпт финального прохода. Он идёт по всему кадру без маски, поэтому говорит
@@ -589,6 +624,8 @@ register(
         stylise=StylisePass(prompt=_STYLISE_ZONE_PROMPT),
         # И финальное зерно холста поверх всего разворота
         unify=UnifyPass(prompt=_UNIFY_PROMPT),
+        # Зона 6: шея и грудь персонажа рисуются заново под подбородок вклейки
+        neck=NeckPass(prompt=_NECK_PROMPT),
     )
 )
 

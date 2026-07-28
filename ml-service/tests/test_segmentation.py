@@ -335,7 +335,25 @@ def test_cutout_reports_where_the_cut_came_from(monkeypatch):
     frame = _portrait(collar_at=320)
     monkeypatch.setattr(segmentation, "silhouette", lambda image, model: _alpha_for(frame))
 
-    head = segmentation.cutout_head(frame, face_mesh(), "stub")
+    head = segmentation.cutout_head(frame, face_mesh(), "stub", take_neck=True)
 
     assert head.meta["neck_source"] == "collar"
     assert head.meta["neck_ratio"] > 0.3, "шея взята, а не отрезана по челюсти"
+
+
+def test_donor_is_cut_at_the_jaw_by_default(monkeypatch):
+    """
+    Шея донора не переносится: фотографичная шея на нарисованной груди читалась
+    дешёвой аппликацией, и спрятать этот стык нечем — воротник рисованный, кожа
+    фотографическая. Шею на обложке рисует заново инпейнтинг.
+    """
+    frame = _portrait(collar_at=320)
+    monkeypatch.setattr(segmentation, "silhouette", lambda image, model: _alpha_for(frame))
+
+    head = segmentation.cutout_head(frame, face_mesh(), "stub")
+
+    assert head.meta["neck_source"] == "jaw"
+    assert head.meta["neck_ratio"] == 0.0
+    # Ниже подбородка (y=260) вырезки нет вовсе
+    assert head.alpha[280, 200] == 0
+    assert head.alpha[250, 200] == 255, "подбородок на месте"

@@ -24,6 +24,13 @@ RUN pip install -r requirements.txt
 ENV U2NET_HOME=/opt/rembg
 RUN python -c "from rembg import new_session; [new_session(m) for m in ('u2net_human_seg', 'u2net')]"
 
+# Веса семантической разметки человека (~16 МБ): лицо, волосы, кожа тела,
+# одежда. Кладутся на этапе сборки по той же причине, что и веса rembg. Без
+# файла сервис работает — разметка просто отключается, и код падает обратно на
+# цветовые эвристики, — но кожу от бежевой одежды они не отличают, замерено.
+ENV MEDIAPIPE_HOME=/opt/mediapipe
+RUN python -c "import urllib.request, os; os.makedirs('/opt/mediapipe', exist_ok=True);     urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite',     '/opt/mediapipe/selfie_multiclass_256x256.tflite')"
+
 COPY pyproject.toml ./
 COPY app ./app
 

@@ -585,3 +585,33 @@ def test_zones_must_overlap():
 
     ok = replace(profile, mask=replace(profile.mask, hole_margin_ratio=reach * 0.9))
     assert ok.validate() is ok, "перекрытие через градиент допустимо"
+
+
+def test_neck_pass_runs_right_after_the_background(client, collage):
+    """
+    Шея — такая же генеративная работа, как фон, и её результат должен попасть
+    под последующее сведение стыка, а не наоборот.
+    """
+    profile = profiles.get("blend")
+    refine.run(
+        _request(collage, masks={"seam": b"s", "background": b"b", "neck": b"n", "paste": b"p"}),
+        profile,
+    )
+
+    assert [a["strength"] for a in client.calls] == [
+        profile.background.strength,
+        profile.neck.strength,
+        profile.stylise.strength,
+        profile.strength,
+    ]
+
+
+def test_neck_prompt_asks_to_continue_the_chin():
+    """
+    Зона рисуется с нуля, и единственный ориентир по тону — подбородок сверху.
+    Про него в промпте сказано прямо.
+    """
+    prompt = profiles.get("blend").neck.prompt.lower()
+
+    assert "chin" in prompt and "oil" in prompt
+    assert "no seam" in prompt

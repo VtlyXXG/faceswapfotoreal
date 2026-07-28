@@ -38,7 +38,7 @@ import numpy as np
 from app.config import settings
 from app.core.logging import get_logger
 from app.pipelines import collage as collage_builder
-from app.pipelines import mask_generator, refine
+from app.pipelines import mask_generator, parsing, refine
 from app.utils.image import decode_image, encode_image
 
 log = get_logger(__name__)
@@ -97,6 +97,7 @@ def run(request: SwapRequest) -> SwapResult:
         erode_ratio=settings.head_erode_ratio,
         scale_mark=settings.head_scale_mark,
         scale_multiplier=settings.head_scale_multiplier,
+        take_neck=settings.head_take_neck,
         anchor_neck=settings.head_anchor_neck,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
@@ -137,6 +138,24 @@ def run(request: SwapRequest) -> SwapResult:
         edge_outer_ratio=profile.mask.edge_outer_ratio,
     )
     masks = {"seam": encode_image(seam, "png")[0]}
+
+    # Зона 6 — шея и открытая грудь персонажа: их модель рисует заново под
+    # подбородок вклейки. Границы даёт семантическая разметка; по цвету кожу от
+    # бежевого воротника не отличить, замерено.
+    if profile.neck is not None:
+        parsed = parsing.parse(target_image)
+        neck = mask_generator.neck_mask(
+            shape,
+            collage.head_alpha,
+            collage.face_polygon,
+            collage.meta["paste_chin"],
+            collage.meta["target_axis"],
+            face_height,
+            body_skin=None if parsed is None else parsed.skin,
+            guard_ratio=profile.mask.guard_ratio,
+        )
+        if (neck > 127).any():
+            masks["neck"] = encode_image(neck, "png")[0]
 
     # Зона 4 — сама вклейка: перевод фотографии в живопись. Тон подогнать можно
     # цветокоррекцией, мазок кисти — нет, это структура, а не цвет.

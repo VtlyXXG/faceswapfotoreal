@@ -289,17 +289,23 @@ def test_hole_covers_what_the_new_head_does_not():
     assert mask[190, 40] == 255, "дальний край дыры открыт целиком"
 
 
-def test_hole_keeps_away_from_the_new_hair():
+def test_hole_fades_to_nothing_at_the_hair_but_leaves_no_gap():
     """
-    Зона идёт на strength 0.85 и всё под собой стирает. Подпусти её к контуру
-    новых волос — и она их съест; полоса у контура принадлежит зоне 2.
+    Два требования разом, и раньше их пытались совместить отступом. Отступ
+    оставлял вокруг головы кольцо, куда не доставала ни одна зона: заливка там
+    светлая, и на тёмном фоне она читалась светящимся контуром — тем самым
+    ореолом. Теперь защита мягкая: у самых волос сила ноль, но незакрытой
+    полосы нет.
     """
     mask = _hole(margin_ratio=0.15)
 
     alpha = _head_alpha()
-    near = cv2.dilate(alpha, np.ones((9, 9), np.uint8)) > 0
+    at_hair = (cv2.dilate(alpha, np.ones((5, 5), np.uint8)) > 0) & (alpha == 0)
+    assert mask[at_hair].max() < 40, "у самого контура зона почти погашена"
 
-    assert mask[near].max() == 0
+    # Но чуть дальше она уже работает — незакрытого кольца не остаётся
+    band = (cv2.dilate(alpha, np.ones((2 * 40 + 1,) * 2, np.uint8)) > 0) & (alpha == 0)
+    assert mask[band].max() > 200
 
 
 def test_hole_spares_the_face_too():
@@ -357,8 +363,8 @@ def test_zones_overlap_and_the_hot_one_keeps_away():
     hole = _hole(margin_ratio=0.15, feather_ratio=0.0)
 
     alpha = _head_alpha()
-    near = cv2.dilate(alpha, np.ones((9, 9), np.uint8)) > 0
-    assert hole[near].max() == 0, "горячая зона держится от волос"
+    at_hair = (cv2.dilate(alpha, np.ones((5, 5), np.uint8)) > 0) & (alpha == 0)
+    assert hole[at_hair].max() < 40, "горячая зона у волос погашена"
 
     orphan = (alpha == 0) & (_erased() > 0) & (seam < 30) & (hole < 30)
     ring_band = cv2.dilate(alpha, np.ones((2 * 20 + 1,) * 2, np.uint8)) > 0
@@ -427,3 +433,61 @@ def test_paste_zone_validates_its_ratios(kwargs):
         mask_generator.paste_mask(
             _SHAPE, _head_alpha(), mask_generator.face_polygon(face_mesh()), _FACE_HEIGHT, **kwargs
         )
+
+
+# --- Зона 6: шея и грудь персонажа ---
+
+
+def _neck(**overrides) -> np.ndarray:
+    # Вклейка кончается на подбородке (y=260): донора режут по челюсти, шеи в
+    # аппликации нет — её и рисует эта зона
+    kwargs = {
+        "head_alpha": _head_alpha(radius=70),
+        "face_polygon": mask_generator.face_polygon(face_mesh()),
+        "chin": (200.0, 260.0),
+        "axis": ((0.0, -1.0), (1.0, 0.0)),
+        "face_height": _FACE_HEIGHT,
+    }
+    kwargs.update(overrides)
+    return mask_generator.neck_mask(_SHAPE, **kwargs)
+
+
+def test_neck_zone_opens_the_area_under_the_chin():
+    """
+    Донора режут по челюсти, шея с фотографии не переносится: фотографичная шея
+    на нарисованной груди читалась дешёвой аппликацией. Значит, шею на обложке
+    надо нарисовать — вот место, где модель это делает.
+    """
+    mask = _neck(guard_ratio=0.0)
+
+    assert mask[300, 200] == 255, "прямо под подбородком зона открыта"
+    assert mask[10, 200] == 0, "над головой ей делать нечего"
+
+
+def test_neck_zone_never_touches_the_paste():
+    """Подбородок и волосы донора рисовать заново не надо: они и есть цель."""
+    mask = _neck(guard_ratio=0.0)
+
+    assert mask[_head_alpha(radius=70) > 0].max() == 0
+
+
+def test_semantic_skin_extends_the_zone_but_not_to_the_hands():
+    """
+    Разметка знает, где кожа, но брать её всю нельзя: руки персонажа
+    перерисовывать незачем, они и так в материале обложки.
+    """
+    skin = np.zeros(_SHAPE, dtype=np.uint8)
+    skin[300:340, 120:280] = 255  # грудь под подбородком
+    skin[300:340, 10:60] = 255  # кисть далеко сбоку
+
+    mask = _neck(body_skin=skin, guard_ratio=0.0)
+
+    assert mask[320, 150] == 255, "грудь рядом с шеей открыта"
+    assert mask[320, 30] == 0, "кисть не трогаем"
+
+
+def test_neck_zone_works_without_parsing():
+    """Без весов остаётся геометрия: полоса под подбородком в ширину челюсти."""
+    mask = _neck(body_skin=None, guard_ratio=0.0)
+
+    assert mask.max() == 255

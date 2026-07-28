@@ -48,7 +48,7 @@ import numpy as np  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.pipelines import collage as collage_builder  # noqa: E402
-from app.pipelines import mask_generator, refine, segmentation  # noqa: E402
+from app.pipelines import mask_generator, parsing, refine, segmentation  # noqa: E402
 
 
 def _memoise_silhouette() -> None:
@@ -231,6 +231,13 @@ def main() -> int:
         gradient_ratio=profile.mask.gradient_ratio,
         edge_outer_ratio=profile.mask.edge_outer_ratio,
     )
+    parsed = parsing.parse(target)
+    neck = mask_generator.neck_mask(
+        target.shape[:2], collage.head_alpha, collage.face_polygon,
+        collage.meta["paste_chin"], collage.meta["target_axis"], face_height,
+        body_skin=None if parsed is None else parsed.skin,
+        guard_ratio=profile.mask.guard_ratio,
+    )
     paste = mask_generator.paste_mask(
         target.shape[:2], collage.head_alpha, collage.face_polygon, face_height,
         profile.mask.guard_ratio, profile.mask.paste_guard_strength,
@@ -272,6 +279,7 @@ def main() -> int:
             "61_mask_background.png": hole,
             "62_zones.png": _zones(collage.image, mask, hole),
             "63_mask_paste.png": paste,
+            "64_mask_neck.png": neck,
         },
     )
 

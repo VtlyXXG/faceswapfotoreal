@@ -216,10 +216,12 @@ def test_reverse_direction_leaves_the_paste_alone(same_pose, photo, cover):
 def test_reverse_direction_recolours_the_painted_body(monkeypatch, photo):
     """
     Открытая кожа персонажа — руки и грудь — подтягивается к тону вклейки.
-    Ищется она по хроме внутри его силуэта: по всему кадру в «кожу» попал бы
-    песок и бок динозавра, у которых тон бывает ровно тот же.
+
+    Здесь проверяется запасной путь, по цвету: семантическая разметка на
+    синтетическом кадре человека не находит, да и суть проверки не в ней.
     """
     monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+    monkeypatch.setattr(collage.parsing, "parse", lambda _: None)
 
     # Обложка: телесное тело персонажа снизу, фон того же оттенка по краям
     cover = np.zeros((400, 400, 3), dtype=np.uint8)
@@ -580,7 +582,20 @@ def test_anchor_does_not_lift_an_overlapping_neck(same_pose, photo):
     Сдвиг только вниз. Если шея уже перекрыла воротник — это нахлёст, ровно то,
     что нужно, и поднимать её обратно незачем.
     """
-    result = _build(photo, _cover_with_collar(300), anchor_neck=True, neck_ratio=1.0)
+    result = _build(
+        photo, _cover_with_collar(300), anchor_neck=True, take_neck=True, neck_ratio=1.0
+    )
+
+    assert result.meta["anchor_px"] == 0.0
+
+
+def test_anchor_is_off_when_the_neck_is_not_taken(same_pose, photo, cover_with_collar):
+    """
+    Якорь сажал в воротник именно перенесённую шею. Её больше нет, и тянуть лицо
+    вниз незачем: оно должно стоять там, где его нарисовал художник, а шею
+    дорисует модель.
+    """
+    result = _build(photo, cover_with_collar)
 
     assert result.meta["anchor_px"] == 0.0
 
@@ -767,11 +782,21 @@ def test_reference_comes_from_the_character_not_from_under_the_paste():
 
 
 def test_skin_zones_split_the_paste_at_the_chin(same_pose, photo, cover):
-    """Шея должна попадать в коррекцию: до разделения зон она в неё не входила."""
-    result = _build(photo, cover)
+    """
+    Разделение на лицо и шею осталось для режима с перенесённой шеей: там у
+    донорской шеи своя тень и свой эталон.
+    """
+    result = _build(photo, cover, take_neck=True, neck_ratio=0.5)
 
     assert result.meta["skin_face_px"] > 0
     assert result.meta["skin_neck_px"] > 0, "шея обязана попасть в цветокоррекцию"
+
+
+def test_paste_has_no_neck_by_default(same_pose, photo, cover):
+    """Срез по челюсти: шеи в аппликации нет вовсе, её рисует инпейнтинг."""
+    result = _build(photo, cover)
+
+    assert result.meta["skin_neck_px"] == 0
 
 
 def test_mask_base_follows_the_paste_not_the_character(same_pose, photo, cover):
@@ -858,3 +883,34 @@ def test_body_correction_can_be_switched_off(same_pose, photo, cover):
     result = _build(photo, cover, colour_match=1.0, body_reach=0.0)
 
     assert result.meta["body_skin_px"] == 0
+
+
+def test_body_skin_comes_from_parsing_when_available(monkeypatch, photo, cover):
+    """
+    Когда разметка есть, кожу берут у неё, а не у цветовой эвристики: цвет
+    отличить кожу от бежевой ткани не может, замерено.
+    """
+    monkeypatch.setattr(mask_generator, "face_landmarks", lambda _: face_mesh())
+    monkeypatch.setattr(
+        segmentation,
+        "silhouette",
+        lambda image, model: cv2.circle(
+            np.zeros(image.shape[:2], np.uint8), (200, 190), 150, 255, -1
+        ),
+    )
+
+    skin = np.zeros((400, 400), dtype=np.uint8)
+    skin[330:380, 150:250] = 255
+    monkeypatch.setattr(
+        collage.parsing,
+        "parse",
+        lambda _: collage.parsing.Parsed(
+            face=np.zeros_like(skin), hair=np.zeros_like(skin), skin=skin,
+            clothes=np.zeros_like(skin),
+        ),
+    )
+
+    result = collage.build(photo, cover, colour_match=1.0)
+
+    assert result.meta["body_skin_source"] == "parsing"
+    assert result.meta["body_skin_px"] > 0

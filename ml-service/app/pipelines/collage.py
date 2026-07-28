@@ -36,7 +36,7 @@ from typing import Any
 
 from app.core.errors import InvalidImageError, MLServiceError, NoFaceDetectedError
 from app.core.logging import get_logger
-from app.pipelines import expression, mask_generator, segmentation
+from app.pipelines import expression, mask_generator, parsing, segmentation
 
 log = get_logger(__name__)
 
@@ -974,9 +974,10 @@ def build(
     hair_ratio: float = segmentation._HAIR_RATIO,
     neck_ratio: float | None = segmentation._NECK_RATIO,
     erode_ratio: float = segmentation._ERODE_RATIO,
+    take_neck: bool = segmentation._TAKE_NECK,
     scale_mark: str = "umeyama",
     scale_multiplier: float = 1.0,
-    anchor_neck: bool = True,
+    anchor_neck: bool = False,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
     colour_direction: str = _COLOUR_DIRECTION,
@@ -995,6 +996,7 @@ def build(
     :param model_photo: модель сегментации для фотографии
     :param model_cover: модель сегментации для обложки
     :param neck_ratio: докуда брать шею; None — искать линию одежды донора
+    :param take_neck: брать ли шею донора вообще; False — срез по челюсти
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :param scale_mark: по какой биометрической мерке считать масштаб;
         umeyama — подгонка сразу по всем опорным точкам лица
@@ -1023,7 +1025,14 @@ def build(
     target_points = _landmarks(target, "обложка")
 
     head = segmentation.cutout_head(
-        source, source_points, model_photo, width_ratio, hair_ratio, neck_ratio, erode_ratio
+        source,
+        source_points,
+        model_photo,
+        width_ratio,
+        hair_ratio,
+        neck_ratio,
+        erode_ratio,
+        take_neck,
     )
 
     # Мимика — до переноса: на вклеенной голове её правка поехала бы вместе с
@@ -1155,6 +1164,7 @@ def build(
     )
 
     body_px = 0
+    body_source = "off"
     if colour_direction == "to_donor" and colour_match > 0:
         # Обратное направление: тело персонажа подтягивается к вклейке. Раз
         # голова остаётся реалистичной, дешевле подкрасить нарисованные руки и
@@ -1164,15 +1174,26 @@ def build(
         # Окрестность отсчитывается от низа вклейки: именно там шея входит в
         # тело, и именно там разнотон виден
         bottom = _lowest_after_transform(face.alpha, matrix, -up_target)
-        body = _body_skin(
-            base,
-            template_body,
-            target_points,
-            busy,
-            template_face_height,
-            anchor=bottom,
-            reach_ratio=body_reach,
-        )
+
+        # Семантическая разметка знает, где у персонажа кожа, а где ткань.
+        # Цвет этого не знает: бежевый жилет ближе к тону лица, чем рука.
+        parsed = parsing.parse(target)
+        if parsed is not None:
+            body = np.where(
+                (np.asarray(parsed.skin) > 0) & (np.asarray(busy) == 0), 255, 0
+            ).astype(np.uint8)
+            body_source = "parsing"
+        else:
+            body = _body_skin(
+                base,
+                template_body,
+                target_points,
+                busy,
+                template_face_height,
+                anchor=bottom,
+                reach_ratio=body_reach,
+            )
+            body_source = "chroma"
         body_px = int(np.count_nonzero(body))
         if body_px > _BODY_SUSPICIOUS * float(np.count_nonzero(template_body) or 1):
             # Кожи не бывает столько. Значит, порог по хроме поймал одежду или
@@ -1209,6 +1230,7 @@ def build(
         "colour_match": colour_match,
         "colour_direction": colour_direction,
         "body_skin_px": body_px,
+        "body_skin_source": body_source,
         "segmenter": head.meta["model"],
         "erode_px": head.meta["erode_px"],
         # Докуда взята шея и по какому признаку. Первое, на что смотреть, если
@@ -1230,6 +1252,12 @@ def build(
         "face_height_target": round(template_face_height, 1),
         # Высота вклеенного лица: база для всех долей масок второго шага
         "face_height_paste": round(paste_face_height, 1),
+        # Геометрия для зоны шеи: где у вклейки подбородок и куда смотрит ось
+        "paste_chin": (float(paste_chin[0]), float(paste_chin[1])),
+        "target_axis": (
+            (float(up_target[0]), float(up_target[1])),
+            (float(side_target[0]), float(side_target[1])),
+        ),
         "skin_face_px": int(np.count_nonzero(skin_face > 127)),
         "skin_neck_px": int(np.count_nonzero(skin_neck > 127)),
         **erase_meta,

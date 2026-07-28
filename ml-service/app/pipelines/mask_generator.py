@@ -81,6 +81,15 @@ _FEATHER_RATIO = 0.04
 _HOLE_MARGIN_RATIO = 0.12
 _HOLE_FEATHER_RATIO = 0.05
 
+# Зона шеи: её ширина в долях высоты лица, глубина вниз от подбородка и спад по
+# краям. Ширина берётся щедрой — рисуется не шея-палка, а шея с плечами.
+_NECK_WIDTH_RATIO = 0.75
+_NECK_DEPTH_RATIO = 0.85
+_NECK_FEATHER_RATIO = 0.05
+# Насколько кожа из разметки может выходить за колонну шеи. Ровно чтобы забрать
+# грудь и плечи по бокам, но не руки: их перерисовывать незачем.
+_NECK_SPREAD_RATIO = 0.25
+
 
 def _mediapipe():
     try:
@@ -298,7 +307,8 @@ def hole_mask(
     :param head_alpha: силуэт вклеенной головы в координатах шаблона
     :param face_polygon: контур лица донора — защищаем и здесь, на всякий случай
     :param erased: маска стёртой головы персонажа
-    :param margin_ratio: отступ от вклеенной головы, доля высоты лица
+    :param margin_ratio: ширина мягкой защиты вклейки, доля высоты лица. Не
+        отступ: зона доходит до волос, но её сила у контура падает до нуля
     :return: одноканальная маска uint8 размера shape
     """
     import cv2
@@ -314,11 +324,24 @@ def hole_mask(
     if not hole.any():
         return np.zeros(shape, dtype=np.uint8)
 
+    # Вклейка защищается МЯГКО, а не отступом. Жёсткий отступ оставлял вокруг
+    # головы кольцо, куда не доставала ни одна зона: заливка там светлая, и на
+    # тёмном фоне она читалась светящимся контуром — тем самым ореолом, который
+    # не брали ни градиенты, ни сужение колец. Теперь зона доходит до самых
+    # волос, но её сила у контура падает до нуля: съесть причёску 0.85 уже не
+    # может, а незакрытой полосы не остаётся.
     margin = max(1, round(face_height * margin_ratio))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1, 2 * margin + 1))
-    keep_away = cv2.dilate((np.asarray(head_alpha) > 0).astype(np.uint8), kernel)
+    guard_paste = cv2.GaussianBlur(
+        cv2.dilate((np.asarray(head_alpha) > 0).astype(np.uint8) * 255, kernel),
+        (2 * margin + 1, 2 * margin + 1),
+        0,
+    )
 
-    mask = np.where((hole > 0) & (keep_away == 0), 255, 0).astype(np.uint8)
+    mask = np.where(hole > 0, 255, 0).astype(np.uint8)
+    mask = (mask.astype(np.float32) * (1.0 - guard_paste.astype(np.float32) / 255.0)).astype(
+        np.uint8
+    )
     if not mask.any():
         return mask
 
@@ -335,16 +358,118 @@ def hole_mask(
     if feather > 0:
         trim = feather + 1
         shrink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * trim + 1, 2 * trim + 1))
+        # Спад только по внешней границе: внутренняя уже сведена мягкой
+        # защитой вклейки, и второй спад по ней вернул бы незакрытую полосу
         soft = cv2.GaussianBlur(cv2.erode(mask, shrink), (2 * feather + 1, 2 * feather + 1), 0)
-
-        reach = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * (margin + 2 * feather) + 1,) * 2
+        near_paste = cv2.dilate(
+            (np.asarray(head_alpha) > 0).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * (margin + 2 * feather) + 1,) * 2),
         )
-        inner = cv2.dilate((np.asarray(head_alpha) > 0).astype(np.uint8), reach) * 255
-        mask = np.maximum(soft, np.minimum(mask, inner))
+        mask = np.where(near_paste > 0, mask, soft)
 
     guard = face_guard(shape, face_polygon, face_height, guard_ratio)
     return (mask.astype(np.float32) * (1.0 - guard.astype(np.float32) / 255.0)).astype(np.uint8)
+
+
+def neck_mask(
+    shape: tuple[int, int],
+    head_alpha: Any,
+    face_polygon: Any,
+    chin: Any,
+    axis: tuple,
+    face_height: float,
+    body_skin: Any = None,
+    width_ratio: float = _NECK_WIDTH_RATIO,
+    depth_ratio: float = _NECK_DEPTH_RATIO,
+    feather_ratio: float = _NECK_FEATHER_RATIO,
+    guard_ratio: float = _GUARD_RATIO,
+) -> Any:
+    """
+    Зона 6: шея и открытая грудь персонажа — их модель рисует заново.
+
+    Донора теперь режут строго по челюсти, шея с фотографии не переносится
+    вовсе. Причина простая: фотографичная шея на нарисованной груди читалась
+    дешёвой аппликацией, и спрятать этот стык нечем — воротник рисованный, кожа
+    фотографическая, разница текстур колоссальная. Проще не сводить два
+    материала, а нарисовать шею целиком в материале обложки: тогда шва нет,
+    есть один непрерывный мазок от подбородка до воротника.
+
+    Зона поэтому накрывает всё, что между подбородком вклейки и одеждой
+    персонажа: его нарисованную шею, открытую грудь и полосу под самым
+    подбородком. Границы даёт семантическая разметка (`parsing.py`) — по цвету
+    отличить кожу от бежевого воротника невозможно, замерено. Без разметки
+    остаётся геометрия: полоса под подбородком в ширину челюсти.
+
+    :param chin: подбородок вклейки в координатах шаблона
+    :param axis: (up, side) шаблона
+    :param body_skin: кожа тела персонажа из разметки; None — только геометрия
+    :param depth_ratio: насколько глубоко зона уходит вниз без разметки
+    """
+    import cv2
+    import numpy as np
+
+    # Ось приходит и массивами, и парой кортежей: коллаж кладёт её в метаданные,
+    # а те переживают сериализацию
+    up = np.asarray(axis[0], dtype=np.float64)
+    side = np.asarray(axis[1], dtype=np.float64)
+    half = width_ratio * face_height / 2
+    depth = depth_ratio * face_height
+
+    # Геометрическая основа: трапеция от подбородка вниз. Она есть всегда и
+    # накрывает то место, где шея обязана появиться, даже если разметки нет
+    column = np.zeros(shape, dtype=np.uint8)
+    top = np.asarray(chin, dtype=np.float64) + up * (0.05 * face_height)
+    bottom = np.asarray(chin, dtype=np.float64) - up * depth
+    cv2.fillConvexPoly(
+        column,
+        np.array(
+            [
+                top + side * half,
+                top - side * half,
+                bottom - side * half * 1.6,
+                bottom + side * half * 1.6,
+            ],
+            dtype=np.int32,
+        ),
+        255,
+    )
+
+    # Кожа из разметки берётся не вся: руки и кисти персонажа рисовать заново
+    # не надо, они и так в материале обложки. Нужна только та кожа, что лежит
+    # под подбородком, — шея и грудь. Поэтому пересечение с окрестностью
+    # колонны, а не объединение со всей кожей.
+    mask = column
+    if body_skin is not None:
+        spread = max(1, round(face_height * _NECK_SPREAD_RATIO))
+        reach = cv2.dilate(
+            column, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * spread + 1,) * 2)
+        )
+        mask = np.maximum(column, np.minimum(np.asarray(body_skin), reach))
+
+    # Вклейку зона не трогает: подбородок и волосы донора рисовать заново не
+    # надо, они и есть то, ради чего всё делается
+    mask = np.where(np.asarray(head_alpha) > 0, 0, mask).astype(np.uint8)
+
+    feather = round(face_height * feather_ratio)
+    if feather > 0:
+        mask = cv2.GaussianBlur(mask, (2 * feather + 1, 2 * feather + 1), 0)
+
+    # Ещё раз после растушёвки: размытие возвращает зону на подбородок, а на
+    # силе этого прохода туда нельзя ни на единицу. Жёсткий край у контура
+    # вклейки не страшен — его накрывает кольцо зоны 2.
+    mask = np.where(np.asarray(head_alpha) > 0, 0, mask).astype(np.uint8)
+
+    guard = face_guard(shape, face_polygon, face_height, guard_ratio)
+    mask = (mask.astype(np.float32) * (1.0 - guard.astype(np.float32) / 255.0)).astype(np.uint8)
+
+    log.info(
+        "маска шеи построена",
+        extra={
+            "semantic": body_skin is not None,
+            "open_px": int(np.count_nonzero(mask > 127)),
+        },
+    )
+    return mask
 
 
 def paste_mask(

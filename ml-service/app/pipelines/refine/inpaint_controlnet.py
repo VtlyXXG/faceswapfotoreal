@@ -73,6 +73,21 @@ class InpaintControlNetRefiner:
                     profile.background.steps,
                 )
             )
+        # Шея — сразу за фоном: она такая же генеративная работа, и её результат
+        # должен попасть под последующее сведение стыка, а не наоборот
+        neck = request.masks.get("neck")
+        if profile.neck and neck:
+            passes.append(
+                (
+                    "neck",
+                    neck,
+                    profile.neck.strength,
+                    profile.neck.prompt or profile.prompt,
+                    profile.neck.guidance_scale,
+                    profile.neck.steps,
+                )
+            )
+
         # Затем фактура самой вклейки: она ложится поверх восстановленного фона,
         # но до сведения стыка — иначе стык пришлось бы сводить дважды
         paste = request.masks.get("paste")
