@@ -56,6 +56,11 @@ services:
       - '8000:8000'
     environment:
       ML_ENV: production
+      # Формат консоли. false — человекочитаемый, и поля диагностики (масштаб
+      # вклейки, доли масок) печатаются рядом с сообщением; true — тот же набор
+      # полей, но JSON, для сборщика логов. Строку [geometry] видно в обоих:
+      #   docker compose logs ml-service | grep geometry
+      ML_LOG_JSON: ${ML_LOG_JSON:-false}
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
       ML_ALLOWED_ORIGINS: http://localhost:3000

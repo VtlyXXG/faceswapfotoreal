@@ -28,6 +28,26 @@ _RESERVED = {
 _PLAIN_FORMAT = "%(asctime)s %(levelname)-8s [%(name)s] %(message)s"
 
 
+class PlainFormatter(logging.Formatter):
+    """
+    Человекочитаемый формат — вместе с полями `extra`.
+
+    Раньше он печатал одно сообщение, а всё, что передано через
+    `extra={...}`, молча терял. В файл при этом писался JSON со всеми полями,
+    поэтому дефект был почти невидим: цифры «есть в логах», но в `docker logs`
+    их нет, и на вопрос «какой вышел масштаб» ответить нечем. Диагностика,
+    которую не видно в терминале, диагностикой не является.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        extras = " ".join(
+            f"{key}={value}"
+            for key, value in sorted(record.__dict__.items())
+            if key not in _RESERVED and not key.startswith("_") and value is not None
+        )
+        return f"{super().format(record)} {extras}" if extras else super().format(record)
+
+
 class RequestIdFilter(logging.Filter):
     """
     Подмешивает request_id из contextvar.
@@ -83,7 +103,7 @@ def _console_handler() -> logging.Handler:
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
-        JsonFormatter() if settings.log_json else logging.Formatter(_PLAIN_FORMAT, "%H:%M:%S")
+        JsonFormatter() if settings.log_json else PlainFormatter(_PLAIN_FORMAT, "%H:%M:%S")
     )
     return handler
 

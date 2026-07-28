@@ -6,6 +6,8 @@
 rembg не запускаются: сетка и силуэт подменяются заглушками.
 """
 
+import logging
+
 import cv2
 import numpy as np
 import pytest
@@ -523,3 +525,38 @@ def test_anchor_is_skipped_when_the_collar_is_not_found(same_pose, photo, cover)
 
     assert result.meta["anchor_px"] == 0.0
     assert result.meta["anchor_collar"] != "skin"
+
+
+# --- Диагностика: цифры должны доезжать до терминала ---
+
+
+def test_geometry_is_logged_as_plain_numbers(same_pose, photo, cover):
+    """
+    Строка [geometry] дублирует то, что и так лежит в meta, и это намеренно:
+    поля extra доезжают не до всякого формата и не до всякого сборщика логов, а
+    именно эти числа спрашивают первыми, когда голова вышла не того размера.
+
+    Ловим своим хендлером, а не caplog: тот живёт в плагине, который можно
+    отключить ключом запуска, а проверка должна работать всегда.
+    """
+    lines: list[str] = []
+
+    class _Catch(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger("app.pipelines.collage")
+    handler = _Catch()
+    logger.addHandler(handler)
+    previous, logger.level = logger.level, logging.INFO
+    try:
+        _build(photo, cover)
+    finally:
+        logger.removeHandler(handler)
+        logger.level = previous
+
+    line = next(m for m in lines if "[geometry]" in m)
+    for field in ("scale=", "mark=", "marks=", "anchor=", "neck=", "face:", "head:"):
+        assert field in line, field
+    # Мерки перечислены поимённо, а не одним числом
+    assert "face_height" in line and "cheeks" in line

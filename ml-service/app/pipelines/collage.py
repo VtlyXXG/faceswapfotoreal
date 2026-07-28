@@ -811,6 +811,33 @@ def build(
     }
     log.info("аппликация собрана", extra={**meta, "image_size": f"{width}x{height}"})
 
+    # Та же геометрия, но числами прямо в тексте сообщения. Дублирование
+    # намеренное: поля `extra` доезжают не до всякого формата и не до всякого
+    # сборщика логов, а именно эти цифры спрашивают первыми, когда голова вышла
+    # не того размера или повисла над воротником. Тег [geometry] — чтобы строка
+    # грепалась одной командой: docker logs ml-service | grep geometry
+    donor_face = head.meta["face_height"]
+    template_head = erase_meta.get("template_head_px")
+    log.info(
+        "[geometry] scale=%.3f mark=%s marks=%s | anchor=%.1f px (%s) | "
+        "neck=%.3f (%s) | face: donor %.0f px -> template %.0f px (x%.3f) | "
+        "head: pasted %d px, character %s px (%s) | erased=%s",
+        scale,
+        scale_mark,
+        {name: round(value, 3) for name, value in sorted(ratios.items())},
+        anchor_meta.get("anchor_px", 0.0),
+        anchor_meta.get("anchor_collar", "-"),
+        head.meta["neck_ratio"],
+        head.meta["neck_source"],
+        donor_face,
+        template_face_height,
+        template_face_height / max(donor_face, 1e-6),
+        meta["head_px"],
+        template_head if template_head is not None else "?",
+        f"x{meta['head_px'] / template_head:.2f}" if template_head else "?",
+        erase_meta.get("erased_ratio"),
+    )
+
     if scale > 1.0:
         log.warning(
             "лицо на фотографии мельче, чем на обложке — вклейка растянута",
