@@ -73,6 +73,21 @@ class InpaintControlNetRefiner:
                     profile.background.steps,
                 )
             )
+        # Затем фактура самой вклейки: она ложится поверх восстановленного фона,
+        # но до сведения стыка — иначе стык пришлось бы сводить дважды
+        paste = request.masks.get("paste")
+        if profile.stylise and paste:
+            passes.append(
+                (
+                    "paste",
+                    paste,
+                    profile.stylise.strength,
+                    profile.stylise.prompt or profile.prompt,
+                    profile.stylise.guidance_scale,
+                    profile.stylise.steps,
+                )
+            )
+
         passes.append(
             ("seam", seam, profile.strength, profile.prompt, profile.guidance_scale, profile.steps)
         )

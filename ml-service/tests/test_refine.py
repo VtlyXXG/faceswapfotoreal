@@ -516,3 +516,68 @@ def test_meta_reports_both_zones(client, collage):
 
     assert result.meta["zones"] == ["background", "seam"]
     assert result.meta["background_strength"] >= 0.8
+
+
+# --- Зона 4: стилизация вклейки ---
+
+
+def test_stylise_pass_runs_between_background_and_seam(client, collage):
+    """
+    Порядок из трёх проходов не произволен: фактура ложится на уже
+    восстановленный фон, но до сведения стыка — иначе стык пришлось бы сводить
+    дважды, второй раз поверх свежих мазков.
+    """
+    profile = profiles.get("blend")
+    refine.run(
+        _request(collage, masks={"seam": b"s", "background": b"b", "paste": b"p"}), profile
+    )
+
+    assert [a["strength"] for a in client.calls] == [
+        profile.background.strength,
+        profile.stylise.strength,
+        profile.strength,
+    ]
+
+
+def test_stylise_sits_between_the_other_two_in_strength():
+    """
+    Компромисс: слишком слабо — фотография остаётся фотографией, слишком
+    сильно — плывут черты. Между сведением стыка и генерацией фона.
+    """
+    profile = profiles.get("blend")
+
+    assert profile.strength < profile.stylise.strength < profile.background.strength
+
+
+def test_stylise_prompt_asks_for_paint_and_forbids_redrawing():
+    """
+    Промпт зоны говорит про фактуру и прямо запрещает двигать черты: на 0.35
+    модель уже способна перерисовать лицо, и напоминание тут не лишнее.
+    """
+    prompt = profiles.get("blend").stylise.prompt.lower()
+
+    assert "brush" in prompt and "canvas" in prompt
+    assert "recognisable person" in prompt
+    assert "do not redraw" in prompt
+
+
+def test_without_a_paste_mask_stylisation_is_skipped(client, collage):
+    """Нет маски — нет вызова: платить за проход, которому негде работать, незачем."""
+    refine.run(_request(collage, masks={"seam": b"s"}), profiles.get("blend"))
+
+    assert len(client.calls) == 1
+
+
+def test_zones_must_overlap():
+    """
+    Отступ горячей зоны больше внешней половины кольца — значит, между ними
+    полоса, которую не трогает ни один проход. Ровно она выглядела грязным
+    контуром вокруг головы.
+    """
+    profile = profiles.get("blend")
+    broken = replace(
+        profile, mask=replace(profile.mask, hole_margin_ratio=profile.mask.edge_outer_ratio)
+    )
+
+    with pytest.raises(InvalidImageError):
+        broken.validate()

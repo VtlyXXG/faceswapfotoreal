@@ -105,7 +105,10 @@ class MaskProfile:
     Зона 2 (стыки) — edge, neck, gradient, feather. Зона 3 (дыра в фоне) —
     hole_*. Зона 1 (лицо) — guard: она не открывается, а вычитается из обеих.
 
-    :param edge_ratio: половина ширины кольца вдоль контура волос
+    :param edge_ratio: насколько кольцо стыка заходит ВНУТРЬ контура волос
+    :param edge_outer_ratio: насколько оно уходит НАРУЖУ. Кольцо несимметрично:
+        внутри волосы заказчика, снаружи заливка на месте чужой причёски, и
+        дотянуться наружу надо до зоны фона
     :param neck_ratio: толщина полосы на стыке шеи с телом персонажа
     :param guard_ratio: растушёвка защиты лица — она вычитается из обеих масок
     :param feather_ratio: спад по краям зоны стыков
@@ -120,15 +123,22 @@ class MaskProfile:
         не стыковаться, иначе между ними остаётся полоса сырой заливки, которую
         не трогает ни один проход. Связь проверяется в `validate`.
     :param hole_feather_ratio: спад по краям зоны фона; ведётся только наружу
+    :param paste_inset_ratio: отступ зоны стилизации внутрь от контура вклейки
+    :param paste_guard_strength: какая доля защиты лица остаётся в зоне
+        стилизации. 1.0 — лицо закрыто полностью и фактуру не получает, 0.0 —
+        открыто наравне с остальным
     """
 
-    edge_ratio: float = 0.04
+    edge_ratio: float = 0.03
+    edge_outer_ratio: float = 0.16
     neck_ratio: float = 0.12
     guard_ratio: float = 0.06
     feather_ratio: float = 0.04
     gradient_ratio: float = 0.0
-    hole_margin_ratio: float = 0.02
+    hole_margin_ratio: float = 0.12
     hole_feather_ratio: float = 0.05
+    paste_inset_ratio: float = 0.04
+    paste_guard_strength: float = 0.6
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,29 @@ class BackgroundPass:
     steps: int = 50
     prompt: str = ""
     min_area_ratio: float = 0.002
+
+
+@dataclass(frozen=True)
+class StylisePass:
+    """
+    Проход по зоне 4 — по самой вклейке, ради фактуры.
+
+    Коллаж собирается из фотографии, а обложка написана маслом. Тон подогнать
+    можно (`collage.colour_match`), мазок кисти — нет: это не цвет, а структура.
+    Пока лицо вычиталось из масок целиком, оно оставалось стопроцентной
+    фотографией на живописи, и склейка читалась именно по фактуре.
+
+    Сила здесь — компромисс, и он честный: чем выше, тем больше мазка и тем
+    сильнее плывут черты. 0.35 добавляет фактуру, оставляя лицо узнаваемым;
+    выше 0.45 начинает меняться разрез глаз. Второй рычаг — доля защиты лица в
+    маске (`MaskProfile.paste_guard_strength`): им регулируют, насколько черты
+    остаются под прикрытием.
+    """
+
+    strength: float = 0.35
+    guidance_scale: float = 3.0
+    steps: int = 50
+    prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -185,6 +218,9 @@ class RefineProfile:
     control_field: str = "controlnets"
     # Второй проход по зоне фона. None — одна зона стыков, как было
     background: BackgroundPass | None = None
+    # Проход по самой вклейке: перевод фотографии в живопись. None — вклейка
+    # остаётся фотографической, как было до сих пор
+    stylise: StylisePass | None = None
 
     def validate(self) -> RefineProfile:
         """
@@ -226,7 +262,7 @@ class RefineProfile:
                     "seam": self.strength,
                 },
             )
-        if self.mask.hole_margin_ratio >= self.mask.edge_ratio:
+        if self.mask.hole_margin_ratio >= self.mask.edge_outer_ratio:
             # Зона 3 отступает от вклейки дальше, чем достаёт кольцо зоны 2.
             # Между ними останется полоса, которую не трогает ни один проход, —
             # и в ней сырая заливка на месте чужой причёски. Ровно этот зазор
@@ -236,8 +272,13 @@ class RefineProfile:
                 {
                     "profile": self.name,
                     "hole_margin": self.mask.hole_margin_ratio,
-                    "edge": self.mask.edge_ratio,
+                    "edge_outer": self.mask.edge_outer_ratio,
                 },
+            )
+        if self.stylise and not 0.0 <= self.stylise.strength <= 1.0:
+            raise InvalidImageError(
+                "strength прохода стилизации должен лежать в диапазоне 0..1",
+                {"profile": self.name, "strength": self.stylise.strength},
             )
         if self.controls and not self.control_field:
             raise InvalidImageError(
@@ -274,6 +315,7 @@ class RefineProfile:
             "gradient_ratio": self.mask.gradient_ratio,
             "controls": [f"{c.kind}:{c.weight}" for c in self.controls],
             "background_strength": self.background.strength if self.background else None,
+            "stylise_strength": self.stylise.strength if self.stylise else None,
         }
 
 
@@ -313,6 +355,21 @@ _SEAM_PROMPT = (
     "same person, and leave the rest of the canvas alone. "
     "Seamless hand-painted cover art: no cut-out edge, no halo around the hair, "
     "no visible collage border, no second head or duplicated hair."
+)
+
+# Промпт зоны стилизации. Речь идёт только о фактуре: перевести фотографическую
+# кожу в живопись, сохранив человека. Про геометрию сказано отдельно и жёстко —
+# на 0.35 модель уже способна двигать черты, и напоминание тут не лишнее.
+_STYLISE_ZONE_PROMPT = (
+    "This head is a photograph collaged onto a hand-painted illustration. "
+    "Repaint it in the medium of the artwork: visible oil brush strokes, canvas "
+    "texture and paper grain, the same palette, the same edge quality and the same "
+    "level of detail as the painting around it. Replace the photographic skin "
+    "texture with painted skin — no pores, no photo grain, no camera sharpness. "
+    "Keep the person exactly as they are: same facial proportions, same position "
+    "and size of the eyes, nose and mouth, same gaze, same hair colour, length and "
+    "shape. Do not redraw, move, rotate or reshape any feature — this must remain "
+    "the very same recognisable person, only painted instead of photographed."
 )
 
 # Промпт зоны фона. Здесь модель не сводит, а рисует заново: под маской лежит
@@ -473,6 +530,8 @@ register(
         # 0.85 — сила, на которой модель действительно генерирует содержимое, а
         # не подкрашивает; ниже ~0.7 из-под неё проступает мыло от заливки.
         background=BackgroundPass(prompt=_BACKGROUND_PROMPT),
+        # Зона 4: перевод самой вклейки из фотографии в живопись
+        stylise=StylisePass(prompt=_STYLISE_ZONE_PROMPT),
     )
 )
 

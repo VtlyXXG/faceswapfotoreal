@@ -228,6 +228,12 @@ def main() -> int:
         guard_ratio=profile.mask.guard_ratio,
         feather_ratio=profile.mask.feather_ratio,
         gradient_ratio=profile.mask.gradient_ratio,
+        edge_outer_ratio=profile.mask.edge_outer_ratio,
+    )
+    paste = mask_generator.paste_mask(
+        target.shape[:2], collage.head_alpha, collage.face_polygon, face_height,
+        profile.mask.guard_ratio, profile.mask.paste_guard_strength,
+        profile.mask.paste_inset_ratio,
     )
     hole = mask_generator.hole_mask(
         target.shape[:2],
@@ -264,6 +270,7 @@ def main() -> int:
             "60_mask_seam.png": mask,
             "61_mask_background.png": hole,
             "62_zones.png": _zones(collage.image, mask, hole),
+            "63_mask_paste.png": paste,
         },
     )
 

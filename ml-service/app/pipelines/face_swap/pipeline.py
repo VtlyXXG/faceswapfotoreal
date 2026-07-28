@@ -130,8 +130,24 @@ def run(request: SwapRequest) -> SwapResult:
         guard_ratio=profile.mask.guard_ratio,
         feather_ratio=profile.mask.feather_ratio,
         gradient_ratio=profile.mask.gradient_ratio,
+        edge_outer_ratio=profile.mask.edge_outer_ratio,
     )
     masks = {"seam": encode_image(seam, "png")[0]}
+
+    # Зона 4 — сама вклейка: перевод фотографии в живопись. Тон подогнать можно
+    # цветокоррекцией, мазок кисти — нет, это структура, а не цвет.
+    if profile.stylise is not None:
+        paste = mask_generator.paste_mask(
+            shape,
+            collage.head_alpha,
+            collage.face_polygon,
+            face_height,
+            guard_ratio=profile.mask.guard_ratio,
+            guard_strength=profile.mask.paste_guard_strength,
+            inset_ratio=profile.mask.paste_inset_ratio,
+        )
+        if (paste > 127).any():
+            masks["paste"] = encode_image(paste, "png")[0]
 
     # Зона 3 — дыра в фоне на месте чужой причёски. Отдельным проходом и на
     # высоком strength: заливка оставляет там мыло, и сводить его с чем-либо

@@ -324,3 +324,106 @@ def test_hole_is_empty_without_erasing():
 def test_hole_negative_ratios_are_rejected(ratios):
     with pytest.raises(InvalidImageError):
         _hole(**ratios)
+
+
+# --- Кольцо стыка: несимметричное ---
+
+
+def test_ring_reaches_further_out_than_in():
+    """
+    Внутри контура волосы заказчика, снаружи заливка на месте чужой причёски.
+    Заходить внутрь надо минимально, а наружу — до зоны фона, иначе между ними
+    останется полоса, которую не трогает ни один проход.
+    """
+    mask = _blend(edge_ratio=0.02, edge_outer_ratio=0.2, guard_ratio=0.0, feather_ratio=0.0)
+
+    alpha = _head_alpha()
+    # По вертикали вверх от центра круга (200, 190) радиуса 130
+    outside = mask[190 - 130 - 12, 200]
+    inside = mask[190 - 130 + 12, 200]
+
+    assert outside == 255, "наружу кольцо дотягивается"
+    assert inside == 0, "внутрь почти не заходит"
+    assert alpha[190 - 130 + 12, 200] == 255, "и там действительно волосы"
+
+
+def test_zones_overlap_and_the_hot_one_keeps_away():
+    """
+    Две вещи разом, и они тянут в разные стороны: зона фона идёт на 0.85 и
+    съедает всё, до чего дотянется, — значит, к волосам её подпускать нельзя;
+    но и зазора между зонами быть не должно. Отсюда широкое наружу кольцо.
+    """
+    seam = _blend(edge_ratio=0.02, edge_outer_ratio=0.25, guard_ratio=0.0, feather_ratio=0.0)
+    hole = _hole(margin_ratio=0.15, feather_ratio=0.0)
+
+    alpha = _head_alpha()
+    near = cv2.dilate(alpha, np.ones((9, 9), np.uint8)) > 0
+    assert hole[near].max() == 0, "горячая зона держится от волос"
+
+    orphan = (alpha == 0) & (_erased() > 0) & (seam < 30) & (hole < 30)
+    ring_band = cv2.dilate(alpha, np.ones((2 * 20 + 1,) * 2, np.uint8)) > 0
+    assert not (orphan & ring_band).any(), "у самой вклейки полосы-сироты нет"
+
+
+# --- Зона 4: стилизация вклейки ---
+
+
+def test_paste_zone_opens_the_skin_and_spares_the_features():
+    """
+    Ради фактуры зона и заводится: тон подогнать можно, мазок кисти — нет.
+    Но черты под ней должны остаться: guard_strength задаёт, какая доля защиты
+    лица сохраняется.
+    """
+    mask = mask_generator.paste_mask(
+        _SHAPE, _head_alpha(), mask_generator.face_polygon(face_mesh()), _FACE_HEIGHT
+    )
+
+    face = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(face_mesh())], 255)
+    core = cv2.erode(face, np.ones((15, 15), np.uint8)) > 0
+    hair = (_head_alpha() > 0) & (face == 0)
+
+    assert mask[hair].max() == 255, "волосы и кожа вне лица открыты полностью"
+    assert 0 < mask[core].mean() < 255 * 0.6, "черты под частичной защитой"
+
+
+def test_paste_zone_can_protect_the_face_completely():
+    """guard_strength=1.0 — прежнее поведение: лицо недоступно вовсе."""
+    mask = mask_generator.paste_mask(
+        _SHAPE,
+        _head_alpha(),
+        mask_generator.face_polygon(face_mesh()),
+        _FACE_HEIGHT,
+        guard_strength=1.0,
+    )
+
+    face = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.fillPoly(face, [mask_generator.face_polygon(face_mesh())], 255)
+    core = cv2.erode(face, np.ones((15, 15), np.uint8)) > 0
+
+    assert mask[core].max() == 0
+
+
+def test_paste_zone_steps_back_from_the_contour():
+    """Сам контур — работа зоны 2; трогать край волос дважды незачем."""
+    mask = mask_generator.paste_mask(
+        _SHAPE,
+        _head_alpha(),
+        mask_generator.face_polygon(face_mesh()),
+        _FACE_HEIGHT,
+        inset_ratio=0.15,
+    )
+
+    # Полоса заведомо уже отступа (12 px при 0.15 от лица в 80): квадратное
+    # ядро съедает больше эллиптического, и мерить надо с запасом
+    alpha = _head_alpha()
+    rim = (alpha > 0) & (cv2.erode(alpha, np.ones((2 * 7 + 1,) * 2, np.uint8)) == 0)
+    assert mask[rim].max() == 0
+
+
+@pytest.mark.parametrize("kwargs", [{"guard_strength": 1.5}, {"inset_ratio": -0.1}])
+def test_paste_zone_validates_its_ratios(kwargs):
+    with pytest.raises(InvalidImageError):
+        mask_generator.paste_mask(
+            _SHAPE, _head_alpha(), mask_generator.face_polygon(face_mesh()), _FACE_HEIGHT, **kwargs
+        )

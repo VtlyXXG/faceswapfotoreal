@@ -63,18 +63,18 @@ _BROW_LIFT = 0.06
 #   нужно свести тон кожи и положить контактную тень.
 # guard — растушёвка защиты лица. Черты под ней недоступны модели полностью.
 # feather — спад 255 → 0 по краям всей зоны.
-_EDGE_RATIO = 0.04
+_EDGE_RATIO = 0.03  # внутрь: там волосы заказчика
+_EDGE_OUTER_RATIO = 0.16  # наружу: до зоны фона и с запасом на перекрытие
 _NECK_RATIO = 0.12
 _GUARD_RATIO = 0.06
 _FEATHER_RATIO = 0.04
 
 # Отступ зоны фона от вклеенной головы, доля высоты лица. Зона 3 работает на
-# strength 0.85 и всё под собой стирает — до контура новых волос её подпускать
-# нельзя, там начинается зона 2 со своей мягкой силой.
-# Меньше edge: зоны обязаны перекрываться, а не стыковаться. Между погасшей
-# зоной 3 и начавшейся зоной 2 иначе остаётся полоса сырой заливки — грязный
-# контур вокруг головы, который не трогает ни один из проходов.
-_HOLE_MARGIN_RATIO = 0.02
+# strength 0.85 с промптом «фон, никаких голов и волос» — подпустишь её к
+# контуру причёски, и она его съест, оставив по краю светлую кайму. Отступ
+# должен быть настоящим, а перекрытие зон обеспечивает не он, а внешняя
+# половина кольца зоны 2 (edge_outer): она дотягивается сюда сверху.
+_HOLE_MARGIN_RATIO = 0.12
 _HOLE_FEATHER_RATIO = 0.05
 
 
@@ -343,6 +343,71 @@ def hole_mask(
     return (mask.astype(np.float32) * (1.0 - guard.astype(np.float32) / 255.0)).astype(np.uint8)
 
 
+def paste_mask(
+    shape: tuple[int, int],
+    head_alpha: Any,
+    face_polygon: Any,
+    face_height: float,
+    guard_ratio: float = _GUARD_RATIO,
+    guard_strength: float = 0.6,
+    inset_ratio: float = 0.04,
+) -> Any:
+    """
+    Зона 4: сама вклейка — её надо перевести из фотографии в живопись.
+
+    До сих пор её не существовало, и это было осознанно: лицо вычиталось из
+    масок целиком, «модель до него физически не дотягивается». Гарантия
+    сходства при этом железная, но и результат честный — фотографическое лицо
+    на картине маслом, склейка видна по фактуре, а не по шву. Никакой
+    цветокоррекцией это не лечится: тон можно подогнать, мазок кисти — нет.
+
+    Поэтому зона открывается, но не целиком. Защита лица не вычитается
+    полностью, а **ослабляется**: `guard_strength` задаёт, какая её доля
+    остаётся. Ноль — лицо открыто наравне с остальным (максимум фактуры,
+    минимум гарантий), единица — прежняя полная защита. Промежуточное значение
+    оставляет черты под частичной маской: мазок ложится, геометрия держится.
+
+    От внешнего контура зона отступает внутрь на `inset_ratio`: сам контур —
+    работа зоны 2 со своей силой, и накладывать поверх него ещё один проход
+    значит трогать край волос дважды.
+
+    :param guard_strength: доля защиты лица, которая остаётся; 0..1
+    :param inset_ratio: отступ внутрь от контура вклейки, доля высоты лица
+    """
+    import cv2
+    import numpy as np
+
+    if not 0.0 <= guard_strength <= 1.0:
+        raise InvalidImageError(
+            "Доля защиты лица должна лежать в диапазоне 0..1",
+            {"guard_strength": guard_strength},
+        )
+    if inset_ratio < 0:
+        raise InvalidImageError("Отступ внутрь не может быть отрицательным", {"inset": inset_ratio})
+
+    solid = (np.asarray(head_alpha) > 127).astype(np.uint8) * 255
+    inset = round(face_height * inset_ratio)
+    if inset > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inset + 1, 2 * inset + 1))
+        solid = cv2.erode(solid, kernel)
+    if not solid.any():
+        return solid
+
+    guard = face_guard(shape, face_polygon, face_height, guard_ratio)
+    weight = 1.0 - guard.astype(np.float32) / 255.0 * guard_strength
+    mask = (solid.astype(np.float32) * weight).astype(np.uint8)
+
+    log.info(
+        "маска стилизации построена",
+        extra={
+            "guard_strength": guard_strength,
+            "inset_px": inset,
+            "open_px": int(np.count_nonzero(mask > 127)),
+        },
+    )
+    return mask
+
+
 def seam_mask(
     shape: tuple[int, int],
     head_alpha: Any,
@@ -354,6 +419,7 @@ def seam_mask(
     guard_ratio: float = _GUARD_RATIO,
     feather_ratio: float = _FEATHER_RATIO,
     gradient_ratio: float = 0.0,
+    edge_outer_ratio: float | None = None,
 ) -> Any:
     """
     Зона 2: стыки — контур новых волос и место, где шея входит в тело персонажа.
@@ -391,9 +457,17 @@ def seam_mask(
 
     solid = (np.asarray(head_alpha) > 127).astype(np.uint8)
 
-    edge = max(1, round(face_height * edge_ratio))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * edge + 1, 2 * edge + 1))
-    ring = cv2.subtract(cv2.dilate(solid, kernel), cv2.erode(solid, kernel)) * 255
+    # Кольцо намеренно НЕсимметричное. Внутрь от контура лежат волосы заказчика,
+    # и туда нужно заходить минимально; наружу лежит заливка на месте чужой
+    # причёски, и там кольцо должно дотянуться до зоны фона, иначе между ними
+    # останется полоса, которую не трогает ни один проход.
+    inner = max(1, round(face_height * edge_ratio))
+    outer = max(inner, round(face_height * (edge_outer_ratio or edge_ratio)))
+
+    grow = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * outer + 1, 2 * outer + 1))
+    shrink = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * inner + 1, 2 * inner + 1))
+    ring = cv2.subtract(cv2.dilate(solid, grow), cv2.erode(solid, shrink)) * 255
+    edge = inner
 
     # Полоса на стыке шеи с телом. Узкая: шея донора доезжает до воротника, и
     # закрывать оторванный край больше не нужно — нужно свести тон кожи с телом
@@ -427,6 +501,7 @@ def seam_mask(
             "image_size": f"{shape[1]}x{shape[0]}",
             "face_height": round(face_height, 1),
             "edge_px": edge,
+            "edge_outer_px": outer,
             "neck_px": thickness,
             "gradient_px": round(face_height * gradient_ratio),
             "open_px": int(np.count_nonzero(mask > 127)),

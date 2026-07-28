@@ -111,6 +111,13 @@ _ERASE_METHODS = ("pyramid", "telea", "ns")
 # останется дыра, которую модели придётся заполнять воротником с нуля.
 _ERASE_NECK_RATIO = 0.05
 
+# Предел, внутри которого достраивается область стирания. Эллипс по пропорциям
+# человеческой головы для рисованного героя мал: причёска бывает вдвое шире его
+# лица. Но и без предела нельзя — сегментатор на иллюстрации иногда объявляет
+# передним планом пол-кадра.
+_ERASE_BOUND_WIDTH = 2.8
+_ERASE_BOUND_HAIR = 3.2
+
 # Запас вокруг силуэта персонажа, доля высоты лица. Стирать впритык нельзя:
 # по краю рисованных волос идёт полупрозрачная кромка, и она остаётся тёмной
 # каймой ровно там, где её должно было не стать.
@@ -605,6 +612,33 @@ def _match_skin(donor: Any, template: Any, zones: list, ratio: float, blur: floa
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def _connected_to(mask: Any, seed: Any) -> Any:
+    """
+    Куски маски, связные с затравкой.
+
+    Морфологическая реконструкция «по одному»: размечаем связные компоненты и
+    оставляем те, в которых есть хоть один пиксель затравки. Нужна затем, чтобы
+    забрать причёску персонажа целиком, а не по границе эллипса: у рисованного
+    героя она бывает вдвое шире его лица, и отрезанные куски торчали из-под
+    вклейки.
+    """
+    import cv2
+    import numpy as np
+
+    binary = (np.asarray(mask) > 127).astype(np.uint8)
+    seeded = np.asarray(seed) > 127
+    if not binary.any() or not seeded.any():
+        return np.asarray(seed)
+
+    count, labels = cv2.connectedComponents(binary, 8)
+    if count <= 1:
+        return np.asarray(seed)
+
+    keep = np.unique(labels[seeded])
+    keep = keep[keep > 0]
+    return np.where(np.isin(labels, keep), 255, 0).astype(np.uint8)
+
+
 def _pyramid_fill(image: Any, unknown: Any) -> Any:
     """
     Заливка дыры пирамидой (push-pull): известное усредняется вниз по уровням и
@@ -769,9 +803,27 @@ def _erase_template_head(
 
     # Персонаж целиком — он не источник цвета для заливки ни одним пикселем
     foreign = cv2.dilate(np.where(silhouette > _FOREIGN_FLOOR, 255, 0).astype(np.uint8), kernel)
+
     # Дыра — та его часть, что попала в область головы. Крупнейшая компонента:
     # в эллипс головы могла заехать поднятая рука или ветка за спиной
-    head = segmentation.largest_component(np.where(region > 0, foreign, 0).astype(np.uint8))
+    seed = segmentation.largest_component(np.where(region > 0, foreign, 0).astype(np.uint8))
+
+    # Эллипс размечен по пропорциям человеческой головы, а у нарисованного героя
+    # причёска бывает вдвое шире собственного лица — и её остатки торчали из-под
+    # уменьшенной вклейки. Поэтому область достраивается по силуэту: берутся все
+    # его куски, связные с найденной головой. Не до бесконечности — внутри
+    # щедрой границы: сегментатор на рисованной обложке иногда объявляет
+    # передним планом пол-кадра, и без предела стёрлась бы половина разворота.
+    bound, _, _ = segmentation.head_region(
+        points,
+        target.shape[:2],
+        _ERASE_BOUND_WIDTH,
+        _ERASE_BOUND_HAIR,
+        neck_ratio,
+        follow_jaw=False,
+        neck_column=False,
+    )
+    head = _connected_to(np.where(bound > 0, foreign, 0).astype(np.uint8), seed)
     hole = cv2.dilate(head, kernel)
 
     if not hole.any():
