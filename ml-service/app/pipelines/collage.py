@@ -257,10 +257,37 @@ def similarity_transform(
     return matrix, scale
 
 
+def _lowest_after_transform(alpha: Any, matrix: Any, down: Any) -> Any:
+    """
+    Самая дальняя точка силуэта в направлении `down` — после переноса.
+
+    Считается без самого переноса. Матрица подобия линейна, поэтому «какой
+    пиксель окажется ниже всех» решается одним скалярным произведением в
+    координатах фотографии: максимум `⟨p, Rᵀ·down⟩`. Гонять ради этого warpAffine
+    по 4K-кадру незачем — тем более что сдвиг должен войти в ту же матрицу, то
+    есть быть известен до переноса.
+
+    :param down: единичный вектор «вниз» в координатах шаблона
+    :return: точка в координатах ШАБЛОНА либо None, если силуэт пуст
+    """
+    import numpy as np
+
+    ys, xs = np.nonzero(np.asarray(alpha) > 127)
+    if ys.size == 0:
+        return None
+
+    linear = np.asarray(matrix, dtype=np.float64)[:, :2]
+    direction = linear.T @ np.asarray(down, dtype=np.float64)
+
+    lowest = int(np.argmax(xs * direction[0] + ys * direction[1]))
+    point = np.array([xs[lowest], ys[lowest]], dtype=np.float64)
+    return point @ linear.T + np.asarray(matrix, dtype=np.float64)[:, 2]
+
+
 def neck_anchor(
     target: Any,
     target_points: list,
-    neck_line: tuple,
+    alpha: Any,
     matrix: Any,
     face_height: float,
     max_ratio: float = _ANCHOR_MAX_RATIO,
@@ -274,6 +301,15 @@ def neck_anchor(
     оказался выше воротника, между шеей и телом остаётся зазор, и голова висит в
     воздухе; сюда и добавляется сдвиг.
 
+    Низ меряется по **самой альфе**, а не по расчётному отрезку среза. Разница
+    принципиальная, и она стоила боевого прогона: когда линия одежды донора не
+    нашлась и взят запасной отступ (`neck_source: fallback`), отрезок среза
+    оказывается на 0.55 высоты лица ниже подбородка независимо от того, есть ли
+    там пиксели. Якорь видел эту обещанную длину, считал, что шея уже достаёт до
+    воротника, и не двигал ничего — а на обложке висела голова с коротким
+    обрубком шеи. По альфе такого не случается: где вклейка кончается, там она и
+    кончается.
+
     Сдвиг только вниз и только по оси лица шаблона. Вверх двигать нечего: если
     шея уже перекрыла воротник — это нахлёст, ровно то, что нужно.
 
@@ -281,7 +317,7 @@ def neck_anchor(
     сплошной альфе: сегментатор для этого не запускается — второй прогон на 4K
     стоит секунд, а нужна здесь только граница кожи и ткани.
 
-    :param neck_line: отрезок низа шеи донора в координатах ФОТОГРАФИИ
+    :param alpha: силуэт вырезанной головы в координатах ФОТОГРАФИИ
     :param matrix: преобразование донор → шаблон
     :param face_height: высота лица на шаблоне
     :return: (сдвиг в пикселях вдоль оси лица вниз, метаданные)
@@ -305,11 +341,12 @@ def neck_anchor(
 
     collar = chin - up * (collar_ratio * face_height)
 
-    # Низ шеи донора после переноса — середина отрезка среза
-    neck = _transform_points(np.array(neck_line, dtype=np.float64), matrix).mean(axis=0)
+    bottom = _lowest_after_transform(alpha, matrix, -up)
+    if bottom is None:
+        return 0.0, {"anchor_px": 0.0, "anchor_collar": "empty"}
 
-    # Насколько воротник ниже низа шеи, вдоль оси лица шаблона
-    gap = float(np.dot(collar - neck, -up))
+    # Насколько воротник ниже низа вклейки, вдоль оси лица шаблона
+    gap = float(np.dot(collar - bottom, -up))
     limit = max_ratio * face_height
     offset = float(min(max(gap, 0.0), limit))
 
@@ -667,6 +704,7 @@ def build(
     neck_ratio: float | None = segmentation._NECK_RATIO,
     erode_ratio: float = segmentation._ERODE_RATIO,
     scale_mark: str = "umeyama",
+    scale_multiplier: float = 1.0,
     anchor_neck: bool = True,
     feather_ratio: float = _FEATHER_RATIO,
     colour_match: float = _COLOUR_MATCH,
@@ -687,6 +725,9 @@ def build(
     :param erode_ratio: подрезка края силуэта, доля высоты лица
     :param scale_mark: по какой биометрической мерке считать масштаб;
         umeyama — подгонка сразу по всем опорным точкам лица
+    :param scale_multiplier: множитель поверх посчитанного масштаба. Ручка
+        художественная, а не геометрическая: 1.0 — лицо донора точно совпадает
+        с лицом персонажа
     :param anchor_neck: опускать ли вклейку до воротника, если шея не дотянулась
     :param colour_match: доля приведения тона кожи к шаблону, 0..1
     :param erase_template_head: стирать ли голову персонажа из-под вклейки
@@ -719,12 +760,28 @@ def build(
     # Масштаб — строго по лицу. Мерки считаются все, чтобы их расхождение было
     # видно в метаданных: на рисованном персонаже они спорят между собой до 18%,
     # и по одному числу потом не понять, почему голова вышла такой.
+    if scale_multiplier <= 0:
+        raise InvalidImageError(
+            "Множитель масштаба должен быть положительным",
+            {"scale_multiplier": scale_multiplier},
+        )
+
     ratios = biometric_ratios(face.points, target_points)
+    measured = biometric_scale(ratios, scale_mark)
+    align_source = [face.points[i] for i in _ALIGN_POINTS]
+    align_target = [target_points[i] for i in _ALIGN_POINTS]
+
     matrix, scale = similarity_transform(
-        [face.points[i] for i in _ALIGN_POINTS],
-        [target_points[i] for i in _ALIGN_POINTS],
-        biometric_scale(ratios, scale_mark),
+        align_source,
+        align_target,
+        None if measured is None else measured * scale_multiplier,
     )
+    if measured is None and scale_multiplier != 1.0:
+        # У umeyama масштаб считается внутри, поэтому множитель применяется
+        # вторым проходом — по уже известному числу
+        matrix, scale = similarity_transform(
+            align_source, align_target, scale * scale_multiplier
+        )
 
     height, width = target.shape[:2]
 
@@ -738,7 +795,7 @@ def build(
     anchor_meta: dict = {"anchor_px": 0.0}
     if anchor_neck:
         offset, anchor_meta = neck_anchor(
-            target, target_points, head.neck_line, matrix, template_face_height
+            target, target_points, face.alpha, matrix, template_face_height
         )
         if offset > 0:
             _, up, _, _ = segmentation._axis(target_points)
@@ -799,6 +856,7 @@ def build(
         # Масштаб и его разброс по меркам: если голова вышла велика или мала,
         # смотреть надо сюда, а не на габариты причёски
         "scale_mark": scale_mark,
+        "scale_multiplier": scale_multiplier,
         "scale_marks": {name: round(value, 3) for name, value in ratios.items()},
         **anchor_meta,
         # Насколько силуэт заполнил отведённый эллипс головы. Близко к нулю —
@@ -819,11 +877,12 @@ def build(
     donor_face = head.meta["face_height"]
     template_head = erase_meta.get("template_head_px")
     log.info(
-        "[geometry] scale=%.3f mark=%s marks=%s | anchor=%.1f px (%s) | "
+        "[geometry] scale=%.3f mark=%s x%.2f marks=%s | anchor=%.1f px (%s) | "
         "neck=%.3f (%s) | face: donor %.0f px -> template %.0f px (x%.3f) | "
         "head: pasted %d px, character %s px (%s) | erased=%s",
         scale,
         scale_mark,
+        scale_multiplier,
         {name: round(value, 3) for name, value in sorted(ratios.items())},
         anchor_meta.get("anchor_px", 0.0),
         anchor_meta.get("anchor_collar", "-"),

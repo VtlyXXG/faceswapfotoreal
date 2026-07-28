@@ -469,14 +469,23 @@ def test_chosen_mark_sets_the_size(same_pose, photo, cover):
 # --- Якорь шеи ---
 
 
-@pytest.fixture
-def cover_with_collar() -> np.ndarray:
-    """Обложка, где под подбородком персонажа есть кожа, а ниже — одежда."""
+def _cover_with_collar(collar_y: int) -> np.ndarray:
+    """
+    Обложка, где под подбородком персонажа есть кожа, а с collar_y — одежда.
+
+    Силуэт-заглушка вклейки кончается на y=320 (круг r=130 вокруг (200, 190)),
+    поэтому воротник ниже 320 означает зазор, а выше — нахлёст.
+    """
     image = np.zeros((400, 400, 3), dtype=np.uint8)
     image[:] = (60, 60, 60)
     cv2.rectangle(image, (140, 150), (260, 400), (170, 180, 210), -1)  # лицо и шея
-    cv2.rectangle(image, (100, 330), (300, 400), (40, 90, 220), -1)  # воротник
+    cv2.rectangle(image, (100, collar_y), (300, 400), (40, 90, 220), -1)  # воротник
     return image
+
+
+@pytest.fixture
+def cover_with_collar() -> np.ndarray:
+    return _cover_with_collar(330)
 
 
 def test_anchor_drops_the_head_onto_the_collar(same_pose, photo, cover_with_collar):
@@ -494,12 +503,28 @@ def test_anchor_drops_the_head_onto_the_collar(same_pose, photo, cover_with_coll
     )
 
 
-def test_anchor_does_not_lift_an_overlapping_neck(same_pose, photo, cover_with_collar):
+def test_anchor_measures_the_silhouette_not_the_promised_cut(same_pose, photo):
+    """
+    Регрессия с боевого прогона. Когда линия одежды донора не нашлась и взят
+    запасной отступ, расчётный отрезок среза уезжает на 0.55 высоты лица ниже
+    подбородка — независимо от того, есть ли там пиксели. Якорь мерил этот
+    отрезок, считал, что шея уже достала до воротника, и не двигал ничего, а на
+    обложке висела голова с коротким обрубком шеи.
+
+    Здесь ровно та расстановка: срез обещан ниже воротника (260 + 80 = 340 при
+    воротнике на 330), а силуэт кончается на 320. Мерить надо силуэт.
+    """
+    result = _build(photo, _cover_with_collar(330), anchor_neck=True, neck_ratio=1.0)
+
+    assert result.meta["anchor_px"] > 0, "зазор есть, и его должно быть видно"
+
+
+def test_anchor_does_not_lift_an_overlapping_neck(same_pose, photo):
     """
     Сдвиг только вниз. Если шея уже перекрыла воротник — это нахлёст, ровно то,
     что нужно, и поднимать её обратно незачем.
     """
-    result = _build(photo, cover_with_collar, anchor_neck=True, neck_ratio=1.0)
+    result = _build(photo, _cover_with_collar(300), anchor_neck=True, neck_ratio=1.0)
 
     assert result.meta["anchor_px"] == 0.0
 
@@ -560,3 +585,50 @@ def test_geometry_is_logged_as_plain_numbers(same_pose, photo, cover):
         assert field in line, field
     # Мерки перечислены поимённо, а не одним числом
     assert "face_height" in line and "cheeks" in line
+
+
+# --- Художественный множитель размера головы ---
+
+
+def test_multiplier_shrinks_the_head(same_pose, photo, cover):
+    """
+    Ручка эстетическая: 1.0 геометрически верно (лицо донора совпадает с лицом
+    персонажа), но у мультяшной серии это читается как большая голова на
+    маленьком туловище.
+    """
+    plain = _build(photo, cover)
+    smaller = _build(photo, cover, scale_multiplier=0.85)
+
+    assert smaller.meta["scale"] == pytest.approx(plain.meta["scale"] * 0.85, rel=0.01)
+    assert int((smaller.head_alpha > 127).sum()) < int((plain.head_alpha > 127).sum())
+    assert smaller.meta["scale_multiplier"] == 0.85
+
+
+def test_multiplier_applies_to_a_chosen_mark_too(same_pose, photo, cover):
+    """Множитель поверх мерки, а не вместо неё: работать должны обе ручки."""
+    plain = _build(photo, cover, scale_mark="cheeks")
+    smaller = _build(photo, cover, scale_mark="cheeks", scale_multiplier=0.5)
+
+    assert smaller.meta["scale"] == pytest.approx(plain.meta["scale"] * 0.5, rel=0.01)
+
+
+def test_multiplier_keeps_the_face_proportions(same_pose, photo, cover):
+    """
+    Голова уменьшается целиком: пропорции самого лица меняться не должны, иначе
+    ручка перестала бы быть безобидной для сходства.
+    """
+    smaller = _build(photo, cover, scale_multiplier=0.7)
+    plain = _build(photo, cover)
+
+    def shape(polygon):
+        width = polygon[:, 0].max() - polygon[:, 0].min()
+        height = polygon[:, 1].max() - polygon[:, 1].min()
+        return width / height
+
+    assert shape(smaller.face_polygon) == pytest.approx(shape(plain.face_polygon), rel=0.02)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5])
+def test_non_positive_multiplier_is_refused(same_pose, photo, cover, value):
+    with pytest.raises(InvalidImageError):
+        _build(photo, cover, scale_multiplier=value)

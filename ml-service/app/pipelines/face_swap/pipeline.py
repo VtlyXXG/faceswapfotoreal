@@ -94,6 +94,7 @@ def run(request: SwapRequest) -> SwapResult:
         neck_ratio=settings.head_neck_ratio,
         erode_ratio=settings.head_erode_ratio,
         scale_mark=settings.head_scale_mark,
+        scale_multiplier=settings.head_scale_multiplier,
         anchor_neck=settings.head_anchor_neck,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,

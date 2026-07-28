@@ -123,6 +123,10 @@ def main() -> int:
         choices=[*sorted(collage_builder._SCALE_MARKS), "median", "umeyama"],
         default=settings.head_scale_mark,
     )
+    parser.add_argument(
+        "--scale-multiplier", type=float, default=settings.head_scale_multiplier,
+        help="художественный множитель размера головы: 0.85 для мультяшных серий",
+    )
     parser.add_argument("--no-anchor", action="store_true", help="не опускать шею к воротнику")
     # Затирка головы персонажа на шаблоне
     parser.add_argument(
@@ -198,6 +202,7 @@ def main() -> int:
         neck_ratio=args.neck_ratio,
         erode_ratio=args.erode_ratio,
         scale_mark=args.scale_mark,
+        scale_multiplier=args.scale_multiplier,
         anchor_neck=not args.no_anchor,
         feather_ratio=settings.collage_feather_ratio,
         colour_match=settings.collage_colour_match,
