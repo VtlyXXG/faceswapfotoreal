@@ -1,0 +1,572 @@
+"""
+Маска волос: область первого шага двухшаговой стратегии.
+
+Проверяется одно свойство важнее всех остальных: **лицо остаётся вне маски**.
+За ним идёт фейссвоп, и он ищет глаза, нос и рот своим детектором на уже
+поправленном шаблоне; тронутое диффузией лицо — это риск молчаливого отказа и
+сглаженной кожи, то есть ровно тех двух провалов, из-за которых сюда и пришли.
+
+Разметка в тестах поддельная: настоящая требует весов на 16 МБ и настоящего
+человека в кадре, а модулю достаточно четырёх масок классов.
+"""
+
+import numpy as np
+import pytest
+
+from app.core.errors import InvalidImageError, NoFaceDetectedError
+from app.pipelines import hair_mask, head_mask, parsing
+
+_SIZE = 400
+_DEFAULT = object()
+
+
+@pytest.fixture
+def image():
+    return np.full((_SIZE, _SIZE, 3), 180, dtype=np.uint8)
+
+
+def _parsed(hair_box, face_box, clothes_box=None, skin_box=None) -> parsing.Parsed:
+    """
+    Разметка из прямоугольников: (top, bottom, left, right).
+
+    Классы не пересекаются, и это не удобство теста, а свойство настоящей
+    разметки: сегментатор отдаёт категорию на пиксель, а не набор слоёв. Пиксель
+    чёлки — либо волосы, либо лицо, и решает это модель, а не мы.
+
+    Приоритет здесь у лица: прямоугольник волос описывает всю голову, лицо
+    вырезается из него, и получается причёска в виде рамки вокруг лица — именно
+    так разметка и разбирает голову. Где нужно обратное (чёлка на лбу), тест
+    опускает верхнюю границу лица и оставляет лоб волосам.
+    """
+
+    def mask(box) -> np.ndarray:
+        plane = np.zeros((_SIZE, _SIZE), dtype=np.uint8)
+        if box is not None:
+            top, bottom, left, right = box
+            plane[top:bottom, left:right] = 255
+        return plane
+
+    hair, face, skin, clothes = (mask(box) for box in (hair_box, face_box, skin_box, clothes_box))
+    hair = np.where(face > 0, 0, hair)
+    skin = np.where((hair > 0) | (face > 0), 0, skin)
+    clothes = np.where((hair > 0) | (face > 0) | (skin > 0), 0, clothes)
+
+    return parsing.Parsed(face=face, hair=hair, skin=skin, clothes=clothes)
+
+
+@pytest.fixture
+def stub(monkeypatch, mesh):
+    """
+    Сетка лица и разметка вокруг центра кадра.
+
+    Лицо — 80 пикселей высотой (см. conftest), причёска накрывает его сверху и
+    свисает ниже подбородка: ровно тот случай, ради которого всё написано, —
+    длинные волосы, которые надо укоротить.
+    """
+
+    default = _parsed(
+        # Волосы: шапка над лицом плюс длинные пряди до плеч
+        hair_box=(110, 320, 130, 270),
+        face_box=(160, 260, 160, 240),
+        clothes_box=(300, 400, 100, 300),
+    )
+
+    def setup(points=None, parsed=_DEFAULT):
+        # Сравнение с сентинелом, а не с None: None здесь — законное значение,
+        # им и проверяется путь «весов разметки нет»
+        landmarks = points if points is not None else mesh(centre=(200, 200))
+        monkeypatch.setattr(head_mask, "try_landmarks", lambda _: landmarks)
+        monkeypatch.setattr(
+            parsing, "parse", lambda _: default if parsed is _DEFAULT else parsed
+        )
+        return landmarks
+
+    return setup
+
+
+def _build(image, **overrides):
+    kwargs = {
+        "dilate_ratio": 0.10,
+        "feather_ratio": 0.07,
+        "protect_ratio": 0.05,
+        "forehead_ratio": 0.5,
+        "core_ratio": 1.0,
+        "guard_ratio": 1.0,
+        "cheek_ratio": 0.0,
+    }
+    kwargs.update(overrides)
+    return hair_mask.build(image, **kwargs)
+
+
+def test_the_face_stays_out_of_the_mask(image, stub):
+    """
+    Главное свойство этой маски. Следом идёт фейссвоп, и лицо ему нужно
+    нетронутым: своим детектором он ищет его на поправленном шаблоне, а не
+    найдя — молча вернёт кадр без замены.
+    """
+    stub()
+
+    mask = _build(image).mask
+
+    # Центр лица, глаза и рот — в координатах заглушки из conftest
+    assert mask[200, 200] == 0, "центр лица под маской"
+    assert mask[190, 170] == 0 and mask[190, 230] == 0, "глаза под маской"
+    assert mask[238, 200] == 0, "рот под маской"
+
+
+def test_the_hair_itself_is_open(image, stub):
+    """Ради чего маска и строится: волосы модели отдаются целиком."""
+    stub()
+
+    mask = _build(image).mask
+
+    assert mask[130, 200] == 255, "шапка волос над лицом"
+    assert mask[300, 150] == 255, "прядь ниже подбородка"
+
+
+def test_the_trace_of_the_old_hair_is_included(image, stub):
+    """
+    Длинные волосы лежат на плечах и закрывают одежду. Короткая стрижка их
+    открывает, и то, что было под ними, модель обязана дорисовать — значит,
+    след старой причёски входит в область целиком, вместе с задетой тканью.
+    Число уезжает в мету: если перерисован весь жилет, объяснит это оно.
+    """
+    stub()
+
+    result = _build(image)
+
+    assert result.meta["clothes_px"] > 0, "волосы лежат на одежде — ткань под маской"
+    # Но не вся ткань: маска идёт по следу волос, а не по костюму
+    assert result.meta["clothes_px"] < 100 * 200
+
+
+def test_the_mask_grows_outward_only(image, stub):
+    """
+    Расширение и растушёвка идут наружу, в фон: сами волосы обязаны остаться под
+    сплошными 255. Полупрозрачные волосы означают призрак старой причёски по
+    контуру — он переживает любую вклейку, потому что лежит внутри маски.
+    """
+    stub()
+
+    wide = _build(image, dilate_ratio=0.4)
+    narrow = _build(image, dilate_ratio=0.0)
+
+    assert wide.meta["open_px"] > narrow.meta["open_px"]
+    assert wide.mask[130, 200] == 255 and narrow.mask[130, 200] == 255
+
+
+def test_a_fringe_over_the_brows_is_still_hair(image, stub):
+    """
+    Защита вычитает контур лица МИНУС волосы. Прядь, упавшая на бровь, — часть
+    причёски: оставить её значит оставить кусок старой гривы над глазом.
+    """
+    stub(
+        parsed=_parsed(
+            # Лоб отдан волосам: разметка отнесла чёлку к причёске, и класс лица
+            # начинается ниже бровей — то есть внутри контура из сетки
+            hair_box=(110, 200, 130, 270),
+            face_box=(200, 260, 160, 240),
+        )
+    )
+
+    mask = _build(image).mask
+
+    assert mask[175, 200] == 255, "чёлка на лбу правится вместе с причёской"
+    assert mask[230, 200] == 0, "кожа лица под тем же контуром защищена"
+    # А вот прядь, доставшая до глаза, остаётся: ядро лица волосам не уступает.
+    # Глаза заглушки на y=190 (conftest), и это единственное место, где старая
+    # причёска имеет право уцелеть
+    assert mask[190, 170] <= 8, "у самого угла глаза ядро гасит маску не в ноль, а почти"
+
+
+def test_the_sideburns_are_not_rescued_by_the_face_guard(image, stub):
+    """
+    Правка после четвёртого прогона: на висках и лбу повисли ошмётки старых
+    тёмных волос.
+
+    Защита лица расширяется НАРУЖУ — на protect_ratio во все стороны, то есть в
+    прилегающие волосы. Спасённую ею прядь редактор не сотрёт, а фейссвоп вклеит
+    лицо под неё. Поэтому готовый вес защиты гасится классом волос: пиксель,
+    размеченный как волосы, обязан попасть под правку, даже если лежит на щеке.
+
+    Бакенбарда здесь — полоса волос вплотную к щеке, внутри контура лица.
+    """
+    parsed = _parsed(hair_box=(110, 320, 130, 270), face_box=(160, 260, 160, 240))
+    parsed.hair[244:258, 160:178] = 255  # прядь на щеке, внутри класса лица
+    parsed.face = np.where(parsed.hair > 0, 0, parsed.face)
+    stub(parsed=parsed)
+
+    # Поле защиты шире пряди: без вычитания волос она уцелела бы целиком
+    result = _build(image, protect_ratio=0.1)
+
+    assert result.mask[251, 169] == 255, "бакенбарда идёт под правку"
+    assert result.mask[251, 200] == 0, "щека рядом с ней — нет"
+    assert result.meta["hair_left_px"] < result.meta["hair_px"] * 0.02
+
+
+def test_narrowing_the_core_frees_the_temple_but_not_the_eye(image, stub):
+    """
+    Последняя прядь: локон, спускающийся от виска к щеке.
+
+    Оболочка ядра кончается на внешнем углу глаза, но дилатация уводит её ещё на
+    `margin` в сторону виска — и локон оказывается под защитой, которую волосы
+    не перебивают. `core_ratio` сжимает оболочку поперёк оси лица, освобождая
+    висок.
+
+    Безопасность держится не на осторожности значения, а на устройстве:
+    дилатация круговая и возвращает накрытие наружу, поэтому сам угол глаза
+    остаётся внутри ядра. Проверяется здесь и то, и другое — иначе «сузили» и
+    «открыли глаз диффузии» станут одним и тем же коммитом.
+
+    Внешние углы глаз заглушки на x=170 и x=230, ось лица по x=200 (conftest).
+    """
+    parsed = _parsed(hair_box=(110, 320, 130, 270), face_box=(160, 260, 160, 240))
+    parsed.hair[185:215, 160:169] = 255  # прядь на виске, вплотную к глазу
+    parsed.face = np.where(parsed.hair > 0, 0, parsed.face)
+    stub(parsed=parsed)
+
+    wide = _build(image, protect_ratio=0.1, core_ratio=1.0)
+    narrow = _build(image, protect_ratio=0.1, core_ratio=0.7)
+
+    assert wide.mask[200, 165] < 128, "ядро целиком дотягивается до виска"
+    # Не 255: хвост размытия ядра сюда всё же дотягивается — но это уже правка,
+    # а не защита. Ровно ноль тут и не нужен, нужен вес, при котором вклейка
+    # берёт пиксель из генерации
+    assert narrow.mask[200, 165] > 200, "сжатое — уже нет, прядь идёт под правку"
+
+    # А глаз под защитой в обоих случаях: сдвиг угла (0.3 × 30 = 9) меньше
+    # поля дилатации (0.1 × 82 = 8)… почти, и потому проверяется, а не считается
+    assert narrow.mask[190, 180] <= 8, "внутренняя часть глаза защищена"
+    assert narrow.mask[210, 200] <= 8, "и лицо между глазом и носом тоже"
+    assert narrow.meta["core_ratio"] == 0.7
+
+
+def test_narrowing_the_guard_frees_a_strand_the_parsing_calls_a_face(image, stub):
+    """
+    Прядь, которую разметка отнесла к классу ЛИЦА, а не волос.
+
+    Так теряется тонкий тёмный локон от виска к щеке: сегментатор работает на
+    256x256 и растворяет его в классе FACE. Дальше он недостижим ничем из
+    прежних чисел — и это здесь и проверяется. В маску он не входит: маска
+    строится из класса волос. Гашение защиты волосами его не касается по той же
+    причине. `core` жмёт ЯДРО, то есть оболочку глаз, носа и рта, а класс FACE
+    остаётся во всю щёку. И, главное, расширять за ним маску бесполезно: защита
+    вычитается ПОСЛЕ дилатации, и на щеке маска умножится на ноль при любом
+    dilate_ratio.
+
+    Остаётся сузить сам источник защиты. Ось лица по x=200, углы глаз на x=170
+    и x=230 (conftest) — и глаза обязаны пережить сужение, иначе «освободили
+    щёку» и «пустили диффузию по глазам» станут одним коммитом.
+    """
+    parsed = _parsed(hair_box=(110, 320, 130, 270), face_box=(160, 260, 160, 240))
+    # Локон на щеке, размеченный ЛИЦОМ: класс face выходит за свой
+    # прямоугольник влево, класс hair на этом месте стёрт
+    parsed.face[215:250, 142:153] = 255
+    parsed.hair = np.where(parsed.face > 0, 0, parsed.hair)
+    stub(parsed=parsed)
+
+    kept = _build(image, protect_ratio=0.05)
+    wider = _build(image, protect_ratio=0.05, dilate_ratio=0.4)
+    freed = _build(image, protect_ratio=0.05, guard_ratio=0.6)
+
+    assert kept.mask[230, 147] <= 8, "прядь под защитой: маска её не берёт"
+    # Ровно то, ради чего тест и написан: расширение маски здесь не работает и
+    # работать не может — защита отнимается после него
+    assert wider.mask[230, 147] <= 8, "вчетверо более широкая маска пряди не достаёт"
+    assert freed.mask[230, 147] == 255, "сужённая защита отдаёт прядь редактору"
+
+    # Глаза и центр лица переживают сужение: ядро возвращается поверх среза
+    assert freed.mask[190, 170] <= 8 and freed.mask[190, 230] <= 8, "глаза защищены"
+    assert freed.mask[200, 200] == 0 and freed.mask[238, 200] == 0, "лицо и рот тоже"
+    assert freed.meta["guard_ratio"] == 0.6
+    assert freed.meta["protected_px"] < kept.meta["protected_px"]
+    # Полуширина меряется по источнику ДО среза — иначе подбор гонялся бы за
+    # собственным хвостом: каждое сужение уменьшало бы и то, от чего берётся доля
+    assert freed.meta["guard_half_px"] == kept.meta["guard_half_px"]
+    # А граница ответственности двух ручек — сужается вместе с защитой
+    assert freed.meta["guard_reach_px"] < kept.meta["guard_reach_px"]
+
+
+def _lost_strand(stub):
+    """
+    Разметка, в которой локон на щеке не отнесён НИ К ЧЕМУ.
+
+    Третий, и худший, случай потерянной пряди. Первые два — прядь в классе волос,
+    спасённая защитой (её берёт `protect`/`core`), и прядь, отнесённая к классу
+    ЛИЦА (её берёт `guard`). Здесь же сегментатор не видит на этих пикселях
+    ничего: ни волос, ни лица, ни кожи, ни одежды. Так на 256x256 и пропадает
+    тонкий тёмный локон от виска к воротнику.
+
+    Причёска поэтому оставлена шапкой над лицом — без длинных прядей, чтобы класс
+    волос до щеки не доставал вовсе, — а сам локон в разметке отсутствует.
+    """
+    parsed = _parsed(hair_box=(110, 175, 130, 270), face_box=(160, 260, 160, 240))
+    stub(parsed=parsed)
+    return parsed
+
+
+def test_a_strand_the_parsing_does_not_see_at_all(image, stub):
+    """
+    Ровно то, что показал прогон со стиранием: локон вне маски целиком.
+
+    И, главное, второе — почему это не было видно в логах. `hair_left_px` меряет
+    остаток КЛАССА волос, а класс этой пряди не знает: ноль в нём прекрасно
+    уживается с локоном во всю щёку. Пока это не проверено, следующий такой
+    случай снова будут искать в редакторе.
+    """
+    _lost_strand(stub)
+
+    result = _build(image)
+
+    assert result.mask[270, 150] == 0, "полосы нет — маска до щеки не достаёт"
+    # Единицы пикселей — те самые «в пределах нормы», что были в логе живого
+    # прогона. Локон во всю щёку при этом висит нетронутым: метрика его не видит
+    assert result.meta["hair_left_px"] < 10, "и метрика остатка об этом молчит"
+
+
+def test_the_cheek_band_swallows_it(image, stub):
+    """
+    Единственное, чем такая прядь берётся: область, заданная геометрией.
+
+    Ничто из остальных чисел до неё не дотягивается по построению — и это
+    проверяется здесь же, вместе с самой полосой: расширять нечего (источника в
+    разметке нет), а `guard` и `core` только отпускают защиту, области не
+    добавляя.
+    """
+    _lost_strand(stub)
+
+    wider = _build(image, dilate_ratio=0.4)
+    freed = _build(image, guard_ratio=0.3, core_ratio=0.5)
+    band = _build(image, cheek_ratio=0.35)
+
+    assert wider.mask[270, 150] == 0, "вчетверо более широкая маска щеки не достаёт"
+    assert freed.mask[270, 150] == 0, "отпущенная защита области не добавляет"
+    assert band.mask[270, 150] == 255, "полоса вдоль щеки — достаёт"
+
+
+def test_the_cheek_band_outlives_the_face_guard(image, stub):
+    """
+    Полоса, не гасящая защиту, не работала бы вовсе: класс FACE растянут на всю
+    щёку, а защита вычитается ПОСЛЕ дилатации — на щеке маска умножилась бы на
+    ноль. Поэтому полоса гасит защиту наравне с настоящими волосами.
+
+    Точка взята вплотную к классу лица (он начинается с x=160), то есть там, где
+    поле защиты заведомо накрывает.
+    """
+    _lost_strand(stub)
+
+    result = _build(image, cheek_ratio=0.35, protect_ratio=0.05)
+
+    # Не ровно 255: точка стоит у самой внутренней кромки полосы, и туда
+    # дотягивается хвост размытия защиты. Нужен не ноль в защите, а вес, при
+    # котором вклейка берёт пиксель из генерации, — он здесь и есть
+    assert result.mask[230, 158] > 200, "полоса переживает защиту вплотную к лицу"
+    assert result.mask[230, 140] == 255, "а глубже в полосе защиты нет вовсе"
+
+
+def test_the_cheek_band_never_opens_the_face(image, stub):
+    """
+    Цена полосы — щёки и шея под диффузией; лицо в эту цену не входит ни при
+    каком её размере. Держат его два независимых обстоятельства, и проверяются
+    оба: ядро лица накладывается поверх всего, а сама полоса начинается снаружи
+    от внешних углов глаз и внутрь не заходит.
+    """
+    _lost_strand(stub)
+
+    huge = _build(image, cheek_ratio=2.0)
+
+    assert huge.mask[190, 170] <= 8 and huge.mask[190, 230] <= 8, "глаза защищены"
+    assert huge.mask[200, 200] == 0, "центр лица"
+    assert huge.mask[238, 200] == 0, "рот"
+
+
+def test_the_cheek_band_turns_with_the_head(image, stub, mesh):
+    """
+    Полоса живёт в осях головы, а не кадра, и по той же причине, что срез лба и
+    сужение защиты: у персонажа, склонившего голову набок, вертикальные полосы
+    прошли бы по щеке с одной стороны и по фону с другой.
+
+    Точка берётся не на глаз, а считается по той же геометрии: на щеке, ниже
+    подбородка и в стороне от оси.
+    """
+    points = mesh(centre=(200, 200), angle=25.0)
+    cap = _parsed(hair_box=(110, 175, 130, 270), face_box=(160, 260, 160, 240))
+    stub(points=points, parsed=cap)
+
+    geometry = head_mask.face_geometry(points)
+    chin, up, side = geometry["chin"], geometry["up"], geometry["side"]
+    spot = chin - up * (geometry["face_height"] * 0.1) + side * (geometry["face_width"] * 0.45)
+    column, row = int(round(spot[0])), int(round(spot[1]))
+
+    result = _build(image, cheek_ratio=0.35)
+
+    assert result.mask[row, column] == 255, "полоса повернулась вместе с головой"
+
+
+def test_the_cheek_band_reports_what_the_parsing_thought(image, stub):
+    """
+    Диагностика, которой не хватило и которая стоила прогона. Большая площадь
+    полосы при почти нулевом `cheek_hair_px` — это и есть «разметка волос тут не
+    видит», то есть подтверждение, что полоса здесь единственный способ. А
+    `cheek_open_px` заметно меньше `cheek_px` означал бы, что полосу съела
+    защита, и вот тогда крутить надо `guard`.
+    """
+    _lost_strand(stub)
+
+    off = _build(image).meta
+    on = _build(image, cheek_ratio=0.35).meta
+
+    assert off["cheek_px"] is None and off["cheek_open_px"] is None
+    assert on["cheek_ratio"] == 0.35
+    assert on["cheek_px"] > 0
+    assert on["cheek_hair_px"] < on["cheek_px"] * 0.05, "разметка волос тут не видит"
+    assert on["cheek_open_px"] > on["cheek_px"] * 0.5, "и защита полосу не съела"
+
+
+def test_the_leftover_hair_says_which_knob_holds_it(image, stub):
+    """
+    Остаток волос без места неинформативен: держат его либо суженная защита,
+    либо ядро, а крутить их надо в разные стороны. Ядро накладывается ПОСЛЕ
+    среза по ширине, поэтому дотягивается дальше него — по выносу остатка и
+    видно, кто виноват.
+
+    Прядь здесь лежит поверх глаза: это ровно то место, где ядро не уступает
+    волосам никогда, и единственный остаток, который считается нормой.
+    """
+    parsed = _parsed(hair_box=(110, 320, 130, 270), face_box=(160, 260, 160, 240))
+    parsed.hair[185:196, 165:176] = 255  # прядь на внешнем углу глаза
+    parsed.face = np.where(parsed.hair > 0, 0, parsed.face)
+    stub(parsed=parsed)
+
+    result = _build(image, protect_ratio=0.05, guard_ratio=0.6)
+
+    near, far = result.meta["hair_left_span_px"]
+    assert result.meta["hair_left_px"] > 0, "прядь поверх глаза ядро не отдаёт"
+    assert far > near >= 0
+    # Держит её ядро, а не защита: она лежит дальше, чем достаёт срезанная защита
+    assert far > result.meta["guard_reach_px"]
+
+
+def test_no_leftover_hair_means_no_place_to_report(image, stub):
+    """Пустой остаток — это None, а не [0, 0]: нуль здесь читался бы как «у оси»."""
+    stub()
+
+    result = _build(image, guard_ratio=0.6)
+
+    assert result.meta["hair_left_px"] == 0
+    assert result.meta["hair_left_span_px"] is None
+
+
+def test_the_forehead_can_be_handed_over_to_the_editor(image, stub):
+    """
+    Правка после третьего прогона: над бровями шёл рубец.
+
+    Пока лоб защищён целиком, нижняя граница маски проходит по открытой коже, а
+    вклейка геометрию не выравнивает — сдвинувшаяся генерация превращает эту
+    границу в ступеньку, и голова читается как накладка. Опущенная до бровей
+    маска отдаёт лоб редактору целиком: полосы старой кожи между лицом от
+    фейссвопа и новой причёской не остаётся.
+
+    Брови у заглушки на y=178, подбородок на y=260 (см. conftest).
+    """
+    stub()
+
+    seam = _build(image, forehead_ratio=0.0).mask
+    kept = _build(image, forehead_ratio=0.5).mask
+
+    assert seam[165, 200] == 255, "лоб отдан редактору"
+    assert kept[165, 200] == 0, "при умолчании лоб по-прежнему защищён"
+    # Ниже линии бровей защита работает одинаково: диффузии там делать нечего
+    assert seam[200, 200] == 0 and seam[238, 200] == 0
+
+
+def test_the_forehead_hand_over_is_counted(image, stub):
+    """
+    Ноль в мете при малом forehead_ratio означает, что линия бровей посчитана
+    мимо, и рубец останется на месте. Разбираться в этом по картинке дороже.
+    """
+    stub()
+
+    assert _build(image, forehead_ratio=0.0).meta["forehead_px"] > 0
+    assert _build(image, forehead_ratio=0.5).meta["forehead_px"] == 0
+
+
+def test_the_neighbour_on_the_spread_keeps_his_hair(image, stub):
+    """
+    Классы разметки приходят одним слоем на всех героев сразу. Перекрашивать
+    причёску второго персонажа мы не нанимались — отбор идёт по связности с
+    нашим лицом.
+    """
+    hair = np.zeros((_SIZE, _SIZE), dtype=np.uint8)
+    hair[110:320, 130:270] = 255  # наш персонаж
+    hair[110:200, 300:380] = 255  # сосед по развороту
+    parsed = _parsed(hair_box=None, face_box=(160, 260, 160, 240))
+    parsed.hair = hair
+
+    stub(parsed=parsed)
+
+    mask = _build(image).mask
+
+    assert mask[130, 200] == 255, "своя причёска открыта"
+    assert mask[150, 340] == 0, "чужая — нет"
+
+
+def test_without_parsing_the_ring_takes_over(image, stub, caplog):
+    """
+    Без весов разметки формы причёски мы не знаем. Кольцо «эллипс головы минус
+    лицо» — затычка, чтобы сервис не отказывал заказу целиком, и в логе она
+    обязана быть видна: длинные волосы такое кольцо не накроет.
+    """
+    stub(parsed=None)
+
+    result = _build(image)
+
+    assert result.meta["source"] == "ellipse"
+    assert result.mask[200, 200] == 0, "лицо защищено и на запасном пути"
+    assert any("кольцом" in record.message for record in caplog.records)
+
+
+def test_no_character_at_all_is_refused(image, monkeypatch):
+    """
+    Ни сетки, ни разметки — маску строить не из чего. 422 с подсказкой: перенос
+    одного лица работает и без локальной геометрии.
+    """
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: None)
+    monkeypatch.setattr(parsing, "parse", lambda _: None)
+
+    with pytest.raises(NoFaceDetectedError) as exc_info:
+        _build(image)
+
+    assert exc_info.value.status_code == 422
+    assert "face_swap" in exc_info.value.details["hint"]
+
+
+def test_protection_eating_the_whole_mask_is_refused(image, stub):
+    """
+    Защита с огромным полем гасит область целиком. Пустая маска означала бы
+    вклейку без единого изменённого пикселя — то есть заказ, прошедший два
+    вызова fal впустую.
+    """
+    stub()
+
+    with pytest.raises(NoFaceDetectedError):
+        _build(image, protect_ratio=10.0)
+
+
+def test_negative_ratios_are_refused(image, stub):
+    stub()
+
+    with pytest.raises(InvalidImageError):
+        _build(image, dilate_ratio=-0.1)
+
+
+def test_meta_explains_what_was_built(image, stub):
+    stub()
+
+    meta = _build(image).meta
+
+    assert meta["source"] == "parsing"
+    assert meta["landmarks"] is True and meta["parsing"] is True
+    assert meta["hair_px"] > 0
+    assert meta["protected_px"] > 0, "защита лица обязана что-то вычесть"
+    assert 0 < meta["open_share"] < 0.35

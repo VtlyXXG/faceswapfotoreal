@@ -42,8 +42,6 @@ async def readiness(response: Response) -> ReadinessResponse:
         missing.append("не установлен opencv")
     if not state["runtime"]["fal_client"]:
         missing.append("не установлен fal-client")
-    if not state["runtime"]["rembg"]:
-        missing.append("не установлен rembg — голову с волосами вырезать нечем")
     if not state["provider"]["key_present"]:
         missing.append(f"не задан {state['provider']['key_env']}")
     if state["provider"]["profile_error"]:
@@ -51,18 +49,26 @@ async def readiness(response: Response) -> ReadinessResponse:
         # потратит три загрузки в CDN и завернётся там же
         missing.append(state["provider"]["profile_error"])
 
+    if state["hair"]["active"] and not state["runtime"]["parsing_weights"]:
+        # Для маски ГОЛОВЫ отсутствие весов — снижение точности, для маски
+        # ВОЛОС — потеря задачи: форму причёски знает только разметка, а
+        # запасное кольцо вокруг лица до длинных волос попросту не дотянется
+        missing.append(
+            "нет весов разметки, а профиль правит причёску: форму волос определить нечем"
+        )
+
     ready = not missing
     response.status_code = 200 if ready else 503
 
-    # Незагруженные веса сегментатора в reason не попадают: их скачает первый
-    # же вызов, отказываться из-за этого от заказов незачем. Готовность к
-    # быстрому старту видна отдельным флагом collage.weights_ready.
+    # Отсутствие весов разметки в reason не попадает: без них маска головы
+    # строится эллипсом по сетке лица, то есть сервис работает — грубее, но
+    # работает. Видно это отдельным флагом runtime.parsing_weights.
     return ReadinessResponse(
         status="ready" if ready else "degraded",
         runtime=state["runtime"],
         provider=state["provider"],
         mask=state["mask"],
-        collage=state["collage"],
+        hair=state["hair"],
         expressions=state["expressions"],
         reason="; ".join(missing) or None,
     )

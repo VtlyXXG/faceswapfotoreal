@@ -2,15 +2,14 @@
 Общая заглушка сетки лица.
 
 mediapipe в тестах не запускается: он медленный, требует настоящего лица в
-кадре и проверяет совсем не то, что нам нужно. Все три модуля — сегментация,
-аппликация и маска — работают с одним и тем же списком из 468 точек, поэтому
-и заглушка одна на всех.
+кадре и проверяет совсем не то, что нам нужно. Модулю маски достаточно списка
+из 468 точек, и заглушка отдаёт именно его.
 """
 
 import numpy as np
 import pytest
 
-from app.pipelines import mask_generator
+from app.pipelines import head_mask
 
 # Канонические смещения относительно центра лица, до масштаба и поворота.
 # Высота лица (подбородок → переносица) равна 80, ширина (глаз → глаз, ×2) — 120.
@@ -49,13 +48,13 @@ def face_mesh(centre=(200, 200), scale=1.0, angle=0.0) -> list[tuple[int, int]]:
         points[index] = place(dx, dy)
 
     # Дуга челюсти — полуокружность от скулы через подбородок ко второй скуле
-    for offset, index in enumerate(mask_generator._JAW_ARC):
-        step = np.pi * offset / (len(mask_generator._JAW_ARC) - 1)
+    for offset, index in enumerate(head_mask._JAW_ARC):
+        step = np.pi * offset / (len(head_mask._JAW_ARC) - 1)
         points[index] = place(-50 * np.cos(step), 60 * np.sin(step))
 
     # Линия бровей
-    for offset, index in enumerate(mask_generator._BROW_ARC):
-        share = offset / (len(mask_generator._BROW_ARC) - 1)
+    for offset, index in enumerate(head_mask._BROW_ARC):
+        share = offset / (len(head_mask._BROW_ARC) - 1)
         points[index] = place(-34 + 68 * share, -22)
 
     return points

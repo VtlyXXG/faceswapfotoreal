@@ -37,18 +37,25 @@ def test_readiness_reports_provider():
 
     body = response.json()
     assert body["status"] in ("ready", "degraded")
-    assert set(body["runtime"]) == {"mediapipe", "opencv", "fal_client", "rembg"}
+    assert set(body["runtime"]) == {"mediapipe", "opencv", "fal_client", "parsing_weights"}
     assert body["provider"]["model"]
-    assert body["mask"]["detector"] == "mediapipe/face_mesh"
+    assert "face_mesh" in body["mask"]["detector"]
     # Второй шаг виден целиком: какой набор чисел активен, какой стратегией он
     # исполняется и что вообще доступно на выбор
     assert body["provider"]["profile"] and body["provider"]["strategy"]
     assert body["provider"]["profile_error"] is None, "профиль обязан собираться"
-    assert "seam" in body["provider"]["profiles"]
-    assert "identity_embedding" in body["provider"]["strategies"]
-    assert body["mask"]["gradient_ratio"] is not None
-    # Оба шага пайплайна видны снаружи: сегментатор с весами и список эмоций
-    assert body["collage"]["segmenter_photo"]
+    assert "pixar_real" in body["provider"]["profiles"]
+    assert {"face_swap", "kontext_multi"} <= set(body["provider"]["strategies"])
+    # Куда уезжает фотография заказчика — главный вопрос схемы
+    assert body["provider"]["identity_field"]
+    # И что вообще уедет в теле запроса. Эндпоинт заворачивает весь запрос из-за
+    # любого лишнего ключа, поэтому список сверяется целиком, а не на вхождение
+    assert body["provider"]["sends"] == ["base_image_url", "swap_image_url"]
+    # Рабочий путь локальной геометрии не требует: маска в блоке ниже описывает
+    # только то, чем она СТРОИЛАСЬ БЫ на диффузионных стратегиях
+    assert body["provider"]["needs_mask"] is False
+    assert body["mask"]["dilate_ratio"] is not None
+    assert body["mask"]["neck_ratio"] is not None
     assert "neutral" in body["expressions"]
 
     # degraded обязан объяснять причину, ready — не имеет её

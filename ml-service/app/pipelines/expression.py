@@ -1,31 +1,22 @@
 """
-Мимика донора: точка расширения пайплайна перед вклейкой.
+Мимика: указание модели, с каким выражением рисовать голову.
 
-Зачем это здесь. Обложка — не одна картинка, а разворот за разворотом, и на
-каждом из них сейчас оказывается одно и то же лицо с одной и той же
-фотографии. Лицо получается статичным: герой радуется, пугается и засыпает с
-неизменным выражением. Значит, в пайплайне должно быть место, где выражение
-меняется — по параметру, приходящему вместе с заказом.
+Что изменилось. Раньше мимика была геометрией: вырезанное лицо донора нужно
+было деформировать до переноса в шаблон, и делать это, не потеряв сходство,
+было нечем — отсюда заглушка и отказ на любой эмоции, кроме нейтральной.
 
-Место это ровно одно: сразу после вырезки головы и до переноса в шаблон.
-Раньше — нельзя, ещё нет вырезанного лица; позже — лицо уже вклеено, и любая
-правка мимики поедет вместе с фоном обложки.
+Теперь голова рисуется генеративно, и мимика стала текстом. Более того, **по
+умолчанию её задавать не нужно**: выражение, поворот и наклон головы берутся с
+шаблона — персонаж на развороте уже смеётся, спит или пугается, и задача
+модели это выражение сохранить, а не выдумать. Ровно поэтому у нейтрального
+значения пустой текст: любое указание мимики здесь спорит с картинкой.
 
-Здесь заложен интерфейс и заглушка, а не реализация. Причина не в экономии:
-любая переделка мимики — это изменение геометрии лица, то есть ровно то, от
-чего мы уходили, вводя жёсткий коллаж. Сначала нужен инструмент, сохраняющий
-личность (кандидаты: LivePortrait на fal, локальный варп по сетке mediapipe с
-ограничением смещений), и способ проверить, что заказчик остался узнаваем.
-До тех пор честнее отказать на неизвестной эмоции, чем молча вернуть
-неподвижное лицо: молчаливый отказ обнаружится уже на печати тиража.
+Значение остаётся ручкой на случай, когда выражение персонажа нужно
+переопределить — например, серия рисовалась под другой сценарий.
 
-Как добавить трансформер:
+Как добавить эмоцию:
 
-    class Smile:
-        name = "smile"
-        def apply(self, face: Face) -> Face: ...
-
-    expression.register(Smile())
+    expression.register(Expression("wink", "the child is winking with one eye"))
 
 После регистрации значение становится допустимым в параметре `emotion`
 эндпоинта `/face-swap` — больше ничего править не нужно.
@@ -33,21 +24,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from dataclasses import dataclass
 
 from app.core.errors import MLServiceError
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
 
-# Значение по умолчанию: лицо переносится как снято.
+# Значение по умолчанию: выражение лица берётся со сцены.
 NEUTRAL = "neutral"
 
 
 class ExpressionNotSupportedError(MLServiceError):
     """
-    Запрошена эмоция, для которой нет трансформера.
+    Запрошена эмоция, для которой нет описания.
 
     501, а не 400: запрос корректен, просто возможности пока нет. Разница
     существенная — по 400 вызывающая сторона чинит запрос, по 501 ждёт релиза.
@@ -57,73 +47,76 @@ class ExpressionNotSupportedError(MLServiceError):
     code = "EXPRESSION_NOT_SUPPORTED"
 
 
-@dataclass
-class Face:
+@dataclass(frozen=True)
+class Expression:
     """
-    Вырезанная голова донора — вход и выход любого трансформера.
+    Эмоция и её описание для промпта.
 
-    Идёт тройкой, потому что менять мимику, не трогая остальное, невозможно:
-    вслед за пикселями двигается и силуэт (открывшийся рот, поднявшаяся бровь),
-    и сетка, по которой лицо потом совмещается с шаблоном.
+    :param prompt: фраза на английском — язык промптов эндпоинта. Пусто
+        означает «ничего не указывать», то есть довериться шаблону
     """
-
-    image: Any  # BGR numpy.ndarray — кадр фотографии целиком
-    alpha: Any  # одноканальная маска головы того же размера
-    points: list[tuple[int, int]]  # сетка mediapipe в координатах кадра
-
-
-class ExpressionTransformer(Protocol):
-    """Контракт трансформера мимики."""
 
     name: str
-
-    def apply(self, face: Face) -> Face:
-        """Возвращает лицо с изменённым выражением, сохраняя личность."""
-        ...
+    prompt: str = ""
 
 
-class KeepAsIs:
-    """Нейтральное выражение — лицо переносится как снято на фотографии."""
-
-    name = NEUTRAL
-
-    def apply(self, face: Face) -> Face:
-        return replace(face)
+_REGISTRY: dict[str, Expression] = {}
 
 
-_REGISTRY: dict[str, ExpressionTransformer] = {}
-
-
-def register(transformer: ExpressionTransformer) -> None:
-    """Добавляет трансформер в реестр. Повторная регистрация имени — замена."""
-    _REGISTRY[transformer.name] = transformer
+def register(expression: Expression) -> None:
+    """Добавляет эмоцию в реестр. Повторная регистрация имени — замена."""
+    _REGISTRY[expression.name] = expression
 
 
 def available() -> list[str]:
     return sorted(_REGISTRY)
 
 
-def transform(face: Face, emotion: str = "") -> Face:
+def prompt(emotion: str = "") -> str:
     """
-    Применяет трансформер мимики к вырезанной голове.
+    Текст мимики для промпта.
 
     :param emotion: имя эмоции; пусто — то же, что `neutral`
-    :raises ExpressionNotSupportedError: если трансформера с таким именем нет
+    :raises ExpressionNotSupportedError: если эмоции с таким именем нет
     """
     # Сначала обрезка, потом умолчание: Node подставляет в форму пустую строку,
     # а из неё после strip() получается не «neutral», а несуществующее имя.
     name = (emotion or "").strip().lower() or NEUTRAL
 
-    transformer = _REGISTRY.get(name)
-    if transformer is None:
+    expression = _REGISTRY.get(name)
+    if expression is None:
         raise ExpressionNotSupportedError(
             f"Мимика «{name}» пока не поддерживается",
             {"emotion": name, "available": available()},
         )
 
-    if name != NEUTRAL:
-        log.info("применяется трансформер мимики", extra={"emotion": name})
-    return transformer.apply(face)
+    if expression.prompt:
+        log.info("мимика задана явно и перекроет выражение персонажа", extra={"emotion": name})
+    return expression.prompt
 
 
-register(KeepAsIs())
+register(Expression(NEUTRAL))
+register(
+    Expression(
+        "smile",
+        "override the expression: the child is smiling warmly, lips together, eyes bright",
+    )
+)
+register(
+    Expression(
+        "laugh",
+        "override the expression: the child is laughing, mouth open, cheeks raised",
+    )
+)
+register(
+    Expression(
+        "surprise",
+        "override the expression: the child looks surprised, eyes wide, eyebrows raised",
+    )
+)
+register(
+    Expression(
+        "calm",
+        "override the expression: the child looks calm and thoughtful, mouth relaxed",
+    )
+)

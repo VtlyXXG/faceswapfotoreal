@@ -1,44 +1,45 @@
 """
-Оркестрация замены лица: фото-аппликация локально → сведение стыка на fal.ai.
+Оркестрация замены лица: маска головы на шаблоне → генерация на fal.ai.
 
-Пайплайн из двух шагов, и порядок в нём принципиален:
+Пайплайн стал из двух шагов, и оба простые:
 
-  1. **Аппликация** (`collage.py`, локально: rembg + OpenCV + mediapipe).
-     Голова заказчика — лицо вместе с причёской — вырезается по силуэту
-     сегментатора и вклеивается в шаблон преобразованием подобия. Геометрия
-     переносится один в один, цвет и структура волос сохраняются.
-  2. **Стилизация** (`refine/`, на fal.ai). Коллаж уходит в инпейнтинг по
-     градиентной маске. Маска накрывает внешний контур волос, срез шеи и следы
-     стирания чужой причёски — лицо из неё вычтено явно, модель до него
-     физически не дотягивается.
+  1. **Локальная геометрия** (`head_mask.py`, `reference.py`) — маска головы
+     персонажа на ШАБЛОНЕ и поле вокруг фотографии заказчика. Нужна не всем:
+     диффузионным стратегиям без неё нечего отдать модели и некуда вернуть
+     ответ, а фейссвопу она только мешает — область он находит своим детектором,
+     а кайма вокруг фотографии сбивает поиск лица донора. Профиль отвечает на
+     это одним полем `needs_mask`, и весь шаг тогда пропускается целиком.
+  2. **Перенос лица** (`refine/`, на fal.ai). Шаблон и фотография уезжают одним
+     вызовом; чем именно и с какими ключами — решает стратегия из профиля.
 
-Оркестратор не знает, чем именно выполняется второй шаг. Он берёт профиль
-(`refine.profiles.from_settings()`), собирает по нему маску и отдаёт запрос в
-`refine.run` — а инпейнтинг там с ControlNet, проброс лицевых эмбеддингов или
-что-то третье, решает поле `strategy` в профиле. Ровно поэтому маска строится
-по тому же профилю: ширина её градиента и strength подбираются вместе, и
-разъехаться они не должны.
+Здесь не знают ни про fal, ни про схему запроса, ни про то, вернётся ли готовый
+кадр или его ещё придётся вклеивать. Смена подхода — это одно значение
+`strategy` в профиле, и ни строчки в этом файле.
 
-Прежние схемы и почему они не подошли: при strength 0.82 модель рисовала лицо
-заново по референсу и портретного сходства не давала; версия с переносом одного
-лишь овала лица сохраняла сходство, но оставляла заказчику причёску
-нарисованного персонажа.
+Чего здесь больше нет и почему. Прежняя схема вырезала голову заказчика по
+контуру челюсти, вклеивала её в шаблон преобразованием подобия и полудюжиной
+проходов инпейнтинга пыталась спрятать шов: фон, шея, фактура, стык, общая
+текстура, LAB-коррекция тона. На фотореалистичных шаблонах это провалилось
+целиком — «летающая голова», плоский свет и, главное, полная неспособность
+перенять мимику и поворот головы персонажа: аппликация переносит геометрию
+донора один в один, а на развороте герой смеётся вполоборота.
+
+Генеративный путь решает ровно это: поза и эмоция остаются от иллюстрации,
+потому что модель видит их в кадре, а личность приходит второй картинкой.
+Пикселей фотографии в результате нет ни одного — и сводить, соответственно,
+нечего.
 
 Контракт SwapRequest/SwapResult сохранён прежним: Node.js API получает те же
-бинарный ответ и заголовок X-Swap-Meta, что и раньше. Добавилось одно
-необязательное поле `emotion` — параметр будущей трансформации мимики.
+бинарный ответ и заголовок X-Swap-Meta, что и раньше.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
-
-from app.config import settings
 from app.core.logging import get_logger
-from app.pipelines import collage as collage_builder
-from app.pipelines import mask_generator, parsing, refine
+from app.pipelines import expression, head_mask, refine
+from app.pipelines import reference as reference_prep
 from app.utils.image import decode_image, encode_image
 
 log = get_logger(__name__)
@@ -57,11 +58,17 @@ def _sniff_mime(data: bytes) -> str:
 
 @dataclass
 class SwapRequest:
-    source: bytes
-    target: bytes
-    # Мимика вклеиваемого лица. Пусто — нейтральное выражение, то есть лицо как
-    # снято. Список доступных значений — expression.available().
+    source: bytes  # фотография заказчика — референс личности
+    target: bytes  # разворот книги, куда переносим
+    # Мимика. Пусто — выражение берётся с шаблона, и это умолчание: поза и
+    # эмоция персонажа уже нарисованы. Список значений — expression.available().
     emotion: str = ""
+    # Причёска заказчика словами: «короткий светлый ёжик». Читает это одна
+    # стратегия — двухшаговая, — и для неё это единственный источник того, что
+    # рисовать: фотография на шаг причёски не уезжает вовсе, иначе редактор
+    # рисует по ней второе лицо. Пусто — описание берётся из ML_HAIR_DESCRIPTION,
+    # а если пусто и там, заказ отклоняется до сети.
+    hair: str = ""
     target_face_index: int | None = None
     swap_all_faces: bool = False
     enhance: bool = False
@@ -79,142 +86,94 @@ class SwapResult:
     meta: dict = field(default_factory=dict)
 
 
-def run(request: SwapRequest) -> SwapResult:
-    # Шаг 1. Голова переносится локально: отсутствие лица в любом из двух
-    # кадров — 422 из детектора, с пометкой, какой именно кадр не подошёл.
-    target_image = decode_image(request.target)
-    source_image = decode_image(request.source)
+def _geometry(
+    request: SwapRequest, profile: refine.profiles.RefineProfile
+) -> tuple[head_mask.HeadMask | None, reference_prep.Reference]:
+    """
+    Шаг 1 целиком: маска головы персонажа и подготовленный референс.
 
-    collage = collage_builder.build(
-        source_image,
+    Оба вычисления существуют ради диффузии и вместе с ней и включаются.
+
+    Маска отвечает на вопрос «где модели можно рисовать» — а фейссвоп рисует не
+    по нашей указке и область находит сам. Поле вокруг фотографии лечит перенос
+    композиции у kontext: с портрета крупным планом голова выходит больше маски,
+    а квадратный кадр эндпоинт растягивает под разворот. Чужому детектору лица
+    ни то, ни другое не нужно — ему нужна чистая фотография.
+
+    :return: маска либо None, если профиль её не требует, и референс — он есть
+        всегда, разница лишь в том, тронут ли он подготовкой
+    """
+    if not profile.needs_mask:
+        log.info(
+            "локальная геометрия пропущена: стратегии не нужны ни маска, ни поле референса",
+            extra={"strategy": profile.strategy},
+        )
+        # pad_max=1.0 в профиле этой стратегии вернёт фотографию теми же
+        # байтами; проверка размеров ей не понадобится, поэтому и цели нет
+        return None, reference_prep.prepare(
+            request.source,
+            _sniff_mime(request.source),
+            target_share=None,
+            target_aspect=None,
+            pad_ratio=profile.reference_pad_ratio,
+            pad_max=profile.reference_pad_max,
+        )
+
+    # Отсутствие персонажа — 422 отсюда: ни детектор, ни разметка его не нашли
+    target_image = decode_image(request.target)
+    head = head_mask.build(
         target_image,
-        emotion=request.emotion,
-        model_photo=settings.seg_model_photo,
-        model_cover=settings.seg_model_cover,
-        width_ratio=settings.head_width_ratio,
-        hair_ratio=settings.head_hair_ratio,
-        neck_ratio=settings.head_neck_ratio,
-        erode_ratio=settings.head_erode_ratio,
-        scale_mark=settings.head_scale_mark,
-        scale_multiplier=settings.head_scale_multiplier,
-        take_neck=settings.head_take_neck,
-        anchor_neck=settings.head_anchor_neck,
-        feather_ratio=settings.collage_feather_ratio,
-        colour_match=settings.collage_colour_match,
-        colour_direction=settings.collage_colour_direction,
-        body_reach=settings.collage_body_reach,
-        erase_template_head=settings.collage_erase_template_head,
-        erase_method=settings.collage_erase_method,
-        erase_neck_ratio=settings.collage_erase_neck_ratio,
-        erase_pad_ratio=settings.collage_erase_pad_ratio,
+        dilate_ratio=profile.mask.dilate_ratio,
+        feather_ratio=profile.mask.feather_ratio,
+        neck_ratio=profile.mask.neck_ratio,
     )
 
+    # Референс равняется на шаблон и по масштабу, и по пропорции. Считается
+    # здесь, потому что здесь известна вторая половина обоих отношений — высота
+    # лица ПЕРСОНАЖА и размер шаблона.
+    target_height, target_width = target_image.shape[:2]
+    return head, reference_prep.prepare(
+        request.source,
+        _sniff_mime(request.source),
+        target_share=head.face_height / float(target_height),
+        target_aspect=target_width / float(target_height),
+        pad_ratio=profile.reference_pad_ratio,
+        pad_max=profile.reference_pad_max,
+    )
+
+
+def run(request: SwapRequest) -> SwapResult:
     # Все гиперпараметры второго шага приходят одним набором — профилем. Здесь
-    # он берётся один раз и передаётся дальше целиком: и маска, и стратегия
-    # обязаны собираться из одних и тех же чисел, иначе градиент маски и
-    # strength разъезжаются молча.
+    # он берётся один раз и передаётся дальше целиком: и маска, и запрос
+    # обязаны собираться из одних и тех же чисел. Ширина растушёвки маски и
+    # strength подбираются вместе, и разъехаться они не должны.
     profile = refine.profiles.from_settings()
 
-    shape = target_image.shape[:2]
-    # Доли масок меряются от ВКЛЕЕННОГО лица, а не от лица персонажа: маски
-    # описывают стык вокруг вклейки. При ML_HEAD_SCALE_MULTIPLIER < 1 голова
-    # меньше персонажной, и кольца, посчитанные от неё, были бы шире нужного —
-    # ровно там, где потом виден грязный контур.
-    face_height = collage.meta["face_height_paste"]
+    # Мимика проверяется до сети: неизвестная эмоция — 501, и узнать об этом
+    # лучше здесь, чем после трёх загрузок в CDN
+    emotion_prompt = expression.prompt(request.emotion)
 
-    # Зона 2 — стыки: узкое кольцо по контуру новых волос и узкая полоса там,
-    # где шея донора входит в тело персонажа. Лицо вычитается внутри.
-    seam = mask_generator.seam_mask(
-        shape,
-        collage.head_alpha,
-        collage.face_polygon,
-        collage.neck_line,
-        face_height,
-        edge_ratio=profile.mask.edge_ratio,
-        neck_ratio=profile.mask.neck_ratio,
-        guard_ratio=profile.mask.guard_ratio,
-        feather_ratio=profile.mask.feather_ratio,
-        gradient_ratio=profile.mask.gradient_ratio,
-        edge_outer_ratio=profile.mask.edge_outer_ratio,
-    )
-    masks = {"seam": encode_image(seam, "png")[0]}
+    # Шаг 1. Локальная геометрия — маска на шаблоне и поле вокруг фотографии.
+    # Нужна не всем: у фейссвопа своя область и свой детектор, и оба наших
+    # вычисления ему только мешают. Три секунды на 4K и лишний повод отказать
+    # заказу (`NoFaceDetectedError` от нашего детектора) — не та цена, которую
+    # стоит платить за неиспользуемое число.
+    head, reference = _geometry(request, profile)
 
-    # Зона 6 — шея и открытая грудь персонажа: их модель рисует заново под
-    # подбородок вклейки. Границы даёт семантическая разметка; по цвету кожу от
-    # бежевого воротника не отличить, замерено.
-    if profile.neck is not None:
-        parsed = parsing.parse(target_image)
-        neck = mask_generator.neck_mask(
-            shape,
-            collage.head_alpha,
-            collage.face_polygon,
-            collage.meta["paste_chin"],
-            collage.meta["target_axis"],
-            face_height,
-            body_skin=None if parsed is None else parsed.skin,
-            guard_ratio=profile.mask.guard_ratio,
-        )
-        if (neck > 127).any():
-            masks["neck"] = encode_image(neck, "png")[0]
-
-    # Зона 4 — сама вклейка: перевод фотографии в живопись. Тон подогнать можно
-    # цветокоррекцией, мазок кисти — нет, это структура, а не цвет.
-    if profile.stylise is not None:
-        paste = mask_generator.paste_mask(
-            shape,
-            collage.head_alpha,
-            collage.face_polygon,
-            face_height,
-            guard_ratio=profile.mask.guard_ratio,
-            guard_strength=profile.mask.paste_guard_strength,
-            inset_ratio=profile.mask.paste_inset_ratio,
-        )
-        if (paste > 127).any():
-            masks["paste"] = encode_image(paste, "png")[0]
-
-    # Зона 3 — дыра в фоне на месте чужой причёски. Отдельным проходом и на
-    # высоком strength: заливка оставляет там мыло, и сводить его с чем-либо
-    # бессмысленно, фон нужно рисовать заново.
-    if profile.background is not None:
-        hole = mask_generator.hole_mask(
-            shape,
-            collage.head_alpha,
-            collage.face_polygon,
-            collage.erased,
-            face_height,
-            margin_ratio=profile.mask.hole_margin_ratio,
-            feather_ratio=profile.mask.hole_feather_ratio,
-            guard_ratio=profile.mask.guard_ratio,
-        )
-        # Мелкая дыра второго вызова не стоит: у героя со стрижкой её почти нет
-        share = float((hole > 127).sum()) / float(shape[0] * shape[1])
-        if share >= profile.background.min_area_ratio:
-            masks["background"] = encode_image(hole, "png")[0]
-        else:
-            log.info("зона фона пропущена: дыра мала", extra={"hole_share": round(share, 5)})
-
-    # Финальный проход идёт по всему кадру: маска сплошная. Эндпоинт всё равно
-    # инпейнтинговый и без mask_url не работает, поэтому «без маски» здесь
-    # выражается белым полем.
-    if profile.unify is not None:
-        masks["unify"] = encode_image(np.full(shape, 255, dtype=np.uint8), "png")[0]
-
-    # PNG, а не JPEG: коллаж — это оригинальные пиксели фотографии, и терять их
-    # на артефактах сжатия перед единственным шагом, который их сохраняет,
-    # бессмысленно.
-    collage_png, collage_mime = encode_image(collage.image, "png")
-
-    # Шаг 2. Референсом остаётся исходное фото: оно подсказывает модели, чьё
-    # лицо она обводит. Коллаж уезжает и массивом тоже — по нему стратегия
-    # строит карты управления, а декодировать PNG второй раз незачем.
+    # Шаг 2. Шаблон уходит теми же байтами, что пришли: перекодировать его
+    # незачем — мы в нём ничего не меняли, а 4K-разворот на пережатии теряет
+    # ровно ту фактуру, которую модель просят повторить.
+    mask_png, mask_mime = encode_image(head.mask, "png") if head else (b"", "image/png")
     result = refine.run(
         refine.RefineRequest(
-            collage=collage_png,
-            collage_mime=collage_mime,
-            reference=request.source,
-            reference_mime=_sniff_mime(request.source),
-            masks=masks,
-            collage_image=collage.image,
+            target=request.target,
+            target_mime=_sniff_mime(request.target),
+            mask=mask_png,
+            mask_mime=mask_mime,
+            identity=reference.data,
+            identity_mime=reference.mime,
+            expression=emotion_prompt,
+            hair=request.hair,
             output_format=request.output_format,
         ),
         profile,
@@ -224,25 +183,36 @@ def run(request: SwapRequest) -> SwapResult:
     mime_type = call_meta.pop("mime_type", "image/png")
 
     log.info(
-        "замена лица выполнена: коллаж + стилизация на fal",
-        extra={"model": call_meta.get("model"), "bytes": len(image), **collage.meta},
+        "замена лица выполнена",
+        extra={
+            "model": call_meta.get("model"),
+            "strategy": profile.strategy,
+            "bytes": len(image),
+            **(head.meta if head else {}),
+        },
     )
 
-    # Перерисовывается ровно одно лицо — крупнейшее найденное, — поэтому
-    # счётчики всегда 1: поля сохранены ради неизменного формата X-Swap-Meta.
+    # Перерисовывается ровно одна голова — та, что нашлась на шаблоне, —
+    # поэтому счётчики всегда 1: поля сохранены ради неизменного формата
+    # X-Swap-Meta.
     return SwapResult(
         image=image,
         mime_type=mime_type,
         faces_detected=1,
         faces_swapped=1,
-        meta={**call_meta, "collage": collage.meta},
+        meta={
+            **call_meta,
+            "mask": head.meta if head else None,
+            "reference": reference.meta,
+            "emotion": request.emotion or expression.NEUTRAL,
+        },
     )
 
 
 def analyse(image_bytes: bytes) -> list[dict]:
     """Только детекция — используется Node.js API для предпросмотра."""
     image = decode_image(image_bytes)
-    points = mask_generator.face_landmarks(image)
+    points = head_mask.face_landmarks(image)
 
     xs = [x for x, _ in points]
     ys = [y for _, y in points]

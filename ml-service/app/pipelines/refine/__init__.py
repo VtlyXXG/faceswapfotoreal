@@ -1,14 +1,24 @@
 """
-Шаг 2: стилизация готового коллажа.
+Шаг 2: генерация головы на шаблоне по референсу личности.
 
 Пакет собран из трёх слоёв, и разделение между ними — главное, что тут есть:
 
-  profiles.py  — числа. Strength, пороги Canny, веса ControlNet, доли маски,
-                 идентификаторы эндпоинтов, промпты. Ни одного вызова.
+  profiles.py  — числа и тексты. Strength, доли маски, схемы запросов,
+                 идентификаторы эндпоинтов, промпты стилей. Ни одного вызова.
   base.py      — контракт: что стратегия получает, что возвращает, и реестр,
                  через который она находится по имени из профиля.
-  стратегии    — inpaint_controlnet.py (работает) и identity_embedding.py
-                 (контракт под проброс лицевых эмбеддингов, 501).
+  стратегии    — fal_face_swap.py: специализированный фейссвоп, без промпта,
+                 без маски и без локальной вклейки (рабочая);
+                 hair_swap.py: два вызова — редактор правит одну причёску, затем
+                 та же стратегия face_swap переносит лицо. Нужна там, где
+                 причёска донора отличается от нарисованной: фейссвоп волос не
+                 касается вовсе;
+                 kontext_multi.py: редактор по двум картинкам плюс вклейка
+                 головы. Эндпоинт у неё переключаемый: kontext провалился, но
+                 схема та же у nano-banana, seedream и hy-wu — это запасной
+                 путь для стилизованных шаблонов;
+                 identity_inpaint.py: генерация внутри маски по фото-референсу
+                 (маска лишает модель контекста, провалилась).
 
 Снаружи нужны ровно две вещи:
 
@@ -21,12 +31,13 @@
 
 from __future__ import annotations
 
-# Импорт ради регистрации: модули стратегий вызывают register() при загрузке.
-from app.pipelines.refine import identity_embedding as _identity_embedding  # noqa: E402,F401
-from app.pipelines.refine import inpaint_controlnet as _inpaint_controlnet  # noqa: E402,F401
+# Импорт ради регистрации: модуль стратегии вызывает register() при загрузке.
+from app.pipelines.refine import fal_face_swap as _fal_face_swap  # noqa: E402,F401
+from app.pipelines.refine import hair_swap as _hair_swap  # noqa: E402,F401
+from app.pipelines.refine import identity_inpaint as _identity_inpaint  # noqa: E402,F401
+from app.pipelines.refine import kontext_multi as _kontext_multi  # noqa: E402,F401
 from app.pipelines.refine import profiles
 from app.pipelines.refine.base import (
-    Identity,
     Refiner,
     RefineRequest,
     RefineResult,
@@ -38,7 +49,6 @@ from app.pipelines.refine.base import (
 )
 
 __all__ = [
-    "Identity",
     "RefineRequest",
     "RefineResult",
     "Refiner",

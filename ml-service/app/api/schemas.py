@@ -30,17 +30,19 @@ class RuntimeStatus(BaseModel):
     mediapipe: bool
     opencv: bool
     fal_client: bool
-    rembg: bool
+    # Веса семантической разметки (~16 МБ). Их отсутствие не отказ: маска
+    # головы строится эллипсом по сетке лица — грубее, но рабоче
+    parsing_weights: bool
 
 
 class ProviderStatus(BaseModel):
     """
     Второй шаг: чем и с какими числами он выполняется.
 
-    Числовые поля необязательны, потому что профиль может не собраться —
-    например, если в окружении включили ControlNet при эндпоинте, который его не
-    принимает. Тогда вместо чисел приходит profile_error, и это ровно то, что
-    нужно видеть в /health/ready.
+    Поля необязательны, потому что профиль может не собраться — например, если
+    в окружении задана несуществующая схема запроса или стиль. Тогда вместо
+    чисел приходит profile_error, и это ровно то, что нужно видеть в
+    /health/ready.
     """
 
     model: str | None = Field(default=None, description="Идентификатор эндпоинта")
@@ -49,31 +51,74 @@ class ProviderStatus(BaseModel):
     # Главная ручка пайплайна: подбирается из окружения на живом сервисе
     strength: float | None = None
     profile: str = Field(description="Имя набора гиперпараметров")
-    strategy: str | None = Field(default=None, description="Подход: инпейнтинг, эмбеддинги, …")
-    controls: list[str] = Field(default_factory=list, description="Карты ControlNet и их веса")
+    strategy: str | None = Field(default=None, description="Подход к генерации")
+    payload: str | None = Field(default=None, description="Семейство схемы запроса")
+    style: str | None = Field(default=None, description="Стиль сцены в промпте")
+    identity_field: str | None = Field(
+        default=None,
+        description="Где эндпоинт ждёт референс: отдельное поле либо массив картинок",
+    )
+    identity_scale: float | None = None
+    # Что схема реально положит в тело запроса. Первое, на что смотрят при 422:
+    # лишний ключ эндпоинт не игнорирует, а заворачивает весь запрос
+    sends: list[str] = Field(default_factory=list, description="Ключи тела запроса")
+    needs_mask: bool | None = Field(
+        default=None, description="Строится ли маска головы: фейссвопу она не нужна"
+    )
     profile_error: str | None = Field(default=None, description="Почему профиль не собрался")
     profiles: list[str] = Field(default_factory=list)
     strategies: list[str] = Field(default_factory=list)
+    styles: list[str] = Field(default_factory=list)
 
 
 class MaskStatus(BaseModel):
+    """Маска головы на шаблоне: чем строится и с какими допусками."""
+
     detector: str
-    # Доли высоты лица: кольцо вдоль контура волос, полоса на срезе шеи,
-    # защита лица, общий спад по краям зоны и ширина градиента
-    edge_ratio: float | None = None
-    neck_ratio: float | None = None
-    guard_ratio: float | None = None
+    parsing_model: str = Field(description="Где сервис ищет веса разметки")
+    # Доли высоты лица персонажа: расширение за контур головы, растушёвка
+    # краёв и глубина захвата шеи под подбородком
+    dilate_ratio: float | None = None
     feather_ratio: float | None = None
-    gradient_ratio: float | None = None
+    neck_ratio: float | None = None
 
 
-class CollageStatus(BaseModel):
-    segmenter_photo: str
-    segmenter_cover: str
-    # Скачаны ли веса сегментатора: иначе первый заказ ждёт ~176 МБ на модель
-    weights_ready: bool
-    colour_match: float
-    erase_template_head: bool
+class HairStatus(BaseModel):
+    """
+    Шаг причёски: первый из двух вызовов двухшаговой стратегии.
+
+    Работает не всегда — только когда выбран профиль с ней. Поэтому `active`
+    отдельным полем: числа в блоке есть всегда, а смысл они имеют лишь при
+    active=true.
+    """
+
+    active: bool = Field(description="Идёт ли правка причёски перед заменой лица")
+    endpoint: str | None = Field(default=None, description="Редактор по двум картинкам")
+    payload: str | None = None
+    description: str = Field(
+        default="",
+        description=(
+            "Причёска словами, из окружения. Единственный источник для первого "
+            "шага: фотография заказчика туда не уезжает"
+        ),
+    )
+    # Доли высоты лица: расширение за контур волос, растушёвка края вклейки и
+    # поле защиты вокруг лица
+    dilate_ratio: float | None = None
+    feather_ratio: float | None = None
+    protect_ratio: float | None = None
+    # Докуда маска спускается по лбу, в долях высоты лица над бровями: 0 — до
+    # самых бровей, и тогда рубца на лбу нет вовсе
+    forehead_ratio: float | None = None
+    # Сжатие ядра лица поперёк его оси: меньше единицы — сильнее открыты виски
+    # и скулы, где застревают пряди старой причёски
+    core_ratio: float | None = None
+    # Поле вокруг маски волос: редактору уезжает окно с головой, а не разворот
+    # целиком — иначе причёска занимает проценты кадра и стричь там нечего
+    crop_ratio: float | None = None
+    min_changed: float | None = Field(
+        default=None, description="Порог «правка состоялась», уровни 0..255"
+    )
 
 
 class ReadinessResponse(BaseModel):
@@ -81,7 +126,7 @@ class ReadinessResponse(BaseModel):
     runtime: RuntimeStatus
     provider: ProviderStatus
     mask: MaskStatus
-    collage: CollageStatus
+    hair: HairStatus
     expressions: list[str] = Field(description="Допустимые значения параметра emotion")
     reason: str | None = Field(default=None, description="Почему degraded")
 

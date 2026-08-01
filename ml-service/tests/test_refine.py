@@ -5,10 +5,15 @@
 
   * **профиль** — числа и их связность. Несобираемая связка обязана падать до
     сети, а не после трёх загрузок в CDN;
-  * **реестр** — что подход переключается именем, а не правкой pipeline.py.
-    Ради этого вся конструкция и затевалась;
+  * **реестр** — что подход переключается именем, а не правкой pipeline.py;
   * **схема запроса** — что уезжает в fal. Фиксируется тестами намеренно: на
     ней уже обжигались вживую, лишний ключ заворачивает весь запрос.
+
+Про рабочий путь. Он безмасочный: эндпоинт получает массив из шаблона и
+фотографии и перерисовывает кадр целиком, а голова возвращается в шаблон
+локально. Поэтому здесь же проверяется отсутствие ключей — mask_url, strength и
+num_inference_steps kontext/max/multi не принимает, и каждый из них означает 422
+на весь запрос.
 """
 
 from dataclasses import replace
@@ -16,10 +21,21 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from app.core.errors import InvalidImageError
-from app.pipelines import fal_api, refine
-from app.pipelines.refine import controls as control_maps
-from app.pipelines.refine import profiles
+from app.core.errors import InvalidImageError, NoFaceDetectedError
+from app.pipelines import fal_api, hair_mask, refine
+from app.pipelines.refine import hair_swap, profiles
+from app.utils.image import decode_image, encode_image
+
+# Картинки настоящие, а не заглушки из байтов: безмасочная стратегия декодирует
+# и шаблон, и маску, и ответ модели — вклейка идёт локально.
+_TEMPLATE = np.full((32, 32, 3), 200, dtype=np.uint8)
+_GENERATED = np.full((32, 32, 3), 40, dtype=np.uint8)
+_MASK = np.zeros((32, 32), dtype=np.uint8)
+_MASK[8:24, 8:24] = 255
+
+_TEMPLATE_PNG = encode_image(_TEMPLATE, "png")[0]
+_MASK_PNG = encode_image(_MASK, "png")[0]
+_GENERATED_PNG = encode_image(_GENERATED, "png")[0]
 
 
 class _FakeClient:
@@ -37,6 +53,11 @@ class _FakeClient:
         self.model = model
         self.arguments = arguments
         self.calls.append(arguments)
+        if "swap_image_url" in arguments:
+            # Фейссвоп отдаёт одиночный `image`, а не список: вариант у него
+            # ровно один. Форма ответа — часть контракта, и подменять её общей
+            # заглушкой значит не проверить разбор вовсе
+            return {"image": {"url": f"https://cdn/out{len(self.calls)}.png"}, "seed": 7}
         return {"images": [{"url": f"https://cdn/out{len(self.calls)}.png"}], "seed": 7}
 
 
@@ -44,180 +65,229 @@ class _FakeClient:
 def client(monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(fal_api, "client", lambda: fake)
-    monkeypatch.setattr(fal_api, "_download", lambda image: b"PNGDATA")
+    monkeypatch.setattr(fal_api, "_download", lambda image: _GENERATED_PNG)
     return fake
 
 
-@pytest.fixture
-def collage() -> np.ndarray:
-    """Коллаж с контрастной границей — иначе Canny нечего находить."""
-    image = np.full((64, 64, 3), 40, dtype=np.uint8)
-    image[16:48, 16:48] = 220
-    return image
-
-
-def _request(collage_image=None, masks=None, **overrides) -> refine.RefineRequest:
+def _request(**overrides) -> refine.RefineRequest:
     kwargs = {
-        "collage": b"collage-bytes",
-        "collage_mime": "image/png",
-        "reference": b"source-bytes",
-        "reference_mime": "image/jpeg",
-        "masks": {"seam": b"seam-mask"} if masks is None else masks,
-        "collage_image": collage_image,
+        "target": _TEMPLATE_PNG,
+        "target_mime": "image/png",
+        "mask": _MASK_PNG,
+        "identity": b"photo-bytes",
+        "identity_mime": "image/jpeg",
     }
     kwargs.update(overrides)
     return refine.RefineRequest(**kwargs)
 
 
-def _seam_only() -> profiles.RefineProfile:
-    """Профиль без прохода по фону: один вызов, как было до трёх зон."""
-    return replace(profiles.get("blend"), background=None)
+def _profile() -> profiles.RefineProfile:
+    """Рабочий профиль: специализированный фейссвоп."""
+    return profiles.get("pixar_real")
 
 
-def _controlnet_profile() -> profiles.RefineProfile:
-    """Профиль с картами и эндпоинтом, который их принимает."""
-    return replace(profiles.get("stylise_controlnet"), endpoint="fal-ai/with-controlnet")
+def _with(strategy: str) -> profiles.RefineProfile:
+    """
+    Тот же профиль, переведённый на другую стратегию её же умолчаниями.
+
+    Ровно то, что делает `ML_REFINE_STRATEGY`: подход приносит с собой эндпоинт,
+    схему, инструкцию и признак локальной геометрии.
+    """
+    defaults = profiles.strategy_defaults(strategy)
+    return replace(
+        _profile(),
+        strategy=strategy,
+        endpoint=defaults.endpoint,
+        payload=defaults.payload,
+        instruction=defaults.instruction,
+        needs_mask=defaults.needs_mask,
+    )
+
+
+def _multi() -> profiles.RefineProfile:
+    """Безмасочная диффузия по кадру целиком плюс локальная вклейка."""
+    return _with("kontext_multi")
+
+
+def _inpaint() -> profiles.RefineProfile:
+    """Прежний масочный путь — он остался под живописной серией."""
+    return profiles.get("impasto")
 
 
 # --- Профили: числа и их связность ---
 
 
-def test_presets_cover_every_regime():
+def test_presets_cover_both_series():
+    """Две серии книг — два стиля."""
+    assert {"pixar_real", "impasto"} <= set(profiles.available())
+
+    assert profiles.get("impasto").style == "impasto"
+    assert profiles.get("pixar_real").style == "pixar_real"
+
+
+def test_default_profile_is_a_face_swap_without_diffusion():
     """
-    Консервативный режим не выброшен, а лежит рядом: если рабочий окажется
-    слишком вольным, откат — это смена имени профиля, а не ревёрт.
+    Смена парадигмы. Обе диффузионные стратегии провалились: инпейнт — на
+    отсутствии контекста внутри маски, безмасочный img2img — на том, что общая
+    модель не умеет хирургической замены по тексту. Рабочий путь лицо не рисует.
     """
-    assert {"seam", "blend", "stylise", "stylise_controlnet"} <= set(profiles.available())
+    profile = _profile()
 
-    assert profiles.get("seam").strength == 0.20
-    assert profiles.get("seam").mask.gradient_ratio == 0.0, "плато, как было"
+    assert profile.strategy == "face_swap"
+    assert profile.endpoint == "fal-ai/face-swap"
+    assert profile.payload.prompt_field is None, "эндпоинт текста не читает"
+    assert profile.payload.mask_field is None
+    assert profile.needs_mask is False, "область эндпоинт находит сам"
 
 
-def test_default_profile_blends_the_seam_without_risking_the_hair():
+def test_maskless_diffusion_stays_available_for_comparison():
     """
-    Связка, ради которой профиль и заведён: градиентная маска сводит шею и
-    контур волос мягко, а strength остаётся в безопасном диапазоне 0.25-0.28 —
-    выше контур причёски плывёт, и без карт ControlNet удержать его нечем.
+    Провал воспроизводится одной переменной окружения. Спорить о результате
+    дешевле, глядя на два файла, чем на память.
     """
-    blend = profiles.get("blend")
+    profile = _multi()
 
-    assert 0.25 <= blend.strength <= 0.28
-    assert blend.mask.gradient_ratio > 0, "градиент — половина смысла профиля"
-    # Предупреждение начинается за верхней границей диапазона, а не внутри
-    assert blend.safe_strength >= blend.strength
-    assert blend.safe_strength <= 0.28
+    assert profile.endpoint == "fal-ai/flux-pro/kontext/max/multi"
+    assert profile.payload.images_field == "image_urls"
+    assert profile.payload.mask_field is None, "эндпоинт маску не принимает"
 
 
-def test_default_profile_stays_on_the_working_endpoint():
+def test_strength_sits_high_because_there_is_nothing_to_preserve():
     """
-    На kontext-inpaint висит наша LoRA, и стиль обложек держится на ней. Уход с
-    этого эндпоинта ради ControlNet стоил бы стиля — карт в дефолте нет
-    осознанно, и вернуть их сюда молча не должно получиться.
+    Про масочный путь: там под маской лежит чужой персонаж, и слабая генерация
+    оставит от него черты — получится смесь двух лиц. На безмасочном пути
+    strength в запрос не уходит вовсе, и число сохранено только ради него.
     """
-    blend = profiles.get("blend")
+    profile = _inpaint()
 
-    assert blend.endpoint == "fal-ai/flux-kontext-lora/inpaint"
-    assert blend.controls == ()
+    assert profile.strength >= 0.85
+    # Предупреждение уходит, когда сила падает НИЖЕ порога, а не поднимается
+    assert profile.safe_strength <= profile.strength
 
 
-def test_stylise_sits_in_the_high_band():
+def test_prompt_addresses_the_images_by_order_and_demands_a_photograph():
     """
-    Режим настоящей стилизации остался доступен: на 0.5 модель перерисовывает
-    открытое маской. Дефолтом он не выбран — без карт на такой силе плывёт
-    контур причёски.
+    Маски у модели нет, поэтому область названа порядком картинок: первая —
+    сцена, вторая — личность. Перепутать их местами значит перерисовать
+    фотографию заказчика по мотивам разворота, причём молча.
+
+    Фотореализм требуется словами и подпирается отрицаниями: на иллюстрации
+    kontext охотно продолжает её материал и отдаёт нарисованное лицо.
     """
-    stylise = profiles.get("stylise")
+    prompt = _multi().prompt().lower()
 
-    assert 0.45 <= stylise.strength <= 0.55
-    assert stylise.mask.gradient_ratio > 0, "на такой силе плато даёт ступеньку"
-    assert stylise.safe_strength >= stylise.strength
+    assert "first image" in prompt and "second image" in prompt
+    assert "real photograph of a real child" in prompt
+    assert "no painting" in prompt and "no brush strokes" in prompt
+    # Поза и мимика — со сцены, черты — с фотографии. Ради этого разделения всё
+    assert "keep the facial expression" in prompt
+    assert "identity" in prompt
 
 
-def test_controlnet_profile_carries_canny_and_depth():
-    controls = {control.kind: control for control in profiles.get("stylise_controlnet").controls}
+def test_masked_path_keeps_its_own_instruction():
+    """
+    Инструкция — часть стратегии, а не стиля: масочный путь адресует область
+    («inside the mask»), безмасочный — картинки по порядку. Один текст на оба
+    означает, что одна из стратегий говорит модели неправду.
+    """
+    prompt = _inpaint().prompt().lower()
 
-    assert set(controls) == {"canny", "depth"}
-    assert controls["canny"].source == "canny", "контур считается локально"
-    assert controls["depth"].source == "image", "карту глубины считает эндпоинт"
-    # Тени берутся в начале денойза, когда решается крупная форма
-    assert controls["depth"].end <= controls["canny"].end
+    assert "inside the mask" in prompt
+    assert "take the identity from the reference" in prompt
+    assert "first image" not in prompt
+
+
+def test_expression_is_woven_into_the_prompt():
+    prompt = _multi().prompt("override the expression: the child is laughing")
+
+    assert "laughing" in prompt
 
 
 @pytest.mark.parametrize(
     "changes",
-    [
-        {"strength": 1.5},
-        {"steps": 0},
-        {"endpoint": ""},
-        {"control_field": ""},
-    ],
+    [{"strength": 1.5}, {"steps": 0}, {"endpoint": ""}, {"style": "не-существует"}],
 )
 def test_broken_profile_is_refused_before_the_network(changes):
     """
-    Профиль проверяется до сети. Иначе неверная связка стоит трёх загрузок в
+    Профиль проверяется до сети. Иначе неверная связка стоит двух загрузок в
     CDN и отказа fal — с текстом, по которому ничего не понять.
     """
     with pytest.raises(InvalidImageError):
-        replace(_controlnet_profile(), **changes).validate()
+        replace(_profile(), **changes).validate()
 
 
-def test_controlnet_on_an_endpoint_without_controlnet_is_refused():
-    """
-    Главная ловушка новой схемы: карты выглядят безобидной добавкой, но
-    kontext-inpaint лишний ключ не игнорирует, а заворачивает весь запрос.
-    Поймать это должен профиль, а не боевой прогон.
-    """
-    broken = replace(
-        profiles.get("stylise_controlnet"), endpoint="fal-ai/flux-kontext-lora/inpaint"
-    )
-
-    with pytest.raises(InvalidImageError) as exc_info:
-        broken.validate()
-
-    assert "ControlNet" in exc_info.value.message
-
-
-def test_default_profile_builds(monkeypatch):
+def test_default_profile_builds():
     """Профиль по умолчанию обязан собираться без единой переменной окружения."""
-    assert profiles.from_settings().report()["profile"] == "blend"
+    assert profiles.from_settings().report()["profile"] in profiles.available()
 
 
 def test_environment_overrides_the_preset(monkeypatch):
-    monkeypatch.setattr(profiles.settings, "refine_profile", "seam")
-    monkeypatch.setattr(profiles.settings, "refine_strength", 0.33)
-    monkeypatch.setattr(profiles.settings, "refine_gradient_ratio", 0.2)
+    monkeypatch.setattr(profiles.settings, "refine_profile", "impasto")
+    monkeypatch.setattr(profiles.settings, "refine_strength", 0.88)
+    monkeypatch.setattr(profiles.settings, "mask_dilate_ratio", 0.2)
 
     profile = profiles.from_settings()
 
-    assert profile.strength == 0.33
-    assert profile.mask.gradient_ratio == 0.2
-    assert profile.guidance_scale == profiles.get("seam").guidance_scale, "остальное из пресета"
+    assert profile.strength == 0.88
+    assert profile.mask.dilate_ratio == 0.2
+    assert profile.mask.feather_ratio == profiles.get("impasto").mask.feather_ratio
+    assert profile.guidance_scale == profiles.get("impasto").guidance_scale
 
 
-def test_controls_can_be_switched_off_from_the_environment(monkeypatch):
-    monkeypatch.setattr(profiles.settings, "refine_profile", "stylise_controlnet")
-    monkeypatch.setattr(profiles.settings, "refine_endpoint", "fal-ai/with-controlnet")
-    monkeypatch.setattr(profiles.settings, "refine_controls", "none")
+def test_strategy_brings_its_endpoint_schema_and_instruction(monkeypatch):
+    """
+    Вещи, которые меняются только вместе. Другой подход — это другой эндпоинт,
+    другой набор ключей, другой текст промпта и другая локальная работа; любая
+    их комбинация из разных стратегий даёт либо 422, либо молча испорченный кадр.
+    """
+    monkeypatch.setattr(profiles.settings, "refine_strategy", "identity_inpaint")
 
-    assert profiles.from_settings().controls == ()
+    profile = profiles.from_settings()
 
-
-def test_controls_subset_is_selectable(monkeypatch):
-    monkeypatch.setattr(profiles.settings, "refine_profile", "stylise_controlnet")
-    monkeypatch.setattr(profiles.settings, "refine_endpoint", "fal-ai/with-controlnet")
-    monkeypatch.setattr(profiles.settings, "refine_controls", "canny")
-
-    controls = profiles.from_settings().controls
-
-    assert [control.kind for control in controls] == ["canny"]
-    assert controls[0].weight == profiles.get("stylise_controlnet").controls[0].weight, (
-        "вес остаётся из профиля: подбирать его строкой в окружении незачем"
-    )
+    assert profile.strategy == "identity_inpaint"
+    assert profile.endpoint == "fal-ai/flux-kontext-lora/inpaint"
+    assert profile.payload.mask_field == "mask_url"
+    assert "inside the mask" in profile.prompt()
+    assert profile.needs_mask is True, "инпейнту маска нужна — её и рисуют"
 
 
-def test_unknown_control_in_the_environment_is_refused(monkeypatch):
-    monkeypatch.setattr(profiles.settings, "refine_profile", "stylise_controlnet")
-    monkeypatch.setattr(profiles.settings, "refine_controls", "canny,segmentation")
+def test_diffusion_strategies_bring_back_the_local_geometry(monkeypatch):
+    """
+    Обратный переход опаснее прямого: профиль по умолчанию маску не строит, и
+    без этого признака диффузия получила бы пустую маску вместо рабочей области.
+    """
+    monkeypatch.setattr(profiles.settings, "refine_strategy", "kontext_multi")
+
+    profile = profiles.from_settings()
+
+    assert profile.needs_mask is True
+    assert profile.reference_pad_max > 1.0, "kontext переносит композицию фотографии"
+
+
+def test_explicit_endpoint_beats_the_strategy_default(monkeypatch):
+    """
+    Иначе новый эндпоинт нельзя было бы попробовать без релиза, а пробовать их
+    приходится — на fal схемы меняются чаще, чем выходят наши версии.
+    """
+    monkeypatch.setattr(profiles.settings, "refine_strategy", "identity_inpaint")
+    monkeypatch.setattr(profiles.settings, "refine_endpoint", "fal-ai/что-нибудь-новое")
+
+    assert profiles.from_settings().endpoint == "fal-ai/что-нибудь-новое"
+
+
+def test_identity_field_is_overridable_without_touching_the_code(monkeypatch):
+    """
+    Имя поля референса — то, чем эндпоинты отличаются друг от друга. Смена
+    эндпоинта не должна требовать релиза.
+    """
+    monkeypatch.setattr(profiles.settings, "refine_strategy", "identity_inpaint")
+    monkeypatch.setattr(profiles.settings, "refine_identity_field", "face_image_url")
+
+    assert profiles.from_settings().payload.identity_field == "face_image_url"
+
+
+def test_unknown_payload_schema_is_refused(monkeypatch):
+    monkeypatch.setattr(profiles.settings, "refine_payload", "телепатия")
 
     with pytest.raises(InvalidImageError):
         profiles.from_settings()
@@ -228,6 +298,12 @@ def test_unknown_profile_name_is_refused():
         profiles.get("не-существует")
 
 
+def test_schema_without_a_template_field_is_refused():
+    """Схема, не называющая, куда класть шаблон, — дефект конфигурации."""
+    with pytest.raises(InvalidImageError):
+        profiles.PayloadSchema(name="пустая", image_field=None, images_field=None)
+
+
 def test_blank_override_means_from_profile():
     """
     В .env.example ручки перечислены с пустыми значениями — так видно, что они
@@ -236,17 +312,17 @@ def test_blank_override_means_from_profile():
     """
     from app.config import Settings
 
-    blank = Settings(refine_strength="", refine_steps="", refine_gradient_ratio="")
+    blank = Settings(refine_strength="", refine_steps="", mask_dilate_ratio="")
 
     assert blank.refine_strength is None
     assert blank.refine_steps is None
-    assert blank.refine_gradient_ratio is None
+    assert blank.mask_dilate_ratio is None
 
 
-# --- Реестр стратегий: ради чего всё затевалось ---
+# --- Реестр стратегий ---
 
 
-def test_strategy_is_chosen_by_name_from_the_profile(client, collage):
+def test_strategy_is_chosen_by_name_from_the_profile(client):
     """
     Смена подхода — это смена имени в профиле. Ни pipeline.py, ни fal_api.py о
     существовании второй стратегии знать не должны.
@@ -261,357 +337,786 @@ def test_strategy_is_chosen_by_name_from_the_profile(client, collage):
             return refine.RefineResult(image=b"SPY", meta={})
 
     refine.register(_Spy())
-    result = refine.run(_request(collage), replace(_seam_only(), strategy="spy"))
+    result = refine.run(_request(), replace(_profile(), strategy="spy"))
 
     assert result.image == b"SPY"
-    assert seen["profile"] == "blend"
+    assert seen["profile"] == "pixar_real"
     assert client.arguments is None, "до fal дойти не должно"
 
 
-def test_identity_embedding_is_declared_but_not_implemented(collage):
+def test_both_approaches_stay_registered():
     """
-    Проброс лицевых эмбеддингов — второй подход, под который заложен контракт.
-    Пока эндпоинта нет, честнее отдать 501, чем молча отработать инпейнтингом:
-    молчаливая подмена обнаружилась бы уже на печати тиража.
+    Масочный путь удалять рано: он провалился на наших парах, но сравнивать
+    новый результат не с чем, если старый нельзя воспроизвести одной ручкой.
     """
-    profile = replace(_seam_only(), strategy="identity_embedding")
-
-    with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
-        refine.run(_request(collage), profile)
-
-    assert exc_info.value.status_code == 501
-    assert "identity_embedding" in refine.available()
+    assert {"face_swap", "hair_swap", "kontext_multi", "identity_inpaint"} <= set(
+        refine.available()
+    )
 
 
-def test_identity_reaches_the_strategy(collage):
-    """
-    Матрица эмбеддингов должна доезжать до стратегии, а не теряться по дороге:
-    когда эндпоинт появится, первым вопросом будет именно этот.
-    """
-    identity = refine.Identity(embedding=np.zeros((1, 512), dtype=np.float32), model="buffalo_l")
-    profile = replace(_seam_only(), strategy="identity_embedding")
-
-    with pytest.raises(refine.RefinerNotSupportedError) as exc_info:
-        refine.run(_request(collage, identity=identity), profile)
-
-    assert exc_info.value.details["identity_present"] is True
-
-
-def test_unknown_strategy_is_refused(collage):
+def test_unknown_strategy_is_refused():
     with pytest.raises(refine.RefinerNotSupportedError):
-        refine.run(_request(collage), replace(_seam_only(), strategy="телепатия"))
+        refine.run(_request(), replace(_profile(), strategy="телепатия"))
 
 
-# --- Схема запроса ---
+# --- Схема запроса: фейссвоп ---
 
 
-def test_arguments_match_endpoint_schema(client, collage):
-    refine.run(_request(collage), _seam_only())
+def test_arguments_match_the_face_swap_schema(client):
+    """
+    Две ссылки и ничего больше. Проверяется полным сравнением множества, а не
+    наличием: лишний ключ здесь стоит столько же, сколько недостающий, — 422 на
+    весь запрос после двух загрузок в CDN.
+    """
+    refine.run(_request(), _profile())
 
     args = client.arguments
-    assert client.model == _seam_only().endpoint
-    # Три обязательные ссылки эндпоинта
-    assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
-    assert args["prompt"] == _seam_only().prompt
-    assert args["strength"] == _seam_only().strength
-    assert args["guidance_scale"] == _seam_only().guidance_scale
-    assert args["num_inference_steps"] == _seam_only().steps
+    assert client.model == "fal-ai/face-swap"
+    assert set(args) == {"base_image_url", "swap_image_url"}
 
 
-def test_collage_goes_first_and_reference_second(client, collage):
+def test_the_template_is_the_base_and_the_photo_is_the_face(client):
     """
-    Порядок ссылок важен: под инпейнтинг идёт коллаж, фотография — только
-    референс. Перепутать их местами — значит вернуться к прежней схеме, где
-    лицо рисовалось с нуля, причём молча.
+    Перепутать их местами значит вклеить лицо персонажа в фотографию заказчика:
+    запрос пройдёт, картинка вернётся, и это будет не разворот книги.
     """
-    refine.run(_request(collage), _seam_only())
+    refine.run(_request(), _profile())
 
-    assert client.arguments["image_url"] == "https://cdn/1", "первым загружается коллаж"
-    assert client.arguments["reference_image_url"] == "https://cdn/2", "вторым — фотография"
-    assert client.uploads[0] == (b"collage-bytes", "image/png")
+    assert client.arguments["base_image_url"] == "https://cdn/1"
+    assert client.arguments["swap_image_url"] == "https://cdn/2"
+    assert client.uploads[0] == (_TEMPLATE_PNG, "image/png")
+    assert client.uploads[1] == (b"photo-bytes", "image/jpeg")
 
 
-@pytest.mark.parametrize("key", ["ip_adapter_scale", "ip_adapters", "negative_prompt"])
-def test_arguments_carry_no_unsupported_keys(client, collage, key):
+def test_a_single_image_response_is_understood(client):
     """
-    Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
-    а заворачивает весь запрос. Отрицания идут прямо в промпт.
+    Фейссвоп отдаёт одиночный `image`, диффузия — список `images`. Обе формы
+    живые, и разбираться они обязаны обе: иначе рабочий путь падает на разборе
+    успешного ответа.
     """
-    refine.run(_request(collage), _seam_only())
+    result = refine.run(_request(), _profile())
+
+    assert result.image == _GENERATED_PNG
+    assert result.meta["seed"] == 7
+
+
+def test_an_unchanged_answer_is_refused(client, monkeypatch):
+    """
+    Молчаливый отказ — главная ловушка этого эндпоинта. Не найдя лица, он не
+    отвечает ошибкой: он возвращает присланный шаблон. Код 200, картинка на
+    месте, счёт выставлен, замены нет — и такой разворот уедет прямо в печать.
+    """
+    monkeypatch.setattr(fal_api, "_download", lambda image: _TEMPLATE_PNG)
+
+    with pytest.raises(NoFaceDetectedError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.details["changed"] < 1.0
+
+
+def test_a_wrong_schema_never_reaches_the_face_swap(client):
+    """Схема с промптом — не для этого эндпоинта: он принимает две ссылки."""
+    with pytest.raises(InvalidImageError):
+        refine.run(_request(), replace(_profile(), payload=profiles.KONTEXT_MULTI))
+
+    assert client.uploads == []
+
+
+def test_the_face_swap_needs_no_mask_at_all(client):
+    """
+    Область эндпоинт находит своим детектором. Маска на этом пути не строится
+    вовсе — и её отсутствие в запросе не должно ничего ломать.
+    """
+    refine.run(_request(mask=b""), _profile())
+
+    assert len(client.uploads) == 2, "в CDN уезжают шаблон и фотография, и только"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["prompt", "mask_url", "strength", "num_inference_steps", "output_format", "image_urls"],
+)
+def test_face_swap_arguments_carry_no_diffusion_keys(client, key):
+    """
+    Всё, что было ручками диффузии, здесь не существует. Промпта в том числе:
+    фотореализм переносится моделью, а не выпрашивается словами.
+    """
+    refine.run(_request(), _profile())
 
     assert key not in client.arguments
 
 
-def test_no_control_key_without_controls(client, collage):
+@pytest.mark.parametrize(
+    ("payload", "endpoint"),
+    [
+        (profiles.NANO_BANANA, "fal-ai/nano-banana/edit"),
+        (profiles.SEEDREAM_EDIT, "fal-ai/bytedance/seedream/v4/edit"),
+        (profiles.HY_WU_EDIT, "fal-ai/hy-wu-edit"),
+    ],
+)
+def test_editor_endpoints_reuse_the_multi_image_strategy(client, payload, endpoint):
     """
-    Пустой список карт — такой же лишний ключ, как и полный. У эндпоинта без
-    ControlNet его быть не должно вовсе.
+    Запасной путь для стилизованных шаблонов. Схема у редакторов одна и та же —
+    промпт плюс массив картинок, — поэтому новый эндпоинт стоит двух переменных
+    окружения и ни строчки кода.
     """
-    refine.run(_request(collage), _seam_only())
+    profile = replace(_multi(), payload=payload, endpoint=endpoint)
+    refine.run(_request(), profile)
 
-    assert "controlnets" not in client.arguments
+    args = client.arguments
+    assert client.model == endpoint
+    assert args["image_urls"] == ["https://cdn/1", "https://cdn/2"]
+    assert args["prompt"]
+    # Ключей вне схемы быть не должно: лишний заворачивает весь запрос
+    assert set(args) == set(payload.sent_keys())
+    assert "strength" not in args and "num_inference_steps" not in args
 
 
-def test_missing_mask_fails_before_network(client, collage):
+# --- Двухшаговый путь: причёска, затем лицо ---
+
+
+@pytest.fixture
+def hair(monkeypatch):
+    """
+    Маска волос без разметки и без mediapipe.
+
+    Строит её сама стратегия, из шаблона, — тестам здесь проверять нечего: своя
+    проверка у неё в test_hair_mask.py. Важно другое: что маска попала во
+    вклейку и что вокруг неё шаблон уцелел.
+    """
+    built = hair_mask.HairMask(mask=_MASK, face_height=8.0, meta={"source": "parsing"})
+    monkeypatch.setattr(hair_mask, "build", lambda image, **kwargs: built)
+    return built
+
+
+def _hair_profile() -> profiles.RefineProfile:
+    """Тот же фотореализм, но с проходом причёски перед заменой лица."""
+    return profiles.get("pixar_hair")
+
+
+def _hair_request(**overrides) -> refine.RefineRequest:
+    """
+    Заказ с описанием причёски.
+
+    Описание обязательно: фотография на первый шаг не уезжает, и без слов
+    редактору нечего рисовать. Тесты, проверяющие именно это, зовут `_request`.
+    """
+    kwargs = {"hair": "short blonde buzz cut"}
+    kwargs.update(overrides)
+    return _request(**kwargs)
+
+
+def test_the_hair_preset_only_adds_a_step(client, hair):
+    """
+    Шаг замены лица обязан остаться неотличимым от рабочего пути: тот же
+    эндпоинт, та же схема, тот же отсутствующий промпт. Двухшаговая схема
+    ДОБАВЛЯЕТ проход перед ним, а не переделывает его.
+    """
+    profile = _hair_profile()
+
+    assert profile.strategy == "hair_swap"
+    assert profile.endpoint == profiles.get("pixar_real").endpoint
+    assert profile.payload.name == profiles.get("pixar_real").payload.name
+    assert profile.needs_mask is False, "маску волос строит стратегия, а не пайплайн"
+
+
+def test_the_hair_goes_first_and_the_face_second(client, hair):
+    """
+    Порядок шагов — главное решение этого пути. Правка волос это диффузия, и
+    всё, что попадёт под неё, вернётся сглаженным; пущенная после переноса, она
+    прошла бы по настоящим пикселям лица — по тому единственному, ради чего всё.
+    """
+    refine.run(_hair_request(), _hair_profile())
+
+    assert len(client.calls) == 2
+    assert "image_urls" in client.calls[0], "первым — редактор причёски"
+    assert set(client.calls[1]) == {"base_image_url", "swap_image_url"}, "вторым — фейссвоп"
+
+
+def test_the_photo_never_reaches_the_editor(client, hair):
+    """
+    Дыра, стоившая двух прогонов. Получив вторым файлом портрет крупным планом,
+    универсальный редактор понимает его не как «вот чья причёска», а как «вот
+    что нарисовать»: и nano-banana, и seedream нарисовали лицо донора на затылке
+    персонажа — в пустой области маски волос, то есть ровно там, где им
+    разрешили рисовать.
+
+    Личность переносит фейссвоп на втором шаге. На первом фотографии нет ни в
+    запросе, ни в CDN — проверяется и то, и другое.
+    """
+    refine.run(_hair_request(), _hair_profile())
+
+    assert client.calls[0]["image_urls"] == ["https://cdn/1"], "в массиве один шаблон"
+    assert client.uploads[0][0] != b"photo-bytes"
+    assert len(client.uploads) == 3, "окно, шаблон после правки и фотография — на втором шаге"
+    # Фотография уезжает в CDN только перед фейссвопом, третьей по счёту
+    assert client.uploads[2] == (b"photo-bytes", "image/jpeg")
+
+
+def test_a_schema_carrying_the_photo_cannot_be_used_for_hair():
+    """
+    Тот же дефект, но пойманный до сети. Схема с фотографией в массиве не даст
+    ни ошибки, ни 422: редактор ответит успехом и нарисует второе лицо. Значит,
+    неверную связку нельзя собирать вовсе — только «одиночные» схемы.
+    """
+    with pytest.raises(InvalidImageError) as exc_info:
+        replace(
+            _hair_profile(), hair=replace(_hair_profile().hair, payload=profiles.NANO_BANANA)
+        ).validate()
+
+    assert "nano_banana_solo" in exc_info.value.details["solo"]
+
+
+def test_hair_without_words_is_refused_before_the_network(client, hair):
+    """
+    Референса на этом шаге нет, и «замени причёску» без описания означает
+    случайную причёску. Дефект заказа, а не модели: чинится одним полем.
+    """
+    with pytest.raises(InvalidImageError) as exc_info:
+        refine.run(_request(), _hair_profile())
+
+    assert exc_info.value.status_code == 400
+    assert "ML_HAIR_DESCRIPTION" in exc_info.value.details["hint"]
+    assert client.uploads == [], "до загрузки в CDN дойти не должно"
+
+
+def test_the_face_swap_receives_the_edited_template(client, hair):
+    """
+    Смысл вклейки между шагами. Редактор перерисовал кадр целиком, но фейссвопу
+    достаётся шаблон, в котором заменена ровно причёска: лицо, фон и одежда —
+    исходные пиксели разворота, и лицо в том числе не тронуто ни на пиксель.
+    """
+    refine.run(_hair_request(), _hair_profile())
+
+    edited = decode_image(client.uploads[1][0])
+    assert tuple(edited[16, 16]) == (40, 40, 40), "под маской волос — правка редактора"
+    assert tuple(edited[1, 1]) == (200, 200, 200), "вне её — шаблон побитово"
+    assert client.uploads[2] == (b"photo-bytes", "image/jpeg"), "фотография уезжает как есть"
+
+
+def test_the_editor_gets_the_template_and_the_words(client, hair):
+    """
+    Схема редактора — массив, и в нём ровно один файл. Всё остальное, что он
+    знает о задаче, — текст.
+    """
+    refine.run(_hair_request(), _hair_profile())
+
+    arguments = client.calls[0]
+    assert arguments["image_urls"] == ["https://cdn/1"]
+    assert set(arguments) == set(_hair_profile().hair.payload.sent_keys())
+    assert "mask_url" not in arguments, "маска работает локально, эндпоинт её не примет"
+
+
+def test_the_hair_prompt_guards_the_face_and_demands_a_photograph(client, hair):
+    """
+    Промпт первого шага решает две задачи разом: правится одна причёска, и
+    правится фотореалистично. Лицо здесь охраняется словами, потому что за ним
+    придёт детектор фейссвопа, а сглаженная диффузией кожа — прямой запрет серии.
+    """
+    prompt = _hair_profile().hair.prompt("short blonde buzz cut").lower()
+
+    assert "do not swap the face" in prompt
+    assert "same position and angle of the head" in prompt
+    # След старой причёски: длинные волосы закрывают уши, шею и одежду
+    assert "rebuilt everywhere the old hair used to be" in prompt
+    assert "no painting" in prompt and "no wig" in prompt
+    # Описание идёт последним: инструкция им заканчивается
+    assert prompt.endswith("short blonde buzz cut")
+
+
+def test_the_prompt_forbids_a_second_face(client, hair):
+    """
+    Правка после второго прогона. Референса в запросе больше нет, но пустая
+    область маски волос сама по себе приглашает модель что-нибудь туда
+    нарисовать — и оба редактора нарисовали лицо. Запрет продублирован словами:
+    стоит он дёшево, а стоил дорого.
+    """
+    prompt = _hair_profile().hair.prompt("buzz cut").lower()
+
+    assert "no reference image" in prompt, "картинка одна, и модель должна это знать"
+    assert "never draw a face" in prompt
+    assert "exactly one person in this image and exactly one face" in prompt
+    assert "no second face" in prompt and "no face on the back of the head" in prompt
+    # Прежней адресации по порядку картинок здесь быть не должно: картинка одна
+    assert "second image" not in prompt
+
+
+def test_the_prompt_forbids_keeping_the_old_volume(client, hair):
+    """
+    Правка после первого живого прогона. Прежний текст просил сохранить «same
+    head size» — фразой против перекадрирования, — и редактор прочитал её
+    буквально: голова вместе с копной волос объявлена неприкосновенной по
+    размеру, и вышел блондинистый шлем при объёме шаблона.
+
+    Теперь череп с лицом и контур причёски разведены прямым текстом, а старая
+    причёска названа формой на удаление, а не формой для правки.
+    """
+    prompt = _hair_profile().hair.prompt("buzz cut").lower()
+
+    assert "do not keep its volume" in prompt
+    assert "visibly smaller in silhouette" in prompt
+    assert "shape to delete" in prompt
+    # Череп не меняется — меняются только волосы вокруг него
+    assert "keep the skull and the face at exactly the same size" in prompt
+    # «Короткие» описываются физически: иначе для модели это «покороче прежних»
+    assert "millimetres thick" in prompt and "scalp shows through" in prompt
+    assert "no rounded cap" in prompt and "no helmet hair" in prompt
+
+
+def test_the_order_can_describe_the_hair_in_words(client, hair):
+    """
+    Причёска приезжает референсом, но на фотографии её бывает не видно — шапка,
+    кадр по подбородок, тёмный фон. Тогда работает описание из заказа.
+    """
+    refine.run(_request(hair="short blonde buzz cut"), _hair_profile())
+
+    assert "short blonde buzz cut" in client.calls[0]["prompt"]
+
+
+def test_the_words_can_come_from_the_environment_instead(client, hair, monkeypatch):
+    """
+    Одна причёска на весь тираж задаётся оператором один раз, а не менеджером в
+    каждом заказе. Источника два, и любого из них достаточно.
+    """
+    profile = replace(
+        _hair_profile(), hair=replace(_hair_profile().hair, description="platinum buzz cut")
+    )
+
+    refine.run(_request(), profile)
+
+    assert "platinum buzz cut" in client.calls[0]["prompt"]
+
+
+def _big_template(monkeypatch, mask_box=(24, 40)):
+    """
+    Разворот вчетверо больше маски волос: только на нём окно вокруг головы
+    отличается от кадра целиком. На 32×32 из остальных тестов поле в высоту лица
+    накрывает всё, и резать нечего.
+    """
+    template = np.full((64, 64, 3), 200, dtype=np.uint8)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    top, bottom = mask_box
+    mask[top:bottom, top:bottom] = 255
+
+    built = hair_mask.HairMask(mask=mask, face_height=8.0, meta={"source": "parsing"})
+    monkeypatch.setattr(hair_mask, "build", lambda image, **kwargs: built)
+    return encode_image(template, "png")[0]
+
+
+def test_the_editor_gets_a_window_around_the_head(client, monkeypatch):
+    """
+    Второй урок первого прогона. Правка удалась, но объём причёски остался
+    шаблонным: на 4K-развороте голова занимает проценты кадра, рабочий кадр
+    редактора около мегапикселя — и стричь ему физически нечего. В окно те же
+    волосы приходят тысячами пикселей.
+    """
+    target = _big_template(monkeypatch)
+
+    result = refine.run(_hair_request(target=target), _hair_profile())
+
+    # Маска 24..40 плюс поле в одну высоту лица (8) с каждой стороны
+    assert result.meta["hair"]["window"] == [16, 16, 32, 32]
+    assert decode_image(client.uploads[0][0]).shape[:2] == (32, 32)
+
+
+def test_outside_the_window_the_spread_is_untouched(client, monkeypatch):
+    """
+    Окно возвращается на место копией, а не правкой шаблона под собой. Вне окна
+    и вне маски внутри него разворот обязан дойти до фейссвопа исходным.
+    """
+    target = _big_template(monkeypatch)
+
+    refine.run(_hair_request(target=target), _hair_profile())
+
+    edited = decode_image(client.uploads[1][0])
+    assert edited.shape[:2] == (64, 64), "фейссвопу уезжает разворот, а не окно"
+    assert tuple(edited[32, 32]) == (40, 40, 40), "под маской волос — правка редактора"
+    assert tuple(edited[1, 1]) == (200, 200, 200), "за окном — шаблон побитово"
+    assert tuple(edited[20, 20]) == (200, 200, 200), "в окне вне маски — тоже шаблон"
+
+
+def test_the_window_can_be_switched_off(client, monkeypatch):
+    """
+    Ноль возвращает прежнее поведение — разворот целиком, теми же байтами.
+    Нужно это там, где голова и так занимает кадр: лишнее перекодирование 4K
+    стоит фактуры, которую модель просят повторить.
+
+    Стирание тоже выключено, и не для удобства теста: стёртый кадр — это новые
+    пиксели, и отдать их прежними байтами невозможно. Байт в байт разворот
+    уезжает ровно тогда, когда мы в нём ничего не трогали.
+    """
+    target = _big_template(monkeypatch)
+    profile = replace(
+        _hair_profile(), hair=replace(_hair_profile().hair, crop_ratio=0.0, erase_ratio=0.0)
+    )
+
+    result = refine.run(_hair_request(target=target), profile)
+
+    assert result.meta["hair"]["window"] is None
+    assert client.uploads[0] == (target, "image/png"), "шаблон уезжает как прислан"
+
+
+def test_a_window_equal_to_the_frame_is_no_window(client, hair):
+    """
+    Поле раздулось до кадра — резать нечего. Тогда окна нет вовсе, и разворот
+    уходит исходными байтами: перекодировать его ради нулевой обрезки незачем.
+    Стирание при этом выключено — оно само по себе делает новые пиксели.
+    """
+    profile = replace(_hair_profile(), hair=replace(_hair_profile().hair, erase_ratio=0.0))
+
+    result = refine.run(_hair_request(), profile)
+
+    assert result.meta["hair"]["window"] is None
+    assert client.uploads[0] == (_TEMPLATE_PNG, "image/png")
+
+
+def _wipes(**overrides) -> profiles.RefineProfile:
+    """
+    Профиль с включённым стиранием — путь, который по умолчанию выключен.
+
+    Прогон показал, что задачи он не решает: прядь лежала ВНЕ маски, и заливка до
+    неё не достала. Стоил он при этом силуэта причёски и светлого ореола. Тесты
+    ниже держат его рабочим — воспроизвести провал одной переменной дешевле, чем
+    спорить о нём, — но включают явно, а не через умолчание.
+    """
+    hair = replace(_hair_profile().hair, erase_ratio=0.06, **overrides)
+    return replace(_hair_profile(), hair=hair)
+
+
+def _template_with_a_strand(monkeypatch) -> bytes:
+    """Разворот с тёмной прядью внутри открытой маски."""
+    template = np.full((64, 64, 3), 200, dtype=np.uint8)
+    template[30:34, 26:38] = 20
+
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[24:40, 24:40] = 255
+
+    built = hair_mask.HairMask(mask=mask, face_height=8.0, meta={"source": "parsing"})
+    monkeypatch.setattr(hair_mask, "build", lambda image, **kwargs: built)
+    return encode_image(template, "png")[0]
+
+
+def test_the_cheek_band_reaches_the_mask(client, monkeypatch, hair):
+    """
+    Полоса вдоль щёк живёт в профиле, а работает в маске — между ними один
+    аргумент, и молчаливо потерять его значит вернуться к локону на щеке, не
+    заметив этого ни по логам, ни по тестам маски. Своя проверка у полосы в
+    test_hair_mask.py; здесь проверяется только, что число до неё доезжает.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(
+        hair_mask, "build", lambda image, **kwargs: (seen.update(kwargs), hair)[1]
+    )
+
+    refine.run(_hair_request(), _hair_profile())
+
+    assert seen["cheek_ratio"] == _hair_profile().hair.cheek_ratio > 0
+
+
+def test_the_wiping_is_off_by_default(client, monkeypatch):
+    """
+    Стирание выключено, и это вывод прогона, а не осторожность.
+
+    Гипотеза была в том, что редактор цепляется за структуру старых волос внутри
+    открытой маски. Прогон её опроверг: залитая мылом маска оставила прядь на
+    щеке резкой — значит, прядь лежала ВНЕ маски, и разметка её не видит. Берётся
+    она полосой вдоль щеки, а стирание к цене за себя добавило лысую голову
+    (пропал силуэт причёски) и вернувшийся ореол.
+
+    Промпт при этом обязан молчать о стирании: пообещать редактору стёртую
+    область и прислать нетронутую фотографию — значит попросить его убрать
+    волосы, которых он не найдёт.
+    """
+    target = _template_with_a_strand(monkeypatch)
+
+    result = refine.run(_hair_request(target=target), _hair_profile())
+
+    sent = decode_image(client.uploads[0][0])
+    assert int(sent.min()) == 20, "прядь уехала редактору как есть"
+    assert result.meta["hair"]["erase"] == {"erased": False, "reason": "off"}
+    assert "deliberately wiped out" not in client.calls[0]["prompt"]
+
+
+def test_the_wiping_still_works_when_switched_on(client, monkeypatch):
+    """
+    Провалившийся путь остаётся рабочим: одной переменной он воспроизводится
+    целиком, вместе с припиской в промпте о том, что пятно — не содержимое.
+    """
+    target = _template_with_a_strand(monkeypatch)
+
+    refine.run(_hair_request(target=target), _wipes())
+
+    sent = decode_image(client.uploads[0][0])
+    assert int(sent.min()) > 150, "под маской не осталось тёмных пикселей"
+    assert "deliberately wiped out" in client.calls[0]["prompt"]
+
+
+def test_the_wiping_stops_at_the_mask(client, monkeypatch):
+    """
+    Стирание — свойство ЗАПРОСА. В шаблон оно не попадает никогда: вклеивается
+    ответ редактора, и вклеивается он в исходный кадр, поэтому вне маски до
+    фейссвопа доезжают пиксели разворота — вместе с лицом, которое он ищет.
+    """
+    target = _template_with_a_strand(monkeypatch)
+
+    refine.run(_hair_request(target=target), _wipes())
+
+    edited = decode_image(client.uploads[1][0])
+    assert tuple(edited[1, 1]) == (200, 200, 200), "вне маски — шаблон побитово"
+    assert tuple(edited[32, 32]) == (40, 40, 40), "под маской — правка редактора"
+
+
+def test_the_silent_editor_is_caught_against_what_was_sent(client, monkeypatch):
+    """
+    Стирание меняет и то, с чем сравнивается ответ. Молчаливый отказ редактора —
+    это присланный кадр обратно, то есть кадр СТЁРТЫЙ, и от шаблона он отличается
+    сильно: сравнение с шаблоном объявило бы такой ответ удачной правкой и
+    отправило бы фейссвопу размытое пятно вместо причёски.
+    """
+    target = _template_with_a_strand(monkeypatch)
+    monkeypatch.setattr(fal_api, "_download", lambda image: client.uploads[0][0])
+
+    with pytest.raises(hair_swap.HairEditFailedError):
+        refine.run(_hair_request(target=target), _wipes())
+
+    assert len(client.calls) == 1, "до фейссвопа дойти не должно"
+
+
+def test_an_unchanged_hair_is_refused_before_the_face_swap(client, hair, monkeypatch):
+    """
+    Редактор тоже умеет промолчать: 200, кадр на месте, причёска прежняя. Ловится
+    это сравнением ВНУТРИ маски — среднее по кадру утонуло бы в неизменном фоне.
+    Отказ обязан прийти до второго вызова: платить за него незачем.
+    """
+    monkeypatch.setattr(fal_api, "_download", lambda image: _TEMPLATE_PNG)
+
+    with pytest.raises(hair_swap.HairEditFailedError) as exc_info:
+        refine.run(_hair_request(), _hair_profile())
+
+    assert exc_info.value.status_code == 422
+    assert len(client.calls) == 1, "до фейссвопа дойти не должно"
+
+
+def test_meta_reports_both_steps(client, hair):
+    """
+    Заказ прошёл двумя вызовами, и по мете это должно быть видно сразу: иначе
+    странный результат ищут в фейссвопе, а испортила его правка причёски.
+    """
+    result = refine.run(_hair_request(), _hair_profile())
+
+    assert result.meta["strategy"] == "hair_swap"
+    assert result.meta["hair"]["source"] == "parsing"
+    assert result.meta["hair"]["changed"] > 1.0
+    assert result.meta["hair"]["endpoint"] == _hair_profile().hair.endpoint
+    # Результат второго шага — то, что вернул фейссвоп, и он остался прежним
+    assert result.image == _GENERATED_PNG
+    assert result.meta["changed"] > 1.0
+
+
+def test_the_hair_stage_is_switched_by_one_variable(monkeypatch):
+    """
+    Редакторы взаимозаменяемы: схема у них одна. Новый эндпоинт обязан стоить
+    переменной окружения, а не релиза, — на fal схемы меняются чаще, чем выходят
+    наши версии.
+    """
+    monkeypatch.setattr(profiles.settings, "refine_profile", "pixar_hair")
+    monkeypatch.setattr(profiles.settings, "hair_endpoint", "fal-ai/bytedance/seedream/v4/edit")
+    monkeypatch.setattr(profiles.settings, "hair_payload", "seedream_solo")
+    monkeypatch.setattr(profiles.settings, "hair_description", "short blonde buzz cut")
+
+    profile = profiles.from_settings()
+
+    assert profile.hair.endpoint == "fal-ai/bytedance/seedream/v4/edit"
+    assert profile.hair.payload.name == "seedream_solo"
+    assert profile.hair.payload.images_identity is False, "фотография донора туда не уезжает"
+    assert "short blonde buzz cut" in profile.hair.prompt()
+    # Шаг замены лица переключение причёски не задевает
+    assert profile.endpoint == profiles.get("pixar_real").endpoint
+
+
+def test_a_hair_schema_without_an_array_is_refused():
+    """
+    Редактор принимает картинки массивом. Схема с двумя именованными полями
+    отправила бы ему шаблон в image_url — 422 на весь запрос после двух загрузок.
+    """
+    broken = replace(_hair_profile().hair, payload=profiles.FACE_SWAP)
+
+    with pytest.raises(InvalidImageError):
+        replace(_hair_profile(), hair=broken).validate()
+
+
+# --- Схема запроса: диффузионные пути ---
+
+
+def test_maskless_arguments_match_endpoint_schema(client):
+    refine.run(_request(), _multi())
+
+    args = client.arguments
+    assert client.model == _multi().endpoint
+    assert len(args["image_urls"]) == 2
+    assert args["prompt"] == _multi().prompt()
+    assert args["guidance_scale"] == _multi().guidance_scale
+    assert args["output_format"] == "png"
+    # Ровно четыре ключа — больше эндпоинт не принимает
+    assert set(args) == {"image_urls", "prompt", "guidance_scale", "output_format"}
+
+
+def test_the_template_goes_first_and_the_photo_second(client):
+    """
+    Порядок в массиве — часть контракта с промптом: инструкция говорит «первая
+    картинка — сцена, вторая — личность». Перепутать их местами значит
+    перерисовать фотографию заказчика по мотивам обложки, причём молча.
+    """
+    refine.run(_request(), _multi())
+
+    assert client.arguments["image_urls"] == ["https://cdn/1", "https://cdn/2"]
+    assert client.uploads[0] == (_TEMPLATE_PNG, "image/png")
+    assert client.uploads[1] == (b"photo-bytes", "image/jpeg")
+
+
+def test_the_mask_never_leaves_the_service(client):
+    """
+    Маска строится, но эндпоинт её не принимает: ключ mask_url означает 422 на
+    весь запрос. Работает она локально, на вклейке.
+    """
+    refine.run(_request(), _multi())
+
+    assert "mask_url" not in client.arguments
+    assert len(client.uploads) == 2, "в CDN уезжают шаблон и фотография, и только"
+    assert all(data != _MASK_PNG for data, _ in client.uploads)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["mask_url", "strength", "num_inference_steps", "image_url", "ip_adapters", "negative_prompt"],
+)
+def test_arguments_carry_no_unsupported_keys(client, key):
+    """
+    Ключей вне схемы эндпоинта быть не должно: лишний параметр он не игнорирует,
+    а заворачивает весь запрос. Отрицания идут прямо в промпт.
+    """
+    refine.run(_request(), _multi())
+
+    assert key not in client.arguments
+
+
+def test_masked_schema_still_sends_all_of_its_keys(client):
+    """Прежняя схема не должна пострадать от того, что новая короче."""
+    refine.run(_request(), _inpaint())
+
+    args = client.arguments
+    assert args["image_url"] and args["mask_url"] and args["reference_image_url"]
+    assert args["strength"] == _inpaint().strength
+    assert args["num_inference_steps"] == _inpaint().steps
+    assert "image_urls" not in args
+
+
+def test_payload_schema_switches_the_field_names(client):
+    """
+    Ради этого схема и вынесена в данные: другой эндпоинт — другой способ
+    подмешивать личность, и стратегия об этом знать не обязана.
+    """
+    profile = replace(_inpaint(), payload=profiles.FLUX_GENERAL)
+    refine.run(_request(), profile)
+
+    adapters = client.arguments["ip_adapters"]
+    assert adapters == [{"image_url": "https://cdn/3", "scale": profile.identity_scale}]
+    assert "reference_image_url" not in client.arguments
+
+
+def test_missing_mask_fails_before_network(client):
+    """
+    В fal маска не уезжает, но без неё нечем взять из ответа одну голову — а
+    вернуть весь сгенерированный кадр значит отдать в печать перерисованные
+    ткань и фон.
+    """
     with pytest.raises(fal_api.MaskMissingError) as exc_info:
-        refine.run(_request(collage, masks={}), _seam_only())
+        refine.run(_request(mask=b""), _multi())
 
     assert exc_info.value.status_code == 500
     assert client.uploads == [], "до загрузки в CDN дойти не должно"
     assert client.arguments is None, "до вызова модели дойти не должно"
 
 
-def test_jpeg_alias(client, collage):
-    refine.run(_request(collage, output_format="jpg"), _seam_only())
+@pytest.mark.parametrize(
+    ("profile_factory", "wrong_payload"),
+    [(_multi, profiles.KONTEXT), (_profile, profiles.KONTEXT_MULTI)],
+)
+def test_wrong_schema_fails_before_network(client, profile_factory, wrong_payload):
+    """
+    Профиль, собранный из чужих частей: стратегия одна, схема от другой.
+    Эндпоинт завернёт такой запрос — но уже после загрузок в CDN.
+    """
+    with pytest.raises(InvalidImageError):
+        refine.run(_request(), replace(profile_factory(), payload=wrong_payload))
+
+    assert client.uploads == []
+
+
+def test_one_call_per_order(client):
+    """
+    Прежняя схема стоила до пяти вызовов: фон, шея, фактура, стык, сведение.
+    Нынешняя обходится одним — и это половина её смысла.
+    """
+    refine.run(_request(), _profile())
+
+    assert len(client.calls) == 1
+
+
+def test_jpeg_alias(client):
+    refine.run(_request(output_format="jpg"), _multi())
 
     # Эндпоинт знает только jpeg, но наружу принимаем и jpg
     assert client.arguments["output_format"] == "jpeg"
 
 
-# --- ControlNet ---
+# --- Что возвращается наружу ---
 
 
-def test_control_maps_are_uploaded_and_described(client, collage):
-    refine.run(_request(collage), _controlnet_profile())
-
-    maps = client.arguments["controlnets"]
-    assert [m["control_type"] for m in maps] == ["canny", "depth"]
-    assert all(m["control_image_url"] for m in maps)
-    assert maps[0]["conditioning_scale"] == 0.65
-    assert maps[0]["start_percentage"] == 0.0 and maps[0]["end_percentage"] == 0.8
-    # Коллаж, референс, маска и две карты
-    assert len(client.uploads) == 5
-
-
-def test_canny_map_is_computed_locally(client, collage):
+def test_the_face_swap_returns_the_endpoint_bytes_untouched(client):
     """
-    Контур считается здесь, а не эндпоинтом: пороги — гиперпараметр, и
-    подбирать их вслепую на чужой стороне невозможно.
+    Локальной вклейки здесь нет: фон эндпоинт сохраняет сам, а лишнее
+    перекодирование стоило бы ровно той сохранности, ради которой сюда шли.
     """
-    refine.run(_request(collage), _controlnet_profile())
+    result = refine.run(_request(), _profile())
 
-    from app.utils.image import decode_image
-
-    # Порядок загрузок: коллаж, референс, карты, маски проходов
-    canny_png = client.uploads[2][0]
-    edges = decode_image(canny_png)[..., 0]
-    assert set(np.unique(edges)) <= {0, 255}, "контурная карта бинарна"
-    assert edges.any(), "на границе квадрата контур обязан найтись"
-
-
-def test_depth_map_sends_the_collage_itself(client, collage):
-    """
-    Локального инференса глубины у сервиса нет — MiDaS потянул бы torch. Карту
-    считает эндпоинт, а мы отдаём ему кадр как есть.
-    """
-    refine.run(_request(collage), _controlnet_profile())
-
-    from app.utils.image import decode_image
-
-    depth_source = decode_image(client.uploads[3][0])
-    assert np.array_equal(depth_source, collage)
-
-
-def test_controls_are_skipped_without_the_collage_array(client):
-    """
-    Карты строятся по пикселям. Без них запрос всё равно должен уехать — но с
-    предупреждением, а не с молчаливым отказом от ControlNet.
-    """
-    refine.run(_request(collage_image=None), _controlnet_profile())
-
-    assert "controlnets" not in client.arguments
-    assert len(client.uploads) == 3
-
-
-def test_canny_thresholds_are_validated(collage):
-    with pytest.raises(InvalidImageError):
-        control_maps.canny(collage, low=200, high=100)
-
-
-def test_meta_reports_the_whole_profile(client, collage):
-    result = refine.run(_request(collage), _controlnet_profile())
-
-    assert result.meta["profile"] == "stylise_controlnet"
-    assert result.meta["strategy"] == "inpaint_controlnet"
-    assert result.meta["strength"] == 0.50
-    assert result.meta["controls"] == ["canny:0.65", "depth:0.45"]
-    assert result.meta["controls_sent"] == 2
-    assert result.meta["seed"] == 7
+    assert result.image == _GENERATED_PNG
     assert result.meta["mime_type"] == "image/png"
 
 
-# --- Три зоны: два прохода с разной силой ---
-
-
-def test_background_zone_runs_first_and_stronger(client, collage):
+def test_the_diffusion_result_is_the_template_with_only_the_head_replaced(client):
     """
-    Ради этого зоны и разделили. У героя обложки грива до плеч, у заказчика
-    ёжик, и вокруг вклейки остаётся кусок стёртого неба. Сводить его нечем —
-    там нет содержимого, его надо сгенерировать, а это другая сила.
-
-    Порядок обязателен: стык сводит вклейку с тем, что вокруг, и «вокруг» к
-    этому моменту должно быть уже нарисовано.
+    Смысл вклейки. Модель вернула кадр целиком, но наружу уходит шаблон, в
+    котором заменена ровно голова: фон и одежда — исходные пиксели разворота.
     """
-    profile = profiles.get("blend")
-    refine.run(_request(collage, masks={"seam": b"seam", "background": b"hole"}), profile)
+    result = refine.run(_request(), _multi())
+    image = decode_image(result.image)
 
-    first, second = client.calls
-    assert first["strength"] == profile.background.strength >= 0.8
-    assert second["strength"] == profile.strength <= 0.28
-    assert first["prompt"] != second["prompt"], "у зон разная работа и разный промпт"
+    assert tuple(image[16, 16]) == (40, 40, 40), "под маской — генерация"
+    assert tuple(image[1, 1]) == (200, 200, 200), "вне маски — шаблон"
 
 
-def test_second_pass_works_on_the_result_of_the_first(client, collage):
+def test_meta_reports_the_whole_profile(client):
+    result = refine.run(_request(), _profile())
+
+    assert result.meta["profile"] == "pixar_real"
+    assert result.meta["strategy"] == "face_swap"
+    assert result.meta["payload"] == "face_swap"
+    assert result.meta["needs_mask"] is False
+    assert result.meta["seed"] == 7
+    # Насколько ответ отличается от шаблона: единственный способ отличить
+    # удачную замену от молчаливого отказа, и он обязан быть в мете
+    assert result.meta["changed"] > 1.0
+
+
+def test_meta_separates_the_generation_from_the_result(client):
     """
-    Иначе второй проход сводил бы края с тем мылом, которое первый только что
-    заменил живописью, — и оба вызова были бы оплачены впустую.
+    Ссылка fal ведёт на кадр ДО вклейки — с перерисованными фоном и одеждой.
+    Назвать её image_url значит однажды отправить в печать не тот файл.
     """
-    refine.run(
-        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
-    )
+    result = refine.run(_request(), _multi())
 
-    first, second = client.calls
-    assert second["image_url"] == "https://cdn/out1.png"
-    assert first["image_url"] != second["image_url"]
-
-
-def test_zones_get_their_own_masks(client, collage):
-    refine.run(
-        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
-    )
-
-    first, second = client.calls
-    assert first["mask_url"] != second["mask_url"], "у зон разные маски"
-    assert (b"hole", "image/png") in client.uploads
-    assert (b"seam", "image/png") in client.uploads
-
-
-def test_without_a_hole_there_is_only_one_call(client, collage):
-    """
-    У персонажа со стрижкой дыры почти нет. Второй вызов стоит денег и времени,
-    и платить за него не за что.
-    """
-    refine.run(_request(collage, masks={"seam": b"seam"}), profiles.get("blend"))
-
-    assert len(client.calls) == 1
-    assert client.calls[0]["strength"] == profiles.get("blend").strength
-
-
-def test_background_weaker_than_the_seam_is_refused():
-    """
-    Проход по фону слабее прохода по стыку — это не настройка, а бессмыслица:
-    ради генерации фона второй вызов и оплачивается.
-    """
-    profile = profiles.get("blend")
-    broken = replace(profile, background=replace(profile.background, strength=0.1))
-
-    with pytest.raises(InvalidImageError):
-        broken.validate()
-
-
-def test_meta_reports_both_zones(client, collage):
-    result = refine.run(
-        _request(collage, masks={"seam": b"seam", "background": b"hole"}), profiles.get("blend")
-    )
-
-    assert result.meta["zones"] == ["background", "seam"]
-    assert result.meta["background_strength"] >= 0.8
-
-
-# --- Зона 4: стилизация вклейки ---
-
-
-def test_stylise_pass_runs_between_background_and_seam(client, collage):
-    """
-    Порядок из трёх проходов не произволен: фактура ложится на уже
-    восстановленный фон, но до сведения стыка — иначе стык пришлось бы сводить
-    дважды, второй раз поверх свежих мазков.
-    """
-    profile = profiles.get("blend")
-    refine.run(
-        _request(collage, masks={"seam": b"s", "background": b"b", "paste": b"p"}), profile
-    )
-
-    assert [a["strength"] for a in client.calls] == [
-        profile.background.strength,
-        profile.stylise.strength,
-        profile.strength,
-    ]
-
-
-def test_stylise_sits_between_the_other_two_in_strength():
-    """
-    Компромисс: слишком слабо — фотография остаётся фотографией, слишком
-    сильно — плывут черты. Между сведением стыка и генерацией фона.
-    """
-    profile = profiles.get("blend")
-
-    assert profile.strength < profile.stylise.strength < profile.background.strength
-
-
-def test_stylise_prompt_asks_for_paint_and_forbids_redrawing():
-    """
-    Промпт зоны говорит про фактуру и прямо запрещает двигать черты: на 0.35
-    модель уже способна перерисовать лицо, и напоминание тут не лишнее.
-    """
-    prompt = profiles.get("blend").stylise.prompt.lower()
-
-    assert "brush" in prompt and "canvas" in prompt
-    assert "recognisable person" in prompt
-    assert "do not redraw" in prompt
-
-
-def test_without_a_paste_mask_stylisation_is_skipped(client, collage):
-    """Нет маски — нет вызова: платить за проход, которому негде работать, незачем."""
-    refine.run(_request(collage, masks={"seam": b"s"}), profiles.get("blend"))
-
-    assert len(client.calls) == 1
-
-
-def test_zones_must_overlap():
-    """
-    Отступ горячей зоны больше внешней половины кольца — значит, между ними
-    полоса, которую не трогает ни один проход. Ровно она выглядела грязным
-    контуром вокруг головы.
-    """
-    profile = profiles.get("blend")
-    # До зоны фона дотягивается не сплошное кольцо, а градиент за ним —
-    # проверка считает их вместе
-    reach = profile.mask.edge_outer_ratio + profile.mask.gradient_ratio
-    broken = replace(profile, mask=replace(profile.mask, hole_margin_ratio=reach))
-
-    with pytest.raises(InvalidImageError):
-        broken.validate()
-
-    ok = replace(profile, mask=replace(profile.mask, hole_margin_ratio=reach * 0.9))
-    assert ok.validate() is ok, "перекрытие через градиент допустимо"
-
-
-def test_neck_pass_runs_right_after_the_background(client, collage):
-    """
-    Шея — такая же генеративная работа, как фон, и её результат должен попасть
-    под последующее сведение стыка, а не наоборот.
-    """
-    profile = profiles.get("blend")
-    refine.run(
-        _request(collage, masks={"seam": b"s", "background": b"b", "neck": b"n", "paste": b"p"}),
-        profile,
-    )
-
-    assert [a["strength"] for a in client.calls] == [
-        profile.background.strength,
-        profile.neck.strength,
-        profile.stylise.strength,
-        profile.strength,
-    ]
-
-
-def test_neck_prompt_asks_to_continue_the_chin():
-    """
-    Зона рисуется с нуля, и единственный ориентир по тону — подбородок сверху.
-    Про него в промпте сказано прямо.
-    """
-    prompt = profiles.get("blend").neck.prompt.lower()
-
-    assert "chin" in prompt and "oil" in prompt
-    assert "no seam" in prompt
+    assert result.meta["generated_url"] == "https://cdn/out1.png"
+    assert "image_url" not in result.meta
+    assert result.meta["composite"]["mask_open_px"] == 16 * 16

@@ -2,19 +2,18 @@
 Состояние обработчика для /health/ready.
 
 Тяжёлых весов больше нет — прогревать нечего, поэтому от прежнего реестра
-моделей осталась только диагностика: доступны ли зависимости и настроен ли
-ключ fal. Функции warmup/reset сохранены, чтобы не менять app/main.py.
+моделей осталась только диагностика: доступны ли зависимости, есть ли веса
+разметки и настроен ли ключ fal. Функции warmup/reset сохранены, чтобы не
+менять app/main.py.
 """
 
 from __future__ import annotations
 
-import os
 from importlib.util import find_spec
-from pathlib import Path
 
 from app.config import settings
 from app.core.errors import MLServiceError
-from app.pipelines import expression, fal_api, refine
+from app.pipelines import expression, fal_api, parsing, refine
 
 
 def _installed(module: str) -> bool:
@@ -22,21 +21,6 @@ def _installed(module: str) -> bool:
         return find_spec(module) is not None
     except (ImportError, ValueError):
         return False
-
-
-def _weights_ready() -> bool:
-    """
-    Скачаны ли веса сегментатора.
-
-    Первый вызов тянет ~176 МБ на модель, и заказ, попавший на эту загрузку,
-    ждёт её минутами. В /health/ready это видно заранее — до того, как в
-    очередь встанет живой заказ.
-    """
-    home = os.environ.get("U2NET_HOME") or Path.home() / ".u2net"
-    return all(
-        (Path(home) / f"{model}.onnx").exists()
-        for model in {settings.seg_model_photo, settings.seg_model_cover}
-    )
 
 
 def warmup() -> None:
@@ -52,9 +36,9 @@ def _active():
     Активный профиль второго шага и причина, если собрать его не вышло.
 
     Профиль складывается из пресета и переопределений окружения, то есть может
-    оказаться несобираемым — например, карты ControlNet при эндпоинте, который
-    их не принимает. Узнать об этом на /health/ready лучше, чем на первом живом
-    заказе: тот отвалится уже после трёх загрузок в CDN.
+    оказаться несобираемым — например, неизвестная схема запроса или стиль.
+    Узнать об этом на /health/ready лучше, чем на первом живом заказе: тот
+    отвалится уже после трёх загрузок в CDN.
     """
     try:
         return refine.profiles.from_settings(), None
@@ -71,10 +55,12 @@ def status() -> dict:
             "mediapipe": _installed("mediapipe"),
             "opencv": _installed("cv2"),
             "fal_client": _installed("fal_client"),
-            "rembg": _installed("rembg"),
+            # Веса семантической разметки. Работу не блокируют: без них маска
+            # головы строится эллипсом по сетке лица — грубее, но рабоче
+            "parsing_weights": parsing.available(),
         },
-        # Профиль виден целиком намеренно: strength, веса карт и ширина
-        # градиента — главные ручки пайплайна, и подбирают их из окружения на
+        # Профиль виден целиком намеренно: strength, вес идентичности и схема
+        # запроса — главные ручки пайплайна, и подбирают их из окружения на
         # живом сервисе. Пустые значения означают, что профиль не собрался, —
         # тогда всё, что о нём известно, лежит в profile_error
         "provider": {
@@ -84,27 +70,47 @@ def status() -> dict:
             "strength": profile.strength if profile else None,
             "profile": settings.refine_profile,
             "strategy": profile.strategy if profile else None,
-            "controls": [f"{c.kind}:{c.weight}" for c in profile.controls] if profile else [],
+            "payload": profile.payload.name if profile else None,
+            "style": profile.style if profile else None,
+            # Куда уезжает личность. У масочной схемы это отдельное поле, у
+            # безмасочной — второй элемент массива картинок, и поля нет вовсе
+            "identity_field": (
+                profile.payload.identity_field or profile.payload.images_field
+                if profile
+                else None
+            ),
+            "identity_scale": profile.identity_scale if profile else None,
+            "sends": profile.payload.sent_keys() if profile else [],
+            # Нужна ли заказу локальная геометрия. false — маска не строится
+            # вовсе, и блок mask ниже описывает только то, чем она СТРОИЛАСЬ БЫ
+            "needs_mask": profile.needs_mask if profile else None,
             "profile_error": profile_error,
             "profiles": refine.profiles.available(),
             "strategies": refine.available(),
+            "styles": refine.profiles.styles(),
         },
+        # Единственная локальная работа: какую область шаблона отдаём модели
         "mask": {
-            "detector": "mediapipe/face_mesh",
-            "edge_ratio": mask.edge_ratio if mask else None,
-            "neck_ratio": mask.neck_ratio if mask else None,
-            "guard_ratio": mask.guard_ratio if mask else None,
+            "detector": "mediapipe/face_mesh + selfie_multiclass",
+            "parsing_model": str(parsing.model_path()),
+            "dilate_ratio": mask.dilate_ratio if mask else None,
             "feather_ratio": mask.feather_ratio if mask else None,
-            "gradient_ratio": mask.gradient_ratio if mask else None,
+            "neck_ratio": mask.neck_ratio if mask else None,
         },
-        # Первый шаг пайплайна виден отдельно: по этим числам сразу понятно,
-        # выполняется ли перенос головы локально и с какими допусками.
-        "collage": {
-            "segmenter_photo": settings.seg_model_photo,
-            "segmenter_cover": settings.seg_model_cover,
-            "weights_ready": _weights_ready(),
-            "colour_match": settings.collage_colour_match,
-            "erase_template_head": settings.collage_erase_template_head,
+        # Первый шаг двухшаговой стратегии. Виден всегда, работает только при
+        # active=true: фейссвоп в одиночку волос не касается вовсе
+        "hair": {
+            "active": bool(profile and profile.strategy == "hair_swap"),
+            "endpoint": profile.hair.endpoint if profile else None,
+            "payload": profile.hair.payload.name if profile else None,
+            "description": profile.hair.description if profile else "",
+            "dilate_ratio": profile.hair.dilate_ratio if profile else None,
+            "feather_ratio": profile.hair.feather_ratio if profile else None,
+            "protect_ratio": profile.hair.protect_ratio if profile else None,
+            "forehead_ratio": profile.hair.forehead_ratio if profile else None,
+            "core_ratio": profile.hair.core_ratio if profile else None,
+            "crop_ratio": profile.hair.crop_ratio if profile else None,
+            "min_changed": profile.hair.min_changed if profile else None,
         },
         # Мимика: какие значения параметра emotion эндпоинт сейчас принимает
         "expressions": expression.available(),

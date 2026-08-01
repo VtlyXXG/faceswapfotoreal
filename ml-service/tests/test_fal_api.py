@@ -108,13 +108,26 @@ def test_extract_image_takes_first_of_images():
     assert fal_api._extract_image(result)["url"] == "https://cdn/a.png"
 
 
+def test_extract_image_understands_a_single_image_response():
+    """
+    Форм ответа две, и обе живые. Диффузия отдаёт список `images` — она умеет
+    несколько вариантов за вызов; фейссвоп и реставраторы отдают одиночный
+    `image`, потому что вариант у них ровно один. Не разобрать вторую форму
+    значит уронить рабочий путь на РАЗБОРЕ УСПЕШНОГО ответа.
+    """
+    result = {"image": {"url": "https://cdn/b.png"}, "seed": 2}
+
+    assert fal_api._extract_image(result)["url"] == "https://cdn/b.png"
+
+
 @pytest.mark.parametrize(
     "response",
     [
         {"images": []},
         {},
         {"images": [{}]},  # объект без ссылки
-        {"image": {"url": "x"}},  # форма чужого эндпоинта
+        {"image": {}},  # одиночный объект без ссылки
+        {"video": {"url": "x"}},  # форма чужого эндпоинта
     ],
 )
 def test_extract_image_rejects_empty_response(response):

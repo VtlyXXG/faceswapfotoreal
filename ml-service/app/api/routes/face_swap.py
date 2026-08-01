@@ -41,6 +41,13 @@ async def swap(
     source: UploadFile = File(..., description="Фото-донор лица"),
     target: UploadFile = File(..., description="Иллюстрация, куда переносим"),
     emotion: str = Form("", description="Мимика: пусто или neutral — лицо как снято"),
+    hair: str = Form(
+        "",
+        description=(
+            "Причёска заказчика словами. На двухшаговом пути обязательна: "
+            "фотография на шаг причёски не отправляется"
+        ),
+    ),
     target_face_index: int | None = Form(None),
     swap_all_faces: bool = Form(False),
     enhance: bool = Form(False, description="Согласовать лицо с иллюстрацией"),
@@ -57,6 +64,7 @@ async def swap(
             source=await _read(source),
             target=await _read(target),
             emotion=emotion,
+            hair=hair,
             target_face_index=target_face_index,
             swap_all_faces=swap_all_faces,
             enhance=enhance,

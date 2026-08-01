@@ -93,10 +93,20 @@ def upload(client, data: bytes, content_type: str) -> str:
 
 
 def _extract_image(result: dict) -> dict:
-    """Достаёт объект изображения: эндпоинт отдаёт список images."""
+    """
+    Достаёт объект изображения из ответа.
+
+    Форм две, и обе живые. Диффузионные эндпоинты отдают список `images` —
+    они умеют рисовать несколько вариантов за вызов. Фейссвоп и реставраторы
+    отдают одиночный `image`: вариант у них ровно один, выбирать не из чего.
+
+    Разбирается это здесь, а не в стратегии: форма ответа — свойство транспорта,
+    а не подхода, и стратегии от неё уже отделены.
+    """
     result = result or {}
+
     images = result.get("images") or []
-    image = images[0] if images else None
+    image = images[0] if images else result.get("image")
 
     if not image or not image.get("url"):
         raise FalError("Ответ fal не содержит изображения", {"response_keys": list(result)})

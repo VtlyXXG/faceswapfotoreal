@@ -18,24 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-# Веса сегментатора кладутся в образ на сборке. Иначе их скачивает первый же
-# заказ: ~176 МБ на модель, минуты ожидания в задаче, которая должна была
-# просто выполниться, — и так в каждом новом контейнере при масштабировании.
-ENV U2NET_HOME=/opt/rembg
-RUN python -c "from rembg import new_session; [new_session(m) for m in ('u2net_human_seg', 'u2net')]"
-
 # Веса семантической разметки человека (~16 МБ): лицо, волосы, кожа тела,
-# одежда. Кладутся на этапе сборки по той же причине, что и веса rembg. Без
-# файла сервис работает — разметка просто отключается, и код падает обратно на
-# цветовые эвристики, — но кожу от бежевой одежды они не отличают, замерено.
+# одежда. По ним строится маска головы на шаблоне. Кладутся на этапе сборки,
+# иначе их качает первый же заказ — в каждом новом контейнере при
+# масштабировании. Без файла сервис работает: маска строится эллипсом по сетке
+# лица, но формы причёски эллипс не знает и берёт её с запасом.
 ENV MEDIAPIPE_HOME=/opt/mediapipe
 RUN python -c "import urllib.request, os; os.makedirs('/opt/mediapipe', exist_ok=True);     urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite',     '/opt/mediapipe/selfie_multiclass_256x256.tflite')"
 
 COPY pyproject.toml ./
 COPY app ./app
 
-# Диффузия идёт на fal.ai; локально работают только mediapipe (везёт свою
-# модель внутри пакета) и сегментатор rembg с весами из /opt/rembg.
+# Генерация идёт на fal.ai; локально работает только mediapipe — сетка лица
+# (модель внутри пакета) и разметка человека с весами из /opt/mediapipe.
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
