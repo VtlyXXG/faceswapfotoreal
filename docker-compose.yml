@@ -7,7 +7,6 @@ services:
       - '3000:3000'
     environment:
       STORAGE_ROOT: /data
-      # Полная автономность: заказы в Postgres, задачи в Redis
       DB_DRIVER: postgres
       DATABASE_URL: postgres://projectx:projectx@postgres:5432/projectx
       QUEUE_DRIVER: redis
@@ -25,7 +24,6 @@ services:
         condition: service_healthy
 
   # Воркер: тот же образ, но выполняет задачи и не принимает HTTP.
-  # Три реплики стартуют всегда — ручной --scale не нужен.
   worker:
     build: .
     command: ['node', 'src/worker.js']
@@ -48,39 +46,21 @@ services:
       ml-service:
         condition: service_healthy
 
-  # ML-сервис: замена лица. Локальных весов нет — инференс идёт на fal.ai,
-  # локально считается только маска лица (mediapipe везёт модель в пакете).
+  # ML-сервис: замена лица. Инференс идёт на fal.ai,
+  # локально считается только маска лица.
   ml-service:
     build: ./ml-service
     ports:
       - '8000:8000'
     environment:
       ML_ENV: production
-      # Формат консоли. false — человекочитаемый, и поля диагностики (масштаб
-      # вклейки, доли масок) печатаются рядом с сообщением; true — тот же набор
-      # полей, но JSON, для сборщика логов. Строку [geometry] видно в обоих:
-      #   docker compose logs ml-service | grep geometry
       ML_LOG_JSON: ${ML_LOG_JSON:-false}
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
       ML_ALLOWED_ORIGINS: http://localhost:3000
-      # Сведение стыка выполняется на fal.ai — без ключа /health/ready даёт degraded
       FAL_KEY: ${FAL_KEY:-}
-      # Веса сегментатора лежат в образе (см. ml-service/Dockerfile), качать их
-      # в рантайме не нужно
-      U2NET_HOME: /opt/rembg
-      # Голова переносится локально аппликацией, на fal уходит стилизация.
-      # Гиперпараметры второго шага живут набором — профилем; см.
-      # ml-service/app/pipelines/refine/profiles.py.
-      #   seam  — strength 0.20, модель только сводит шов
-      #   blend — strength 0.26, градиентная маска: шея и контур волос сводятся
-      #           мягко, но геометрия причёски не плывёт
-      # Подбирается в .env без пересборки: docker compose up -d ml-service
-      ML_REFINE_PROFILE: ${ML_REFINE_PROFILE:-blend}
+      ML_REFINE_PROFILE: ${ML_REFINE_PROFILE:-pixar_real}
       ML_REFINE_STRENGTH: ${ML_REFINE_STRENGTH:-}
-      ML_REFINE_CONTROLS: ${ML_REFINE_CONTROLS:-}
-      ML_COLLAGE_COLOUR_MATCH: ${ML_COLLAGE_COLOUR_MATCH:-0.8}
-      ML_COLLAGE_ERASE_TEMPLATE_HEAD: ${ML_COLLAGE_ERASE_TEMPLATE_HEAD:-true}
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
       interval: 10s
