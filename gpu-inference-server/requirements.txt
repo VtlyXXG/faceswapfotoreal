@@ -1,0 +1,71 @@
+# Python 3.11 — та же граница, что у ml-service (pyproject: >=3.11,<3.12)
+#
+# Ставить ТОЛЬКО на инстанс с картой. Версии torch/diffusers/transformers
+# намеренно совпадают с теми, что уже лежат в ml-service/.venv, — там они
+# оказались в CPU-сборке (torch 2.4.1+cpu), здесь нужна CUDA-сборка. Отличается
+# ровно индекс, поэтому строка ниже обязательна:
+#
+#     pip install -r requirements.txt
+#
+# Проверка после установки — она же ответ на вопрос «а карта-то видна»:
+#
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+#     # ожидается 2.4.1+cu124 True, а НЕ 2.4.1+cpu False
+#
+# cu124 — для драйвера 550+. На драйвере 525-545 замените на cu121: torch сам
+# несёт рантайм CUDA, но старше драйвера он не прыгнет.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- Torch ---
+torch==2.4.1
+torchvision==0.19.1
+
+# --- Диффузия ---
+# diffusers 0.30.3 несёт StableDiffusionXLControlNetInpaintPipeline, который
+# умеет и 4-канальный UNet, и 9-канальный (inpaint-вариант SDXL). Ниже 0.27
+# этого пайплайна нет вовсе.
+diffusers==0.30.3
+transformers==4.44.2
+accelerate==0.34.2
+safetensors==0.4.5
+huggingface-hub==0.25.1
+
+# --- Web ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-multipart==0.0.9
+
+# --- Кадр ---
+# headless-сборка: серверу нужен cv2 без GTK/Qt, а полная тянет их за собой и
+# требует libgtk в образе
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+# numpy строго 1.x: torch 2.4 и opencv 4.10 собраны против ABI 1.x, и numpy 2
+# ломает их обоих в рантайме, а не на установке. Пин тот же, что в ml-service
+numpy==1.26.4
+
+# --- Восстановление лица (CodeFormer) — СТАВИТСЯ ОТДЕЛЬНО ---
+# Детекция, выравнивание и обратная вклейка лица.
+#
+# Здесь закомментировано намеренно, а не забыто. facexlib объявляет
+# зависимостью opencv-python — ПОЛНЫЙ, не headless, — и pip ставит его рядом с
+# нашим opencv-python-headless. Оба пакета кладут один и тот же модуль cv2,
+# перезаписывая файлы друг друга: что окажется рабочим, зависит от порядка
+# установки, и ломается это не здесь, а на первом импорте libGL в рантайме.
+#
+# Поэтому двумя шагами, ПОСЛЕ основного набора (порядок обязателен — headless
+# ставится последним и забирает cv2 себе):
+#
+#     pip install --no-cache-dir facexlib==0.3.0
+#     pip install --no-cache-dir --force-reinstall opencv-python-headless==4.10.0.84
+#
+# Без facexlib восстановление лица просто выключается, сервер работает, причина
+# видна на /health/ready. Полный порядок — в setup_server.sh, шаг 9.
+# facexlib==0.3.0
+
+# --- Прочее ---
+python-dotenv==1.0.1
+# Многопоточная докачка весов: 7 ГБ SDXL по одному соединению тянутся заметно
+# дольше. Включается переменной HF_HUB_ENABLE_HF_TRANSFER=1
+hf-transfer==0.1.8
