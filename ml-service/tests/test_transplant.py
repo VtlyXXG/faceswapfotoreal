@@ -556,7 +556,7 @@ def test_the_skin_of_the_generation_is_pulled_to_the_skin_of_the_template(monkey
     result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
 
     assert meta["skin_matched"] is True
-    assert meta["skin_gain"] < 0.95, "кожа донора светлее — множитель обязан её притемнить"
+    assert meta["skin_gamma"] > 1.05, "кожа донора светлее — гамма обязана её притемнить"
 
     def lightness(image):
         return float(cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[80:120, 80:120, 0].mean())
@@ -605,3 +605,24 @@ def test_the_skin_match_can_be_switched_off(scene):
     off = transplant.transplant(template, generated, 0.12, 0.10, 0.35, match_skin=False)
 
     assert "skin_matched" not in off.meta
+
+
+def test_a_darker_donor_is_lightened_without_burning_the_skin(monkeypatch):
+    """
+    Донор бывает смуглее персонажа, и тогда кожу надо ОСВЕТЛЯТЬ. Множитель на
+    этом ломался: на живом перегоне при 1.319 и 1.465 в белое выбивало 20% и 16%
+    пикселей кожи. Гамма оставляет концы шкалы на месте, поэтому пересвета не
+    даёт ни при каком тоне донора.
+    """
+    template, aligned, mask, parsed = _skin_scene()
+    # Меняем роли: теперь смуглый донор под маской, светлый персонаж в шаблоне
+    template[60:160, 60:140] = (190, 205, 230)
+    aligned[60:160, 60:140] = (55, 62, 85)
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed)
+
+    result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
+
+    assert meta["skin_matched"] is True
+    assert meta["skin_gamma"] < 0.95, "кожа донора темнее — гамма обязана её поднять"
+    burnt = int((result[60:160, 60:140].max(axis=2) >= 254).sum())
+    assert burnt == 0, f"{burnt} пикселей кожи выбито в белое"
