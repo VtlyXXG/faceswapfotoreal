@@ -447,7 +447,12 @@ def _neck_strip(
     return strip
 
 
-def _fabric_guard(shape: tuple[int, int], parsed: parsing.Parsed | None, face_height: float) -> Any:
+def _fabric_guard(
+    shape: tuple[int, int],
+    parsed: parsing.Parsed | None,
+    face_height: float,
+    region: Any = None,
+) -> Any:
     """
     Защита одежды: то, что вычитается из маски последним действием.
 
@@ -456,6 +461,23 @@ def _fabric_guard(shape: tuple[int, int], parsed: parsing.Parsed | None, face_he
     поэтому маска гаснет НАД тканью, а не по её кромке: сама ткань не получает
     ни единицы, а переход от маски к нулю укладывается в поле над ней.
 
+    ПОЛЕ НЕ ЗАХОДИТ НА ВОЛОСЫ ПЕРСОНАЖА. Запас над тканью нужен затем, что по
+    кромке воротника идёт полупрозрачный антиалиасинг, и маска, доведённая до
+    неё вплотную, зацепит первый ряд ткани. Но там, где соседом ткани оказалась
+    не кожа, а прядь волос, лежащая ПОВЕРХ одежды, поле обходится дорого:
+    расширение съедает прядь на несколько пикселей, маска рвёт её поперёк, верх
+    уходит под перерисовку, а низ остаётся от прежнего героя — на плече повисает
+    тёмный обрубок. Замерено на dino1: поле гасило маску с 0.02 до 0.53-0.84 как
+    раз на тех строках, где разметка ещё уверенно говорит HAIR.
+
+    Волосы персонажа перерисовываются в любом случае — они и есть то, что мы
+    заменяем, — поэтому запас над ними не защищает ничего. Сама ткань при этом не
+    теряет ни единицы защиты: `region` по построению не содержит класса CLOTHES
+    (см. `_region_from_parsing`), и на каждом пикселе ткани поле остаётся ровно
+    таким, каким было.
+
+    :param region: рабочая область до расширения. Нужна, чтобы снять поле только
+        с волос НАШЕГО персонажа, а не всего класса волос на развороте
     :return: вес 0..1 той же формы, где 1 — «сюда нельзя», либо None
     """
     import cv2
@@ -471,8 +493,17 @@ def _fabric_guard(shape: tuple[int, int], parsed: parsing.Parsed | None, face_he
     margin = max(1, int(round(face_height * _CLOTHES_MARGIN_RATIO)))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin + 1,) * 2)
     guard = cv2.GaussianBlur(cv2.dilate(clothes, kernel), (2 * margin + 1,) * 2, 0)
+    guard = guard.astype(np.float32) / 255.0
 
-    return guard.astype(np.float32) / 255.0
+    if region is not None:
+        # Именно ПОСЛЕ размытия: до него вычитание не дало бы ничего — классы
+        # HAIR и CLOTHES не пересекаются, и снимать поле было бы не с чего. Всё
+        # поле над тканью и есть результат расширения с размытием, и снимается
+        # ровно оно
+        own_hair = (np.asarray(parsed.hair) > 127) & (np.asarray(region) > 127)
+        guard = np.where(own_hair, 0.0, guard).astype(np.float32)
+
+    return guard
 
 
 def _depth_cutoff(
@@ -631,7 +662,7 @@ def build(
     # шевроны — не пускать туда маску вовсе.
     grown = mask
 
-    fabric = _fabric_guard(shape, parsed, face_height)
+    fabric = _fabric_guard(shape, parsed, face_height, region)
     if fabric is not None:
         mask = (mask.astype(np.float32) * (1.0 - fabric)).astype(np.uint8)
     else:

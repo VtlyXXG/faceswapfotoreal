@@ -89,18 +89,23 @@ def scene(monkeypatch, mesh):
             _MARK_GENERATED: _parsed(gen_centre, gen_axes),
         }
 
-        def pick(table):
+        # Силуэт головы для ВЫРОВНЕННОЙ генерации: та же геометрия лица, что у
+        # шаблона (подобие её туда и посадило), но другая форма причёски. Из
+        # этой разницы и берётся зона-сирота — место, которое шаблонная маска
+        # накрывает, а новая голова нет. Совпади силуэты, дефекта бы не было, и
+        # заглушка проверяла бы не то.
+        aligned_parsed = _parsed(_TEMPLATE_CENTRE, (int(_HEAD_AXES[0] * 0.6), _HEAD_AXES[1]))
+
+        def pick(table, fallback):
             def choose(image):
-                # Кадров у нас на самом деле три: шаблон, генерация и ВЫРОВНЕННАЯ
-                # генерация. Метку последняя не несёт — варп её сдвигает, — и это
-                # верно по смыслу: после подобия голова стоит там же и того же
-                # размера, что шаблонная, поэтому ей и отдаётся шаблонная сетка
-                return table.get(int(image[0, 0, 0]), table[_MARK_TEMPLATE])
+                # Кадров на самом деле три: шаблон, генерация и выровненная
+                # генерация. Метку последняя не несёт — варп её сдвигает
+                return table.get(int(image[0, 0, 0]), fallback)
 
             return choose
 
-        monkeypatch.setattr(head_mask, "try_landmarks", pick(meshes))
-        monkeypatch.setattr(parsing, "parse", pick(parses))
+        monkeypatch.setattr(head_mask, "try_landmarks", pick(meshes, meshes[_MARK_TEMPLATE]))
+        monkeypatch.setattr(parsing, "parse", pick(parses, aligned_parsed))
         return template, generated, meshes
 
     return build
@@ -310,6 +315,64 @@ def test_the_crop_fallback_returns_coordinates_of_the_full_frame(monkeypatch, me
     assert points is not None
     chin = points[152]
     assert abs(chin[0] - expected[152][0]) <= 3 and abs(chin[1] - expected[152][1]) <= 3
+
+
+def test_under_the_old_head_goes_the_plate_and_not_the_generation(scene):
+    """
+    Зона-сирота: шаблонная маска её накрывает, новая голова — нет.
+
+    Ради этого места модуль и переделывался. Без стирания туда попадало
+    содержимое выровненной генерации — её собственные воротник и плечи, сдвинутые
+    подобием, — и на стыке шеи выходило два воротника вместо одного. Проверяется,
+    что теперь там лежит именно подложка.
+    """
+    template, generated, _ = scene(gen_centre=(200, 150), gen_scale=0.8)
+    plate = np.full_like(template, 7)  # заведомо неповторимый тон
+    plate[0, 0] = template[0, 0]
+
+    result = transplant.transplant(template, generated, 0.12, 0.10, 0.35, plate=plate)
+
+    old = head_mask.build(template, 0.12, 0.10, 0.35).mask
+    assert result.meta["orphan_px"] > 0, "сироты нет — проверять нечего"
+    assert result.meta["plate"] is True
+
+    # В глубине зоны, куда новая голова точно не дотянулась, обязан быть тон плиты
+    deep = (old >= 255) & (np.all(np.abs(result.image.astype(int) - 7) <= 1, axis=2))
+    assert deep.sum() > 0, "подложка не попала в кадр вовсе"
+
+
+def test_the_plate_never_leaks_outside_the_template_mask(scene):
+    """Стирание правит только то, что под шаблонной маской, и ни пикселем больше."""
+    template, generated, _ = scene(gen_centre=(205, 185), gen_scale=0.95)
+    plate = np.full_like(template, 7)
+    result = transplant.transplant(template, generated, 0.12, 0.10, 0.35, plate=plate)
+
+    outside = np.ones(_SHAPE, dtype=bool)
+    outside[40:350, 90:320] = False
+    assert np.array_equal(result.image[outside], template[outside])
+
+
+def test_a_plate_of_the_wrong_size_is_refused(scene):
+    template, generated, _ = scene()
+    with pytest.raises(InvalidImageError):
+        transplant.transplant(template, generated, 0.12, 0.10, 0.35,
+                              plate=np.zeros((10, 10, 3), np.uint8))
+
+
+def test_without_a_plate_it_still_works_but_warns(scene, caplog):
+    """
+    Откат обязан остаться рабочим: сервер стирания может быть недоступен, и
+    ронять из-за этого весь заказ неправильно. Но молчать тоже нельзя — дефект
+    на стыке шеи должен быть виден в логе, а не только на печати.
+    """
+    import logging
+
+    template, generated, _ = scene(gen_centre=(200, 150), gen_scale=0.8)
+    with caplog.at_level(logging.WARNING):
+        result = transplant.transplant(template, generated, 0.12, 0.10, 0.35, plate=None)
+    assert result.meta["plate"] is False
+    assert result.meta["orphan_px"] > 0
+    assert any("стирание не передано" in r.message for r in caplog.records)
 
 
 def test_meta_reports_what_was_done(scene):

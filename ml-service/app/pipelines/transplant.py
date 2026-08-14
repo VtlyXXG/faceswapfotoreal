@@ -228,15 +228,35 @@ def transplant(
     feather_ratio: float,
     neck_ratio: float,
     match_tone: bool = True,
+    plate: Any = None,
 ) -> Transplanted:
     """
     Возвращает шаблон, в котором заменена только голова.
+
+    ЧТО ЛОЖИТСЯ ПОД СТАРУЮ ГОЛОВУ. Маска шаблона и маска новой головы совпадают
+    не полностью: у прежнего героя своя причёска, у нового своя, и между ними
+    остаётся зона, которую надо очистить от старой головы, но накрыть новой
+    нечем. На замере это 8819 пикселей из 49874 — шестая часть маски.
+
+    Класть туда выровненную генерацию НЕЛЬЗЯ, и это проверено дорого: подобие
+    сдвигает её по вертикали (на замеренном кадре на 11 пикселей), вместе с
+    головой уезжают её собственные воротник и плечи, и на стыке шеи выходит два
+    воротника вместо одного. Замер: 3458 пикселей результата расходятся с
+    шаблоном больше чем на 32 уровня, максимум 207.
+
+    Правильное содержимое там — продолжение шаблонной одежды и фона, то есть
+    стирание. Его делает LaMa на GPU-сервере (`/v1/erase`), и результат
+    передаётся сюда параметром `plate`.
 
     :param template: шаблон-разворот, BGR numpy.ndarray. Источник всего, что не
         голова, — и источник побитово
     :param generated: ответ генеративного редактора, BGR numpy.ndarray
     :param match_tone: привести тон генерации к шаблону перед вклейкой. Считается
         по пикселям вне ОБЕИХ масок, где обе картинки изображают одно и то же
+    :param plate: шаблон со стёртой по маске головой. None — старая голова
+        накрывается генерацией, и на стыке шеи появляется описанное выше
+        удвоение; путь оставлен рабочим на случай недоступного сервера, но
+        сопровождается предупреждением в логе
     :raises InvalidImageError: голову не нашли на шаблоне или на генерации, либо
         подобие вышло за пределы правдоподобного
     """
@@ -286,7 +306,11 @@ def transplant(
     head_old = head_mask.build(template, dilate_ratio, feather_ratio, neck_ratio)
     mask = np.maximum(head_new.mask, head_old.mask)
 
+    orphan = int(np.count_nonzero((head_old.mask > 127) & (head_new.mask <= 127)))
+
     meta = {
+        "orphan_px": orphan,
+        "plate": plate is not None,
         "scale": round(scale, 3),
         "angle": round(angle, 1),
         "shift": [round(float(matrix[0, 2]), 1), round(float(matrix[1, 2]), 1)],
@@ -301,7 +325,25 @@ def transplant(
         aligned, tone = _match_tone(template, aligned, mask)
         meta.update(tone)
 
-    result = _paste(template, aligned, mask)
+    if plate is None:
+        if orphan:
+            log.warning(
+                "стирание не передано — под старой головой останется содержимое "
+                "генерации, на стыке шеи возможно удвоение воротника",
+                extra={"orphan_px": orphan},
+            )
+        result = _paste(template, aligned, mask)
+    else:
+        if plate.shape != template.shape:
+            raise InvalidImageError(
+                "Стёртая подложка другого размера, чем шаблон",
+                {"plate": list(plate.shape), "template": list(template.shape)},
+            )
+        # Два действия по очереди, и порядок важен: сперва со всей шаблонной
+        # маски снимается старая голова, потом на её место садится новая. Вне
+        # обеих масок ни один байт не трогается ни на одном из шагов
+        cleared = _paste(template, plate, head_old.mask)
+        result = _paste(cleared, aligned, head_new.mask)
     meta["changed_px"] = int(np.count_nonzero(np.any(result != template, axis=2)))
     log.info("голова пересажена в шаблон", extra=meta)
     return Transplanted(image=result, meta=meta)

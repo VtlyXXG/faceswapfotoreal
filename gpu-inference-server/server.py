@@ -1502,6 +1502,75 @@ async def render_endpoint(request: RenderRequest) -> dict[str, Any]:
     }
 
 
+class EraseRequest(BaseModel):
+    """
+    Пакет стирания. Те же поля, что у генерации, но нужны только два.
+
+    Отдельная схема, а не переиспользование `RenderRequest`: у того половина
+    полей обязательна для диффузии и здесь смысла не имеет, а необязательные
+    поля в запросе, который их игнорирует, — это приглашение прислать их и
+    удивиться, что ничего не изменилось.
+    """
+
+    base_image: str
+    mask_image: str
+    output_format: str = "png"
+
+    @field_validator("output_format")
+    @classmethod
+    def _known_format(cls, value: str) -> str:
+        if value.lower() not in {"png", "jpg", "jpeg"}:
+            raise ValueError("output_format: только png или jpg")
+        return value.lower()
+
+
+@app.post("/v1/erase", summary="Стереть содержимое маски (LaMa)")
+async def erase_endpoint(request: EraseRequest) -> dict[str, Any]:
+    """
+    Стирание без генерации: под маской остаётся правдоподобное продолжение сцены.
+
+    Существует ради пересадки головы в ml-service. Там генеративный редактор
+    отдаёт свою голову, но СТАРУЮ убрать нечем: вклейка накрывает только новую,
+    а под шаблонной маской остаётся ободок прежней причёски. Класть туда
+    выровненную генерацию нельзя — её воротник и плечи сдвинуты подобием
+    относительно шаблонных, и на стыке шеи получается два воротника вместо
+    одного (замерено: 3458 пикселей расходятся с шаблоном больше чем на 32
+    уровня). Правильное содержимое там — продолжение шаблонной одежды и фона,
+    а это ровно то, что делает LaMa.
+
+    Очередь общая с генерацией: карта одна, и стирание на ней не бесплатное.
+    """
+    if MODELS.eraser.kind == "none":
+        raise HTTPException(503, "стирание недоступно: веса не загружены")
+
+    original = decode_image(request.base_image, "base_image")
+    mask = normalise_mask(decode_image(request.mask_image, "mask_image", grayscale=True),
+                          original.shape[:2])
+    if mask_bbox(mask) is None:
+        raise HTTPException(422, "mask_image: маска пустая — стирать нечего")
+
+    timings: dict[str, float] = {}
+    try:
+        async with QUEUE.slot() as waited:
+            with stage(timings, "erase"):
+                plate = await asyncio.to_thread(MODELS.eraser.erase, original, mask)
+    except QueueFull as exc:
+        raise HTTPException(503, f"очередь переполнена: {exc}") from exc
+    except QueueTimeout as exc:
+        raise HTTPException(503, f"перегрузка: {exc}") from exc
+
+    return {
+        "image": encode_image(plate, request.output_format),
+        "encoding": f"image/{'jpeg' if request.output_format in {'jpg', 'jpeg'} else 'png'}",
+        "meta": {
+            "erase_backend": MODELS.eraser.kind,
+            "mask_px": int(np.count_nonzero(mask)),
+            "timings": timings,
+            "queue_wait_s": round(waited, 3),
+        },
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 
