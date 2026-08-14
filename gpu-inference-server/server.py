@@ -181,6 +181,57 @@ CODEFORMER_W = _env_float("GPU_CODEFORMER_W", 0.7)
 ERASE_ENABLED = _env_bool("GPU_ERASE", True)
 RESTORE_ENABLED = _env_bool("GPU_RESTORE_FACE", True)
 
+# --- Демонстрационный путь: FLUX.2 + пересадка головы ------------------------
+#
+# Отдельный путь, а не замена основному. Он принимает СЫРОЕ фото ребёнка и сам
+# делает всё, что раньше делал ml-service до запроса: маска головы, кроп лица,
+# стирание, пересадка. Нужен для показа «загрузили фото — получили результат»,
+# без промежуточных ручных шагов.
+DEMO_ENABLED = _env_bool("GPU_DEMO", True)
+FLUX_MODEL = _env("GPU_FLUX_MODEL", "black-forest-labs/FLUX.2-klein-4B")
+
+# Где лежит пакет `app` из ml-service: маска головы, разметка, пересадка. Код
+# намеренно не дублируется — он уже написан, покрыт тестами и измерен, а копия
+# разошлась бы с оригиналом на первой же правке.
+MLSERVICE_PATH = _env("GPU_MLSERVICE_PATH", "")
+
+# Параметры генерации демо-пути. Подобраны замером и менять их без нового замера
+# не следует:
+#   8 шагов  — +0.05 к сходству против 4; на 16 уже хуже, чем на 8, при
+#              трёхкратном времени
+#   guidance 1.0 — режим дистиллированной модели, выше она ломается
+FLUX_STEPS = _env_int("GPU_FLUX_STEPS", 8)
+FLUX_GUIDANCE = _env_float("GPU_FLUX_GUIDANCE", 1.0)
+
+# Промпт-запрет вместо промпта-описания. Проверено на четырёх формулировках:
+# описание ракурса словами («голова отвёрнута и наклонена вниз») заставляло
+# модель довернуть голову ещё дальше, и лицо переставало находиться вовсе. Этот
+# вариант дал лучшее удержание позы и лучшее сходство одновременно.
+FLUX_PROMPT = _env(
+    "GPU_FLUX_PROMPT",
+    "Replace only the facial features of the child in the first image with the "
+    "facial features of the child in the second image. Do not change the head "
+    "orientation, the gaze direction, the hair position, the body pose or "
+    "anything else in the first image.",
+)
+
+# Рабочее разрешение демо-пути. У модели потолок 4 мегапикселя, берём с запасом:
+# на 8 шагах активации толще, и на 2048x2048 рядом с занятой картой уже ловился
+# OutOfMemory.
+FLUX_MAX_PIXELS = _env_int("GPU_FLUX_MAX_PIXELS", 3_400_000)
+
+# Доли маски головы — те же, что у боевого профиля ml-service (`MaskProfile`).
+DEMO_DILATE_RATIO = _env_float("GPU_DEMO_DILATE", 0.12)
+DEMO_FEATHER_RATIO = _env_float("GPU_DEMO_FEATHER", 0.10)
+DEMO_NECK_RATIO = _env_float("GPU_DEMO_NECK", 0.35)
+
+# Кроп лица донора: сторона холста и во сколько раз шире поле зрения. 512 и 1.2
+# против «боевых» 112 и 1.0 — потому что потребитель другой. Тем 112 нужен был
+# вход распознавателя, где причёска мешает; генеративному редактору нужно лицо
+# целиком, вместе с овалом и волосами.
+DEMO_DONOR_SIDE = _env_int("GPU_DEMO_DONOR_SIDE", 512)
+DEMO_DONOR_MARGIN = _env_float("GPU_DEMO_DONOR_MARGIN", 1.2)
+
 # Согласование тона генерации с шаблоном перед вклейкой, см. `match_levels`.
 # Ручка нужна затем, что поправка держится на допущении о сцене, а не на
 # арифметике: если она однажды сработает не туда, выключить её надо переменной
@@ -344,6 +395,76 @@ def encode_image(image: np.ndarray, fmt: str = "png", quality: int = 95) -> str:
 def snap(value: int) -> int:
     """Ближайшее кратное восьми: и VAE, и ControlNet работают по сетке 8."""
     return max(8, int(round(value / 8)) * 8)
+
+
+_MLSERVICE: dict[str, Any] = {}
+
+
+def mlservice() -> dict[str, Any]:
+    """
+    Модули ml-service: маска головы, разметка, пересадка, выравнивание донора.
+
+    Импорт отложенный и кэшированный. Отложенный — потому что путь к пакету
+    приходит из окружения и на боевом образе его может не быть вовсе; кэшированный
+    — потому что `parsing` держит граф tflite глобальным объектом, и второй
+    импорт стоил бы второй загрузки весов.
+
+    :raises HTTPException: 503, если пакет не найден или не импортируется. Текст
+        уходит клиенту как есть: это не ошибка запроса, а незавершённая установка
+    """
+    if _MLSERVICE:
+        return _MLSERVICE
+
+    if MLSERVICE_PATH and MLSERVICE_PATH not in sys.path:
+        sys.path.insert(0, MLSERVICE_PATH)
+
+    # ml-service требует Python 3.11 (`requires-python = ">=3.11,<3.12"`), и
+    # `app.core.logging` берёт оттуда `datetime.UTC`. На демонстрационном хосте
+    # стоит 3.10, и поднимать там вторую сборку интерпретатора ради одной
+    # константы дороже, чем объявить её здесь.
+    #
+    # Это ЗАПЛАТКА, а не решение: правильный ход — python 3.11 на хосте. Правка
+    # живёт здесь, а не в копии ml-service, намеренно — копия обязана оставаться
+    # побайтово равной репозиторию, иначе следующий, кто её обновит, молча
+    # затрёт исправление и будет искать причину в другом месте.
+    import datetime as _datetime
+
+    if not hasattr(_datetime, "UTC"):
+        _datetime.UTC = _datetime.timezone.utc
+
+    try:
+        from app.pipelines import head_mask, transplant
+        from app.pipelines.refine.adapter import AntelopeExtractor
+    except ImportError as exc:
+        raise HTTPException(
+            503,
+            f"пакеты ml-service недоступны: {exc}. Укажите GPU_MLSERVICE_PATH "
+            f"на каталог с пакетом app (сейчас: {MLSERVICE_PATH or 'не задан'})",
+        ) from exc
+
+    _MLSERVICE.update(head_mask=head_mask, transplant=transplant, extractor=AntelopeExtractor)
+    return _MLSERVICE
+
+
+def _mlservice_reason() -> str:
+    """Почему демо-путь не готов, если дело в пакетах. Пусто — всё на месте."""
+    try:
+        mlservice()
+    except HTTPException as exc:
+        return str(exc.detail)
+    return ""
+
+
+def flux_size(height: int, width: int) -> tuple[int, int]:
+    """
+    Размер кадра для FLUX.2: кратный шестнадцати и не крупнее потолка.
+
+    Кратность обязательна — модель делит кадр на патчи, — а потолок стоит из-за
+    памяти: на 8 шагах активации толще, и полный разворот 2048x2048 рядом с
+    занятой картой уже падал по OutOfMemory.
+    """
+    scale = min(1.0, (FLUX_MAX_PIXELS / float(height * width)) ** 0.5)
+    return (max(16, int(height * scale) // 16 * 16), max(16, int(width * scale) // 16 * 16))
 
 
 def working_size(height: int, width: int) -> tuple[int, int]:
@@ -927,6 +1048,110 @@ class Renderer:
         log.info("IP-Adapter подключён", extra={"scale": IPADAPTER_SCALE})
 
 
+@dataclass
+class Flux2Renderer:
+    """
+    FLUX.2 [klein] 4B — генеративный редактор под демонстрационный путь.
+
+    ЧЕМ ОН ОТЛИЧАЕТСЯ ОТ `Renderer`. Тот инпейнтит по маске: рисует внутри дыры
+    и не трогает остальное. Этот так не умеет вовсе — он переписывает кадр
+    целиком и возвращает СВОЮ сцену, расходясь с шаблоном на два десятка уровней
+    по всему полю. Зато личность он переносит вдвое точнее: замер по семи детям
+    на трёх шаблонах дал 0.56 против 0.25 у SDXL с IP-Adapter.
+
+    Отсюда разделение обязанностей: этот класс отвечает только за голову, а
+    возврат шаблона на место — за `transplant` в ml-service.
+
+    ПОЧЕМУ ЗАГРУЗКА ОТЛОЖЕННАЯ И ПАДАЮЩАЯ МЯГКО. `Flux2KleinPipeline` появился в
+    diffusers недавно и есть не во всякой сборке: в образе с torch 2.4 его нет и
+    быть не может. Сервис от этого не обязан переставать работать — он обязан
+    честно сказать на `/health/ready`, что демонстрационный путь недоступен, и
+    продолжать обслуживать остальные.
+
+    Веса лицензионно чистые (Apache 2.0) и не тянут за собой ни одной модели
+    распознавания лиц — ради этого их и выбирали.
+    """
+
+    model_id: str
+    device: str
+    _pipe: Any = field(default=None, init=False, repr=False)
+    _ready: bool = field(default=False, init=False)
+    _reason: str = field(default="", init=False)
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    @property
+    def reason(self) -> str:
+        return self._reason
+
+    def load(self) -> None:
+        import torch
+
+        if self._ready or self._reason:
+            return
+
+        try:
+            from diffusers import Flux2KleinPipeline
+        except ImportError as exc:
+            self._reason = f"diffusers без Flux2KleinPipeline: {exc}"
+            log.warning("демонстрационный путь выключен", extra={"reason": self._reason})
+            return
+
+        try:
+            pipe = Flux2KleinPipeline.from_pretrained(self.model_id, dtype=torch.bfloat16)
+        except Exception as exc:  # noqa: BLE001 — нет весов, нет сети, битый кэш
+            self._reason = f"веса не загрузились: {exc}"
+            log.warning("демонстрационный путь выключен", extra={"reason": self._reason})
+            return
+
+        # Оффлоад, а не .to(device): модель с текстовым энкодером занимает больше,
+        # чем остаётся на карте рядом с LaMa, и держать её целиком незачем — пик
+        # с оффлоадом 10.6 ГБ против 24 доступных
+        pipe.enable_model_cpu_offload()
+        self._pipe = pipe
+        self._ready = True
+        log.info("FLUX.2 загружен", extra={"model": self.model_id})
+
+    def render(self, template: np.ndarray, donor: np.ndarray, *, steps: int,
+               guidance: float, seed: int | None) -> np.ndarray:
+        """
+        Кадр по двум картинкам: шаблон первым референсом, лицо донора вторым.
+
+        Порядок референсов — часть контракта промпта: он говорит «лицо из ВТОРОЙ
+        картинки на ребёнка из ПЕРВОЙ», и перестановка меняет смысл на обратный.
+        """
+        import torch
+        from PIL import Image
+
+        if not self._ready:
+            raise HTTPException(503, self._reason or "FLUX.2 не загружен")
+
+        height, width = flux_size(*template.shape[:2])
+        def to_pil(array: np.ndarray, size: tuple[int, int]) -> Image.Image:
+            resized = cv2.resize(array, size, interpolation=cv2.INTER_LANCZOS4)
+            return Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
+
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        donor_side = donor.shape[0] // 16 * 16
+        result = self._pipe(
+            image=[to_pil(template, (width, height)),
+                   to_pil(donor, (donor_side, donor_side))],
+            prompt=FLUX_PROMPT,
+            height=height,
+            width=width,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            generator=generator,
+        ).images[0]
+
+        return cv2.cvtColor(np.asarray(result), cv2.COLOR_RGB2BGR)
+
+
 # --- 4. Состояние процесса ---------------------------------------------------
 
 
@@ -935,12 +1160,15 @@ class Models:
     renderer: Renderer
     eraser: LamaEraser
     restorer: FaceRestorer
+    flux: Flux2Renderer
 
     def load(self) -> None:
         self.renderer.load()
         self.eraser.load()
         if RESTORE_ENABLED:
             self.restorer.load()
+        if DEMO_ENABLED:
+            self.flux.load()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -957,6 +1185,13 @@ class Models:
                 "path": str(DIR_IPADAPTER),
             },
             "erase": {"enabled": ERASE_ENABLED, "backend": self.eraser.kind},
+            "demo": {
+                "enabled": DEMO_ENABLED,
+                "ready": self.flux.ready,
+                "reason": self.flux.reason,
+                "model": FLUX_MODEL,
+                "pipelines": _mlservice_reason() or "ok",
+            },
             "restore": {
                 "enabled": RESTORE_ENABLED,
                 "backend": self.restorer.kind,
@@ -975,6 +1210,7 @@ MODELS = Models(
         device=DEVICE,
         fidelity=CODEFORMER_W,
     ),
+    flux=Flux2Renderer(model_id=FLUX_MODEL, device=DEVICE),
 )
 QUEUE = GpuQueue(QUEUE_SLOTS, QUEUE_MAX_WAITING, QUEUE_WAIT_TIMEOUT)
 
@@ -1569,6 +1805,268 @@ async def erase_endpoint(request: EraseRequest) -> dict[str, Any]:
             "queue_wait_s": round(waited, 3),
         },
     }
+
+
+class DemoRequest(BaseModel):
+    """
+    Пакет демонстрации: шаблон и СЫРОЕ фото ребёнка.
+
+    Ни маски, ни кропа, ни промпта здесь нет намеренно. Всё это сервер считает
+    сам — в этом и смысл: показ должен выглядеть как «загрузили фотографию,
+    получили картинку», а не как последовательность из четырёх запросов.
+    """
+
+    base_image: str
+    donor_photo: str
+
+    seed: int | None = None
+    steps: int = Field(default=FLUX_STEPS, ge=1, le=50)
+    guidance_scale: float = Field(default=FLUX_GUIDANCE, ge=0.0, le=10.0)
+    output_format: str = "png"
+
+    @field_validator("output_format")
+    @classmethod
+    def _known_format(cls, value: str) -> str:
+        if value.lower() not in {"png", "jpg", "jpeg"}:
+            raise ValueError("output_format: только png или jpg")
+        return value.lower()
+
+
+def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Весь путь одним проходом: фото и шаблон на входе, готовый разворот на выходе.
+
+        разметка шаблона  -> маска головы и её силуэт
+        сетка лица донора -> выровненный кроп лица
+        FLUX.2            -> кадр с новой головой, но со СВОЕЙ сценой
+        LaMa              -> шаблон со стёртой старой головой
+        transplant        -> голова из генерации в шаблон, остальное побитово
+
+    Порядок не переставляется: стирание идёт по силуэту, а силуэт считается по
+    шаблону, и обе величины нужны пересадке одновременно.
+    """
+    modules = mlservice()
+    head_mask, transplant = modules["head_mask"], modules["transplant"]
+    timings: dict[str, float] = {}
+    meta: dict[str, Any] = {}
+
+    template = decode_image(request.base_image, "base_image")
+    photo = decode_image(request.donor_photo, "donor_photo")
+
+    with stage(timings, "geometry"):
+        points = transplant._full_frame_landmarks(template)
+        if points is None:
+            raise HTTPException(422, "base_image: на шаблоне не найден персонаж")
+        geometry = head_mask.face_geometry(points)
+
+        donor_points = head_mask.try_landmarks(photo)
+        if donor_points is None:
+            raise HTTPException(
+                422,
+                "donor_photo: лицо не найдено. Нужен портрет, где лицо занимает "
+                "хотя бы пятую часть кадра — это предел детектора, а не каприз",
+            )
+        donor = _donor_crop(photo, donor_points, modules)
+        head = head_mask.build(template, DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO)
+        silhouette = transplant.head_silhouette(template, points, geometry["face_height"])
+
+    with stage(timings, "generate"):
+        generated = MODELS.flux.render(
+            template, donor,
+            steps=request.steps, guidance=request.guidance_scale, seed=request.seed,
+        )
+
+    plate = None
+    if silhouette is not None and MODELS.eraser.kind != "none":
+        with stage(timings, "erase"):
+            plate = MODELS.eraser.erase(template, silhouette)
+    elif silhouette is None:
+        # Без разметки силуэта нет, а стирать по рабочей маске нельзя: она
+        # расширена на 29 пикселей за голову, и LaMa заменит целый фон догадкой
+        log.warning("силуэт головы не построен — пересадка пойдёт без стирания")
+
+    with stage(timings, "transplant"):
+        pasted = transplant.transplant(
+            template, generated,
+            DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO,
+            plate=plate,
+        )
+
+    meta.update(pasted.meta)
+    meta.update(
+        {
+            "size": {"height": int(template.shape[0]), "width": int(template.shape[1])},
+            "flux_size": dict(zip(("height", "width"), flux_size(*template.shape[:2]))),
+            "mask_px": int(np.count_nonzero(head.mask > 127)),
+            "face_height": round(float(geometry["face_height"]), 1),
+            "donor_face_px": round(float(head_mask.face_geometry(donor_points)["face_height"]), 1),
+            "donor_outside": round(_donor_outside(photo, donor_points, modules), 3),
+            "steps": request.steps,
+            "guidance_scale": request.guidance_scale,
+            "seed": request.seed,
+            "erased": plate is not None,
+            "timings": timings,
+        }
+    )
+    return pasted.image, meta
+
+
+def _donor_crop(photo: np.ndarray, points: list, modules: dict[str, Any]) -> np.ndarray:
+    """
+    Выровненное лицо донора на квадратном холсте.
+
+    Подобие берётся из живого кода экстракции (`AntelopeExtractor._matrix`) — то
+    самое, что сажает глаза, нос и углы рта в канонические позиции, — и только
+    пересчитывается под другой холст и более широкое поле зрения. Благодаря
+    этому портрет по грудь и лицо крупным планом дают один и тот же кроп: именно
+    инвариантность к кадрировке здесь и нужна, иначе результат зависел бы от
+    того, как родитель держал телефон.
+    """
+    matrix = np.asarray(modules["extractor"]._matrix(points), dtype=np.float64)
+
+    # Пересчёт под другой холст и более широкое поле: точка q в 112-координатах
+    # переносится как (q - 56) * k + side/2. Формула и интерполяция взяты из
+    # проверенного пути буква в букву — теми же кропами измерены 0.56 сходства,
+    # и «улучшение» здесь означало бы, что число относится к чему-то другому
+    side, margin = DEMO_DONOR_SIDE, DEMO_DONOR_MARGIN
+    scale = side / (112.0 * margin)
+    matrix[:, :2] *= scale
+    matrix[:, 2] = scale * (matrix[:, 2] - 56.0) + side / 2.0
+
+    return cv2.warpAffine(
+        photo, matrix, (side, side),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _donor_outside(photo: np.ndarray, points: list, modules: dict[str, Any]) -> float:
+    """
+    Какая доля кропа НЕ пришла из фотографии, 0..1.
+
+    Плотно кадрированный портрет при широком поле вылезает за край, и там
+    `BORDER_REPLICATE` размазывает крайний пиксель полосами. Для генератора это
+    не лицо, а шум. Число уходит в отчёт: заметное значение объясняет слабый
+    результат лучше, чем любые догадки о модели.
+    """
+    matrix = np.asarray(modules["extractor"]._matrix(points), dtype=np.float64)
+    side, margin = DEMO_DONOR_SIDE, DEMO_DONOR_MARGIN
+    scale = side / (112.0 * margin)
+    matrix[:, :2] *= scale
+    matrix[:, 2] = scale * (matrix[:, 2] - 56.0) + side / 2.0
+
+    inside = cv2.warpAffine(
+        np.full(photo.shape[:2], 255, dtype=np.uint8), matrix, (side, side),
+        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return 1.0 - float(np.count_nonzero(inside)) / float(side * side)
+
+
+@app.post("/v1/demo-render", summary="Фото ребёнка + шаблон -> готовый разворот")
+async def demo_endpoint(request: DemoRequest) -> dict[str, Any]:
+    """
+    Один запрос на весь путь. Ответ — `{"image": base64, "meta": {...}}`.
+
+    Синхронный: показ идёт вживую, и просить заказчика опрашивать статус задачи
+    ради тридцати секунд — плохой сценарий демонстрации.
+    """
+    if not DEMO_ENABLED:
+        raise HTTPException(503, "демонстрационный путь выключен (GPU_DEMO=0)")
+    if not MODELS.flux.ready:
+        raise HTTPException(503, MODELS.flux.reason or "FLUX.2 не загружен")
+
+    try:
+        async with QUEUE.slot() as waited:
+            started = time.perf_counter()
+            image, meta = await asyncio.to_thread(run_demo, request)
+            meta["queue_wait_s"] = round(waited, 3)
+            meta["total_s"] = round(time.perf_counter() - started, 3)
+    except QueueFull as exc:
+        raise HTTPException(503, f"очередь переполнена: {exc}") from exc
+    except QueueTimeout as exc:
+        raise HTTPException(503, f"перегрузка: {exc}") from exc
+
+    return {
+        "image": encode_image(image, request.output_format),
+        "encoding": f"image/{'jpeg' if request.output_format in {'jpg', 'jpeg'} else 'png'}",
+        "meta": meta,
+    }
+
+
+_DEMO_PAGE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Книга с твоим лицом</title>
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;
+      background:#101418;color:#e8eaed;max-width:900px;margin:0 auto}
+ h1{font-size:22px;margin:0 0 4px} p.sub{color:#9aa0a6;margin:0 0 24px;font-size:14px}
+ .row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+ label{flex:1;min-width:220px;background:#1b2026;border:1px solid #2c333b;border-radius:12px;
+       padding:16px;cursor:pointer;display:block}
+ label span{display:block;font-size:13px;color:#9aa0a6;margin-bottom:8px}
+ input[type=file]{width:100%;color:#e8eaed;font-size:14px}
+ button{width:100%;padding:16px;font-size:17px;border:0;border-radius:12px;
+        background:#3b82f6;color:#fff;cursor:pointer}
+ button:disabled{background:#2c333b;color:#6b7280;cursor:default}
+ #out{margin-top:24px} img{width:100%;border-radius:12px;display:block}
+ #status{margin-top:16px;color:#9aa0a6;font-size:14px;min-height:20px}
+ .err{color:#f28b82}
+</style></head><body>
+<h1>Книга с твоим лицом</h1>
+<p class="sub">Выберите фотографию ребёнка и разворот книги — остальное сделает сервер.</p>
+<div class="row">
+  <label><span>1. Фотография ребёнка</span><input type="file" id="photo" accept="image/*"></label>
+  <label><span>2. Разворот книги</span><input type="file" id="template" accept="image/*"></label>
+</div>
+<button id="go" disabled>Сделать</button>
+<div id="status"></div>
+<div id="out"></div>
+<script>
+const photo=document.getElementById('photo'), template=document.getElementById('template'),
+      go=document.getElementById('go'), status=document.getElementById('status'),
+      out=document.getElementById('out');
+function check(){ go.disabled=!(photo.files[0] && template.files[0]); }
+photo.onchange=check; template.onchange=check;
+function b64(file){ return new Promise((ok,bad)=>{ const r=new FileReader();
+  r.onload=()=>ok(r.result.split(',')[1]); r.onerror=bad; r.readAsDataURL(file); }); }
+go.onclick=async()=>{
+  go.disabled=true; out.innerHTML=''; status.className='';
+  const t0=Date.now(); let dots=0;
+  const tick=setInterval(()=>{ dots=(dots+1)%4;
+    status.textContent='Рисуем'+'.'.repeat(dots)+'  '+Math.round((Date.now()-t0)/1000)+' с'; },500);
+  try{
+    const r=await fetch('v1/demo-render',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base_image:await b64(template.files[0]),
+                           donor_photo:await b64(photo.files[0])})});
+    clearInterval(tick);
+    if(!r.ok){ const t=await r.text(); status.className='err';
+      status.textContent='Не получилось: '+t.slice(0,300); go.disabled=false; return; }
+    const d=await r.json();
+    out.innerHTML='<img src="data:'+(d.encoding||'image/png')+';base64,'+d.image+'">';
+    status.textContent='Готово за '+Math.round((Date.now()-t0)/1000)+' с';
+  }catch(e){ clearInterval(tick); status.className='err';
+    status.textContent='Ошибка сети: '+e; }
+  go.disabled=false;
+};
+</script></body></html>"""
+
+
+@app.get("/demo", summary="Страница показа: загрузить фото и получить разворот")
+async def demo_page() -> Any:
+    """
+    Одностраничник для живого показа с телефона или ноутбука.
+
+    Отдаётся самим сервисом, а не отдельным фронтендом: показывать надо сегодня,
+    и заводить ради этого статику, сборку и второй адрес — значит потратить время
+    на инфраструктуру вместо демонстрации. Ни одной внешней зависимости в
+    странице нет, потому что сервер живёт оффлайн и CDN ему недоступен.
+
+    Путь к API относительный (`v1/demo-render`), чтобы страница одинаково
+    работала и через туннель, и по прямому адресу, и из-под обратного прокси.
+    """
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse(_DEMO_PAGE)
 
 
 if __name__ == "__main__":
