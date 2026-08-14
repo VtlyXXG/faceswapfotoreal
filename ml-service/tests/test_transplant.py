@@ -426,3 +426,182 @@ def test_meta_reports_what_was_done(scene):
     for field in ("scale", "angle", "shift", "mask_px", "changed_px"):
         assert field in meta
     assert 0 < meta["changed_px"] < _SHAPE[0] * _SHAPE[1]
+
+
+# --- отдельные пряди за силуэтом ---------------------------------------------
+
+
+def _with_parsing(monkeypatch, mesh, parsed=None, centre=_TEMPLATE_CENTRE):
+    """Ставит заглушки сетки и разметки на один кадр и отдаёт точки."""
+    points = mesh(centre=centre)
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: points)
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed or _parsed(centre))
+    return points
+
+
+def test_the_silhouette_takes_in_a_strand_the_parsing_missed(monkeypatch, mesh):
+    """
+    Волосок тона причёски, которого нет в классе HAIR, обязан попасть в стирание.
+
+    Ради этого случая матирование и заведено: сегментатор работает на сетке
+    256x256, прядь толщиной в пиксель в класс не попадает ни на каком
+    разрешении, и на готовых кадрах такие волоски прежнего героя доходили до
+    печати нетронутыми — поверх новой головы.
+    """
+    import cv2
+
+    image = _frame(_MARK_TEMPLATE)
+    cv2.line(image, (145, 180), (132, 180), (200, 200, 200), 2)
+    points = _with_parsing(monkeypatch, mesh)
+
+    silhouette = transplant.head_silhouette(image, points, 80.0)
+
+    strand = np.zeros(_SHAPE, dtype=np.uint8)
+    cv2.line(strand, (145, 180), (132, 180), 255, 2)
+    covered = (silhouette[strand > 0] > 127).mean()
+    assert covered > 0.8, f"волосок накрыт только на {covered:.0%}"
+
+
+def test_a_lonely_spot_is_not_a_strand(monkeypatch, mesh):
+    """
+    Прядь растёт из причёски. Отдельно стоящее пятно тона волос — это птица в
+    небе или деталь пейзажа, и отдавать её LaMa значит менять шаблон там, где
+    никакой старой головы нет.
+    """
+    image = _frame(_MARK_TEMPLATE)
+    image[176:184, 126:132] = 200  # тон причёски, но до головы не достаёт
+    points = _with_parsing(monkeypatch, mesh)
+
+    silhouette = transplant.head_silhouette(image, points, 80.0)
+
+    assert (silhouette[176:184, 126:132] > 127).mean() < 0.05
+
+
+def test_the_matte_never_reaches_into_the_clothes(monkeypatch, mesh):
+    """
+    Последнее слово за тканью — то же требование, что у `_fabric_guard`.
+
+    Полоска тона причёски на одежде разложением объясняется не хуже настоящей
+    пряди: она такая же тёмная на таком же светлом. Отличить её нечем, кроме
+    разметки, и поэтому запрет на ткань снимать нельзя ни при каких числах.
+    """
+    image = _frame(_MARK_TEMPLATE)
+    image[276:280, 150:250] = 200
+    points = _with_parsing(monkeypatch, mesh)
+
+    silhouette = transplant.head_silhouette(image, points, 80.0)
+
+    assert (silhouette[276:280, 150:250] > 127).mean() < 0.05
+
+
+def test_a_frame_without_strands_keeps_the_bare_silhouette(monkeypatch, mesh):
+    """На гладком кадре матирование обязано не добавить ничего."""
+    import cv2
+
+    image = _frame(_MARK_TEMPLATE)
+    points = _with_parsing(monkeypatch, mesh)
+    own, parsed = transplant._own_head(image, points)
+
+    grow = max(1, int(round(80.0 * transplant._ERASE_DILATE_RATIO)))
+    feather = max(1, int(round(80.0 * transplant._ERASE_FEATHER_RATIO)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2)
+    bare = cv2.GaussianBlur(
+        cv2.dilate((own * 255).astype(np.uint8), kernel), (2 * feather + 1,) * 2, 0)
+
+    assert np.array_equal(transplant.head_silhouette(image, points, 80.0), bare)
+
+
+# --- тон кожи ----------------------------------------------------------------
+
+
+def _skin_scene():
+    """
+    Шаблон со смуглым персонажем и генерация со светлым ребёнком.
+
+    Ровно тот случай, ради которого писан `_match_skin`: под маской кожа светлее
+    шаблонной, и ниже стыка это видно как резкая граница поперёк шеи.
+    """
+    shape = (200, 200)
+    template = np.full((*shape, 3), 40, dtype=np.uint8)
+    aligned = np.full((*shape, 3), 40, dtype=np.uint8)
+    template[20:60, 60:140] = (30, 30, 30)      # причёска персонажа
+    aligned[20:60, 60:140] = (60, 200, 220)     # причёска донора, светлая
+    template[60:160, 60:140] = (90, 100, 130)   # кожа персонажа, смуглая
+    aligned[60:160, 60:140] = (170, 190, 220)   # кожа донора, светлая
+
+    skin = np.zeros(shape, dtype=np.uint8)
+    hair = np.zeros(shape, dtype=np.uint8)
+    skin[60:160, 60:140] = 255
+    hair[20:60, 60:140] = 255
+    parsed = parsing.Parsed(face=skin, hair=hair, skin=np.zeros(shape, np.uint8),
+                            clothes=np.zeros(shape, np.uint8))
+
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[20:130, 55:145] = 255
+    return template, aligned, mask, parsed
+
+
+def test_the_skin_of_the_generation_is_pulled_to_the_skin_of_the_template(monkeypatch):
+    """
+    Замер на 21 кадре: без этой поправки светлота кожи на стыке шеи прыгает на
+    14.5 L* (dino1_id4) и на 24 L* (dino1_id6) при собственном перепаде шаблона
+    в тех же кольцах 34±2 L*. Двигается генерация, а не шаблон: шаблон обязан
+    дойти до печати побитово.
+    """
+    import cv2
+
+    template, aligned, mask, parsed = _skin_scene()
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed)
+
+    result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
+
+    assert meta["skin_matched"] is True
+    assert meta["skin_gain"] < 0.95, "кожа донора светлее — множитель обязан её притемнить"
+
+    def lightness(image):
+        return float(cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[80:120, 80:120, 0].mean())
+
+    assert abs(lightness(result) - lightness(template)) < abs(
+        lightness(aligned) - lightness(template)
+    ), "после правки кожа обязана стать ближе к шаблонной, а не дальше"
+
+
+def test_the_skin_match_leaves_the_hair_alone(monkeypatch):
+    """
+    Множитель по светлоте на волосах перекрасил бы причёску заодно: коэффициент
+    0.69 с замеренного кадра превращает светлые волосы в тёмно-русые. Цвет волос
+    — не дефект стыка, и трогать его этой правкой незачем.
+    """
+    template, aligned, mask, parsed = _skin_scene()
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed)
+
+    result, _ = transplant._match_skin(template, aligned, mask, parsed, 80.0)
+
+    assert np.array_equal(result[25:40, 70:130], aligned[25:40, 70:130])
+
+
+def test_without_skin_under_the_mask_the_tone_is_left_alone(monkeypatch):
+    """
+    Кожи под маской нет — мерить не по чему. Тогда честнее не трогать ничего:
+    поправка, посчитанная по случайным точкам, перекрасила бы лицо в цвет
+    ошибки разметки.
+    """
+    template, aligned, mask, parsed = _skin_scene()
+    bare = parsing.Parsed(
+        face=np.zeros(mask.shape, np.uint8), hair=parsed.hair,
+        skin=np.zeros(mask.shape, np.uint8), clothes=np.zeros(mask.shape, np.uint8))
+    monkeypatch.setattr(parsing, "parse", lambda _: bare)
+
+    result, meta = transplant._match_skin(template, aligned, mask, bare, 80.0)
+
+    assert meta["skin_matched"] is False
+    assert np.array_equal(result, aligned)
+
+
+def test_the_skin_match_can_be_switched_off(scene):
+    """Переключатель нужен затем же, зачем `match_tone`: чтобы отделить дефект от правки."""
+    template, generated, _ = scene(gen_centre=(205, 185), gen_scale=0.95)
+
+    off = transplant.transplant(template, generated, 0.12, 0.10, 0.35, match_skin=False)
+
+    assert "skin_matched" not in off.meta

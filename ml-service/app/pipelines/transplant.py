@@ -57,6 +57,72 @@ SCALE_MODE = "head"
 _ERASE_DILATE_RATIO = 0.03
 _ERASE_FEATHER_RATIO = 0.03
 
+# Кольцо вокруг силуэта, в котором ищутся отдельные пряди, доли высоты лица.
+# Замерено по dino1: самые дальние волоски прежнего героя уходят от силуэта на
+# 14 px при высоте лица 135, то есть на 0.10. Шире брать нечем: за кольцом
+# начинается фон, который обязан дойти до печати нетронутым.
+_MATTE_BAND_RATIO = 0.12
+
+# Ниже какой доли волоса в пикселе он считается фоном. Порог низкий намеренно:
+# прядь толщиной в пиксель почти нигде не бывает непрозрачной, и на 0.5 от неё
+# не остаётся ничего. Ложные срабатывания здесь ловятся не порогом, а
+# требованием невязки и запретом на ткань с кожей.
+_MATTE_FLOOR = 0.15
+
+# Насколько цвет пикселя обязан объясняться смесью «волосы плюс фон», уровни
+# 0..255 по каналу. Главная защита от ложных срабатываний: тёмная полоска
+# футболки или ветка в листве по яркости на прядь похожи, а по цвету в эту
+# смесь не ложатся.
+_MATTE_RESIDUAL = 16.0
+
+# Насколько волосы обязаны отличаться от фона, чтобы разложение вообще имело
+# смысл. Ниже этого разложение делит на шум и выдаёт альфу из ничего.
+_MATTE_CONTRAST = 12.0
+
+# Сколько раз кольцо шагает вдоль найденных прядей. Один шаг ловит бахрому у
+# самой копны, дальше волосок надо вести. Число невелико намеренно: каждый шаг
+# отодвигает опору фона, и на пятом-шестом разложение считало бы прядь по фону,
+# который сам наполовину состоит из прядей.
+_MATTE_PASSES = 3
+
+# Сторона клетки сегментатора: он размечает кадр на сетке 256x256 и растягивает
+# ответ обратно. На нашем развороте это 5.4 пикселя.
+_PARSING_GRID = 256.0
+
+# Кольцо внутри маски, в котором меряется тон кожи, доли высоты лица. Значение
+# выбрано перебором на 21 кадре по средней ошибке — насколько ступень на стыке
+# после правки расходится с естественным перепадом самого шаблона, L*:
+#
+#   кольцо   низ маски   dino1   dino2   spread_08
+#     0.05      75%        0.4     1.2      1.8
+#     0.10      75%        0.8     0.5      2.9
+#     0.15      85%        0.8     0.5      5.2
+#     0.20      60%        1.5     4.2      5.0
+#
+# Узкое кольцо лучше широкого, и причина видна по столбцу spread_08: там голова
+# занимает седьмую часть кадра, широкое кольцо уходит от стыка на десятки
+# пикселей и усредняет тон вместе с перепадом освещения, которого на самом стыке
+# нет. Мерить надо там, где виден дефект, а не рядом.
+_SKIN_RING_RATIO = 0.05
+
+# Ниже какой доли маски идёт замер. Верх маски — темя, там кожи нет вовсе, а
+# лоб освещён иначе, чем шея. Дефект живёт на стыке шеи, туда и смотрим.
+_SKIN_LOW_PERCENTILE = 75
+
+# Сколько пикселей кожи нужно с каждой стороны, чтобы поправке верить. Меньше —
+# значит, замер идёт по случайным точкам, и тогда правильнее не трогать ничего.
+_SKIN_MIN_PX = 200
+
+# Пределы поправки светлоты кожи. Выход за них означает, что мерка попала не на
+# кожу — например, разметка приняла за кожу песок или ткань, — и подгонка по
+# такому числу перекрасила бы лицо в цвет ошибки.
+_SKIN_GAIN_MIN, _SKIN_GAIN_MAX = 0.55, 1.8
+
+# Предел сдвига по цветности, единицы a* и b*. Смуглость от бледности отличается
+# в основном светлотой; сдвиг цветности нужен на разницу тёплого и холодного
+# света, а это единицы, не десятки.
+_SKIN_SHIFT_LIMIT = 10.0
+
 # Во сколько раз масштаб генерации может разойтись с шаблоном, прежде чем это
 # перестаёт быть подгонкой головы и становится признаком, что модель нарисовала
 # другую сцену. Полтора раза — это уже не «чуть мельче», а другой план.
@@ -114,14 +180,17 @@ def _full_frame_landmarks(image: Any) -> list[tuple[int, int]] | None:
     return [(int(x / scale) + x0, int(y / scale) + y0) for x, y in points]
 
 
-def _own_head(image: Any, points: list[tuple[int, int]]) -> Any:
+def _own_head(image: Any, points: list[tuple[int, int]]) -> tuple[Any, Any] | None:
     """
     Силуэт головы НАШЕГО персонажа: классы HAIR и FACE, связные с его лицом.
 
     Отсюда берут и размер головы (`head_extent`), и область стирания
     (`head_silhouette`) — источник один, и разойтись им негде.
 
-    :return: 0/1 uint8 либо None, если разметки нет или головы на ней не видно
+    :return: пара «силуэт 0/1 uint8, разметка» либо None, если разметки нет или
+        головы на ней не видно. Разметка отдаётся наружу, а не запрашивается
+        второй раз: она же отвечает, где ткань и кожа, а сегментатор стоит
+        десятки миллисекунд на кадр
     """
     import cv2
     import numpy as np
@@ -145,7 +214,129 @@ def _own_head(image: Any, points: list[tuple[int, int]]) -> Any:
     seed = np.zeros(image.shape[:2], dtype=np.uint8)
     cv2.fillPoly(seed, [head_mask.face_polygon(points)], 1)
     own = head_mask.component_of(head, seed)
-    return head if own is None else own
+    return (head if own is None else own), parsed
+
+
+def _strand_matte(image: Any, own: Any, parsed: Any, face_height: float) -> tuple[Any, dict]:
+    """
+    Отдельные волоски прежнего героя, которых разметка не видит.
+
+    ЗАЧЕМ. Силуэт стирания — это классы HAIR и FACE, а сегментатор работает на
+    сетке 256x256: на нашем развороте одна его клетка это 5.4 пикселя кадра.
+    Прядь толщиной в пиксель-другой, лежащая по небу, в класс не попадает
+    никогда — она не «волосы» и не «фон», она их СМЕСЬ, и правильный ответ про
+    неё не класс, а доля. Замерено на готовых кадрах: 109 пикселей волосков по
+    небу у dino1_id4 и 40 у dino1_id6 дошли до печати ПОБИТОВО — прежний герой
+    остался в книге прядями поверх новой головы, и глазами они заметны, потому
+    что тёмное на светлом. Разметка окна головы, увеличенного в пять раз,
+    добавляет к силуэту 1.2% причёски и этих прядей не находит тоже — значит,
+    дело не в разрешении, и семантикой задача не решается в принципе.
+
+    КАК. Пиксель кольца раскладывается на смесь двух цветов: волос и фона.
+    Оба берутся не из головы, а из кадра — усреднением по своей стороне
+    (`cv2.blur` по маске, делённый на blur самой маски, то есть среднее ровно по
+    тем пикселям, что принадлежат стороне). Доля волоса — проекция на отрезок
+    между ними. Это школьное разложение, и держится оно на двух проверках:
+
+      * НЕВЯЗКА. Смесь обязана сойтись с настоящим цветом пикселя. Тёмная
+        полоска футболки и ветка в листве по яркости на прядь похожи, а по цвету
+        в смесь «волосы плюс небо» не ложатся, и невязка их отсекает.
+      * СВЯЗНОСТЬ. Прядь растёт из причёски. Одиноко стоящее пятно — это не
+        прядь, а птеродактиль в небе, и стирать его нельзя.
+
+    Сверх этого действует запрет на ткань и открытую кожу: последнее слово за
+    ними, как и в `head_mask._fabric_guard`. Одежда персонажа обязана дойти до
+    печати без изменений, и цена ошибки тут несимметрична — лишний волосок в
+    кадре хуже смотрится, но перерисованный воротник непоправим.
+
+    :return: 0/1 uint8 и отчёт. Маска бинарная, а не мягкая, намеренно: LaMa
+        достраивает область как целое, и просить у неё полупрозрачное стирание
+        нечем — она либо переписывает пиксель, либо нет. Смесь «20% волоса и 80%
+        неба» честнее целиком отдать под небо, тем более что альфа считается
+        только там, где вокруг действительно фон
+    """
+    import cv2
+    import numpy as np
+
+    band = max(2, int(round(face_height * _MATTE_BAND_RATIO)))
+    core = own > 0
+
+    # Ткань и кожа тела — не волосы, и разложение на них не запускается вовсе.
+    #
+    # Вето применяется по СЪЁЖЕННОМУ классу, и это не поблажка. Сегментатор
+    # размечает кадр на сетке 256x256: положение границы класса он знает с
+    # точностью до клетки, а клетка здесь 5.4 пикселя. У самой границы в классе
+    # «одежда» оказывается голое небо, а вместе с ним и лежащие по нему пряди.
+    # Замерено на dino1: вето по сырому классу накрывает 67% дошедших до печати
+    # волосков на id4 и 10% на id6, по съёженному — 100% на обоих, а лишнего
+    # стирания прибавляется 540 пикселей. Съёженный класс запрещает ровно то, в
+    # чём разметка уверена.
+    fabric = (np.asarray(parsed.clothes) > 127) | (np.asarray(parsed.skin) > 127)
+    cell = max(1, int(round(max(image.shape[:2]) / _PARSING_GRID)))
+    veto = cv2.erode(fabric.astype(np.uint8), cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * cell + 1,) * 2)) > 0
+
+    meta = {"band_px": band, "cell_px": cell}
+
+    # Окно вчетверо шире кольца: уже — и на тонкой пряди среднее фона наберётся
+    # из неё самой, то есть прядь объяснит сама себя и альфа выйдет нулевой
+    window = (4 * band) | 1
+    frame = image.astype(np.float32)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1,) * 2)
+
+    def side_colour(mask_bool: Any) -> tuple[Any, Any]:
+        """Средний цвет по СВОЕЙ стороне в окрестности каждого пикселя."""
+        weight = mask_bool.astype(np.float32)
+        total = cv2.blur(weight, (window, window))
+        colour = cv2.blur(frame * weight[..., None], (window, window))
+        return colour / np.maximum(total, 1e-6)[..., None], total
+
+    # Цвет волос берётся всегда по плотной копне, а не по уже найденным
+    # волоскам: те сами полупрозрачны, и подмешивать их в опорный цвет значит
+    # уводить его к фону с каждым шагом
+    hair_colour, hair_weight = side_colour(cv2.erode(own, np.ones((3, 3), np.uint8)) > 0)
+
+    # Кольцо шагает вдоль пряди, а не расширяется везде. Длинный волосок уходит
+    # от копны дальше кольца — на dino1 до 31 px при кольце 16, — но он связная
+    # линия, и найденный кусок сам служит опорой для следующего шага. Широкое
+    # кольцо вместо этого замерено и отвергнуто: на 0.20 высоты лица оно
+    # дотягивается до тени под челюстью и до шеи, то есть стирает уже не волосы.
+    found = np.zeros(own.shape, bool)
+    for _ in range(_MATTE_PASSES):
+        base = core | found
+        grown = cv2.dilate(base.astype(np.uint8), kernel) > 0
+        unknown = grown & ~base & ~veto
+        if not unknown.any():
+            break
+
+        back_colour, back_weight = side_colour(~grown)
+        delta = hair_colour - back_colour
+        contrast = np.linalg.norm(delta, axis=2)
+        usable = unknown & (contrast > _MATTE_CONTRAST) & (hair_weight > 1e-4) \
+            & (back_weight > 1e-4)
+        if not usable.any():
+            break
+
+        alpha = np.zeros(own.shape, np.float32)
+        num = ((frame - back_colour) * delta).sum(axis=2)
+        alpha[usable] = np.clip(num[usable] / (contrast[usable] ** 2), 0.0, 1.0)
+        residual = np.linalg.norm(frame - (back_colour + alpha[..., None] * delta), axis=2)
+        alpha[residual > _MATTE_RESIDUAL] = 0.0
+
+        fresh = alpha > _MATTE_FLOOR
+        if not fresh.any():
+            break
+        found |= fresh
+
+    strand = found.astype(np.uint8)
+    meta["raw_px"] = int(np.count_nonzero(strand))
+
+    # Прядь растёт из причёски: оставляем только то, что связано с силуэтом
+    joined = head_mask.component_of(np.maximum(strand, own), own)
+    strand = np.zeros(own.shape, np.uint8) if joined is None else (joined & ~core).astype(np.uint8)
+
+    meta["matte_px"] = int(np.count_nonzero(strand))
+    return strand, meta
 
 
 def head_silhouette(image: Any, points: list[tuple[int, int]], face_height: float) -> Any:
@@ -168,20 +359,55 @@ def head_silhouette(image: Any, points: list[tuple[int, int]], face_height: floa
     Силуэт знает форму, и потому запас поверх него нужен маленький: только на
     полупрозрачную кромку антиалиасинга, которую разметка относит к фону.
 
+    ЧЕГО СИЛУЭТУ НЕ ХВАТАЕТ. Отдельных волосков: их разметка не относит к
+    волосам ни на каком разрешении, и на готовых кадрах они доходили до печати
+    нетронутыми. Их добавляет `_strand_matte` — разложением цвета, а не классом.
+    Слепое расширение силуэта вместо этого замерено и отвергнуто: запас
+    0.15 высоты лица даёт у dino1 полосу в 15 259 px, из которых 11% ложится на
+    одежду и 12% на открытую кожу — ровно то, от чего защищает `clothes_guard`,
+    — а у dino2 79% полосы приходится на детальную листву, которую LaMa вернёт
+    размытым пятном.
+
     :return: маска 0..255 либо None, если разметки нет
     """
     import cv2
     import numpy as np
 
-    own = _own_head(image, points)
-    if own is None:
+    head = _own_head(image, points)
+    if head is None:
         return None
+    own, parsed = head
 
     grow = max(1, int(round(face_height * _ERASE_DILATE_RATIO)))
     feather = max(1, int(round(face_height * _ERASE_FEATHER_RATIO)))
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2)
     mask = cv2.dilate((own * 255).astype(np.uint8), kernel)
-    return cv2.GaussianBlur(mask, (2 * feather + 1,) * 2, 0)
+    mask = cv2.GaussianBlur(mask, (2 * feather + 1,) * 2, 0)
+
+    strand, meta = _strand_matte(image, own, parsed, face_height)
+    if not strand.any():
+        log.info("отдельных прядей за силуэтом не найдено", extra=meta)
+        return mask
+
+    # Волосок берётся вместе с собственной кромкой: на границе он полупрозрачен
+    # и с одним лишь ядром пряди в кадре остаётся его же ореол. Запас тот же,
+    # что у силуэта, и он тоже не выходит за пределы фона
+    strand = cv2.dilate(strand, cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2))
+    cell = max(1, int(round(max(image.shape[:2]) / _PARSING_GRID)))
+    fabric = (np.asarray(parsed.clothes) > 127) | (np.asarray(parsed.skin) > 127)
+    strand[cv2.erode(fabric.astype(np.uint8), cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * cell + 1,) * 2)) > 0] = 0
+
+    meta["erase_px"] = int(np.count_nonzero(mask > 127))
+    meta["added_px"] = int(np.count_nonzero((strand > 0) & (mask <= 127)))
+    # Сколько прядей попало в сырой класс ткани и кожи. Ноль здесь не нужен:
+    # волосы лежат ПОВЕРХ плеча, и разметка их плечу и отдаёт. Но если число
+    # сравнимо с `added_px`, значит стирается уже не прядь, а воротник, — и
+    # смотреть при жалобе на перерисованную одежду надо сюда
+    meta["on_fabric_px"] = int(np.count_nonzero((strand > 0) & fabric))
+    log.info("к силуэту добавлены пряди прежнего героя", extra=meta)
+    return np.maximum(mask, strand * 255)
 
 
 def head_extent(image: Any, points: list[tuple[int, int]]) -> float | None:
@@ -201,10 +427,10 @@ def head_extent(image: Any, points: list[tuple[int, int]]) -> float | None:
     """
     import numpy as np
 
-    own = _own_head(image, points)
-    if own is None:
+    head = _own_head(image, points)
+    if head is None:
         return None
-    area = int(np.count_nonzero(own))
+    area = int(np.count_nonzero(head[0]))
     return float(np.sqrt(area)) if area else None
 
 
@@ -285,6 +511,7 @@ def transplant(
     feather_ratio: float,
     neck_ratio: float,
     match_tone: bool = True,
+    match_skin: bool = True,
     plate: Any = None,
 ) -> Transplanted:
     """
@@ -310,6 +537,10 @@ def transplant(
     :param generated: ответ генеративного редактора, BGR numpy.ndarray
     :param match_tone: привести тон генерации к шаблону перед вклейкой. Считается
         по пикселям вне ОБЕИХ масок, где обе картинки изображают одно и то же
+    :param match_skin: привести отдельно тон КОЖИ — см. `_match_skin`. Общая
+        подгонка тона этого не делает и сделать не может: она считается по фону,
+        а разрыв возникает на шее, где светлая кожа донора встречается со смуглой
+        кожей персонажа
     :param plate: шаблон со стёртой головой. Стирать ОБЯЗАТЕЛЬНО той же маской,
         которой подложка потом применяется, то есть `head_silhouette`, — это
         требование корректности, а не экономии. Проверено дорого: плита,
@@ -389,6 +620,18 @@ def transplant(
         aligned, tone = _match_tone(template, aligned, mask)
         meta.update(tone)
 
+    if match_skin:
+        # Порядок важен: сперва общий увод по кадру, потом кожа. Наоборот —
+        # общая подгонка сдвинула бы уже исправленную кожу заново, и мерка,
+        # посчитанная по фону, съела бы мерку, посчитанную по коже
+        parsed_t = parsing.parse(template)
+        if parsed_t is None:
+            meta.update({"skin_matched": False, "skin_reason": "no_parsing"})
+        else:
+            aligned, skin = _match_skin(
+                template, aligned, head_new.mask, parsed_t, geometry_t["face_height"])
+            meta.update(skin)
+
     if plate is None:
         if orphan:
             log.warning(
@@ -460,6 +703,117 @@ def _match_tone(template: Any, aligned: Any, mask: Any) -> tuple[Any, dict]:
         "matched": True,
         "match_gain": [round(g, 3) for g, _ in fit],
         "match_bias": [round(b, 1) for _, b in fit],
+    }
+
+
+def _match_skin(
+    template: Any, aligned: Any, mask: Any, parsed_t: Any, face_height: float
+) -> tuple[Any, dict]:
+    """
+    Приводит тон КОЖИ генерации к тону кожи персонажа шаблона.
+
+    ЗАЧЕМ ОТДЕЛЬНО ОТ `_match_tone`. Та подгонка считается по пикселям ВНЕ
+    маски — по небу, горам, жилету и динозавру — и ловит общий увод экспозиции.
+    К коже она отношения не имеет, и замер это показал: на стыке шеи светлота
+    кожи прыгает на 14.5 L* (dino1_id4) и на 24 L* (dino1_id6), тогда как у
+    самого шаблона кожа в тех же кольцах ровная, 34±2 L*. То есть весь разрыв
+    внесён вклейкой, и виден он как резкая граница поперёк шеи: светлый
+    подбородок нового ребёнка над смуглой шеей прежнего героя.
+
+    ПОЧЕМУ ДВИГАЕМ ГЕНЕРАЦИЮ, А НЕ ШАБЛОН. Обратный ход — подкрасить шею и грудь
+    персонажа под донора — ломает главное обещание пайплайна: вне маски шаблон
+    доходит до печати побитово. Вдобавок красить пришлось бы всю видимую кожу
+    разворота, иначе шея сойдётся, а руки нет. Цена принятого решения названа
+    прямо: ребёнок получает тон кожи персонажа, а не свой.
+
+    ГДЕ МЕРЯЕТСЯ. В кольце ВНУТРИ маски, у самой границы вклейки, и только на
+    нижней её части — то есть на шее, а не на темени. Донор сравнивается с
+    ПРЕЖНИМ ГЕРОЕМ в том же самом кольце: под маской ещё лежит его кожа, и это
+    единственная пара замеров, у которой совпадают и место, и поза, и свет.
+
+    Сравнивать через границу — донора внутри с шаблоном снаружи — пробовали, и
+    так делать нельзя. Между подбородком и шеей есть законный перепад: одно
+    освещено, другое в тени. Правка, загоняющая этот перепад в ноль, на dino1
+    сработала (там он и был около нуля), а на spread_08, где голова занимает
+    седьмую часть кадра и перепад доходит до 8.6 L*, перевернула ступень с +0.4
+    на −6.3 — то есть починила кадр, который не был сломан. Замер внутри кольца
+    от этой ошибки свободен по построению: сравниваются две кожи в одной точке
+    сцены, и естественный перепад сокращается.
+
+    ЧЕМ ПРАВИТСЯ. Светлота — множителем, цветность — сдвигом. Множитель, а не
+    сдвиг, потому что тень на шее обязана остаться тенью: сдвиг поднял бы её
+    вместе со светами и сплющил объём.
+
+    :param parsed_t: разметка ШАБЛОНА, уже посчитанная вызывающим
+    :param face_height: высота лица персонажа, база всех долей в модуле
+    :return: поправленная генерация и отчёт
+    """
+    import cv2
+    import numpy as np
+
+    skin_t = np.asarray(parsed_t.bare_skin) > 127
+    parsed_g = parsing.parse(aligned)
+    if parsed_g is None:
+        return aligned, {"skin_matched": False, "skin_reason": "no_parsing"}
+    skin_g = np.asarray(parsed_g.bare_skin) > 127
+
+    inside = mask >= 250
+    if not inside.any():
+        return aligned, {"skin_matched": False, "skin_reason": "no_mask"}
+
+    ring = max(2, int(round(face_height * _SKIN_RING_RATIO)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring + 1,) * 2)
+    near_in = (cv2.erode(inside.astype(np.uint8), kernel) == 0) & inside
+
+    # Только низ маски: там шея, и там же виден дефект
+    rows = np.nonzero(inside)[0]
+    low = np.zeros(mask.shape, bool)
+    low[int(np.percentile(rows, _SKIN_LOW_PERCENTILE)):] = True
+
+    # Набор пикселей ОДИН на оба замера: кожа и у донора, и у прежнего героя.
+    # Считать медианы по своим наборам нельзя, и это проверено — разметка
+    # обводит кожу по-разному на двух картинках, один набор попадает на
+    # освещённую челюсть, другой на затенённую шею, и разница наборов уезжает в
+    # поправку как разница тона. На замере такая мерка тянула вниз лишние
+    # 3-7 L* на dino2 и spread_08.
+    both = near_in & skin_g & skin_t & low
+    if int(both.sum()) < _SKIN_MIN_PX:
+        return aligned, {
+            "skin_matched": False, "skin_reason": "no_skin",
+            "skin_px": int(both.sum()),
+        }
+
+    lab = cv2.cvtColor(aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_t = cv2.cvtColor(template, cv2.COLOR_BGR2LAB).astype(np.float32)
+    src = np.median(lab[both], axis=0)
+    dst = np.median(lab_t[both], axis=0)
+
+    gain = float(np.clip(dst[0] / max(1.0, src[0]), _SKIN_GAIN_MIN, _SKIN_GAIN_MAX))
+    shift = np.clip(dst[1:] - src[1:], -_SKIN_SHIFT_LIMIT, _SKIN_SHIFT_LIMIT)
+
+    # Правим только кожу: множитель по светлоте на волосах перекрасил бы
+    # причёску заодно. Переход мягкий — граница кожи и волос реальная, и резкая
+    # ступень по ней была бы видна не меньше исходного дефекта
+    weight = cv2.GaussianBlur(skin_g.astype(np.float32), (0, 0), max(1.0, ring / 2.0))
+    corrected = lab.copy()
+    corrected[..., 0] *= gain
+    corrected[..., 1:] += shift
+    lab = lab * (1.0 - weight[..., None]) + corrected * weight[..., None]
+
+    result = cv2.cvtColor(np.rint(np.clip(lab, 0, 255)).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    # Где кожи нет, не должно остаться и следа поправки. Обратное преобразование
+    # LAB меняет на единицу уровня весь кадр, и хотя вклейка эти пиксели всё
+    # равно не берёт, тихий шум по всей генерации — плохая цена за правку шеи
+    result[weight <= 0.0] = aligned[weight <= 0.0]
+    return result, {
+        "skin_matched": True,
+        "skin_px": int(both.sum()),
+        # Светлота в единицах L*, а не в байтах: 100 против 255, и путать их
+        # при чтении лога дороже, чем поделить здесь
+        "skin_donor_l": round(float(src[0]) / 2.55, 1),
+        "skin_host_l": round(float(dst[0]) / 2.55, 1),
+        "skin_gain": round(gain, 3),
+        "skin_shift": [round(float(v), 1) for v in shift],
     }
 
 
