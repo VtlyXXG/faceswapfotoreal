@@ -556,7 +556,7 @@ def test_the_skin_of_the_generation_is_pulled_to_the_skin_of_the_template(monkey
     result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
 
     assert meta["skin_matched"] is True
-    assert meta["skin_gamma"] > 1.05, "кожа донора светлее — гамма обязана её притемнить"
+    assert min(meta["skin_gamma"]) > 1.05, "кожа донора светлее — гамма обязана её притемнить"
 
     def lightness(image):
         return float(cv2.cvtColor(image, cv2.COLOR_BGR2LAB)[80:120, 80:120, 0].mean())
@@ -623,6 +623,28 @@ def test_a_darker_donor_is_lightened_without_burning_the_skin(monkeypatch):
     result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
 
     assert meta["skin_matched"] is True
-    assert meta["skin_gamma"] < 0.95, "кожа донора темнее — гамма обязана её поднять"
+    assert max(meta["skin_gamma"]) < 0.95, "кожа донора темнее — гамма обязана её поднять"
     burnt = int((result[60:160, 60:140].max(axis=2) >= 254).sum())
     assert burnt == 0, f"{burnt} пикселей кожи выбито в белое"
+
+
+def test_the_correction_stops_at_the_edge_of_the_scale(monkeypatch):
+    """
+    Гаммы мало: она держит внутри шкалы СВЕТЛОТУ, а вылезает за край цветовой
+    охват. У насыщенной кожи поднятая светлота выталкивает красный канал за 255
+    раньше, чем L дойдёт до сотни, — на перегоне так сгорело 8.4% пикселей лица
+    у dino1_id7. Пиксель обязан доехать к цели до упора и там остановиться.
+    """
+    template, aligned, mask, parsed = _skin_scene()
+    # Кожа персонажа почти белая, кожа донора — насыщенная и уже светлая:
+    # поправка потянет её вверх, и красный упрётся в потолок первым
+    template[60:160, 60:140] = (245, 248, 250)
+    aligned[60:160, 60:140] = (120, 160, 240)
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed)
+
+    result, meta = transplant._match_skin(template, aligned, mask, parsed, 80.0)
+
+    assert meta["skin_matched"] is True
+    burnt = int((result[60:160, 60:140].max(axis=2) >= 255).sum())
+    was = int((aligned[60:160, 60:140].max(axis=2) >= 255).sum())
+    assert burnt <= was, f"выбитых стало {burnt} против {was} в генерации"
