@@ -317,6 +317,47 @@ def test_the_crop_fallback_returns_coordinates_of_the_full_frame(monkeypatch, me
     assert abs(chin[0] - expected[152][0]) <= 3 and abs(chin[1] - expected[152][1]) <= 3
 
 
+def test_the_erase_silhouette_is_much_tighter_than_the_working_mask(monkeypatch, mesh):
+    """
+    Стирать по рабочей маске нельзя: она расширена на dilate + feather, и в этом
+    кольце шаблонный фон ЦЕЛ. Отдать его LaMa значит поменять чёткий фон на
+    догадку — на замере так и вышло, хребет за головой размывался.
+    """
+    image = _frame(_MARK_TEMPLATE)
+    points = mesh(centre=_TEMPLATE_CENTRE)
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: points)
+    monkeypatch.setattr(parsing, "parse", lambda _: _parsed(_TEMPLATE_CENTRE))
+
+    silhouette = transplant.head_silhouette(image, points, 80.0)
+    working = head_mask.build(image, 0.12, 0.10, 0.35).mask
+
+    assert silhouette is not None
+    tight = int((silhouette > 127).sum())
+    wide = int((working > 127).sum())
+    assert 0 < tight < wide, f"силуэт {tight} не меньше рабочей маски {wide}"
+
+
+def test_the_erase_silhouette_still_covers_the_head(monkeypatch, mesh):
+    """Запас поверх силуэта маленький, но кромку антиалиасинга он обязан накрыть."""
+    import cv2
+
+    image = _frame(_MARK_TEMPLATE)
+    points = mesh(centre=_TEMPLATE_CENTRE)
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: points)
+    parsed = _parsed(_TEMPLATE_CENTRE)
+    monkeypatch.setattr(parsing, "parse", lambda _: parsed)
+
+    silhouette = transplant.head_silhouette(image, points, 80.0)
+    hair = np.asarray(parsed.hair) > 127
+    covered = (silhouette[hair] > 127).mean()
+    assert covered > 0.95, f"силуэт накрыл только {covered:.0%} волос шаблона"
+
+
+def test_without_parsing_there_is_no_silhouette(monkeypatch, mesh):
+    monkeypatch.setattr(parsing, "parse", lambda _: None)
+    assert transplant.head_silhouette(_frame(_MARK_TEMPLATE), mesh(), 80.0) is None
+
+
 def test_under_the_old_head_goes_the_plate_and_not_the_generation(scene):
     """
     Зона-сирота: шаблонная маска её накрывает, новая голова — нет.
