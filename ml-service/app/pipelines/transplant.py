@@ -671,25 +671,43 @@ def _match_tone(template: Any, aligned: Any, mask: Any) -> tuple[Any, dict]:
     и есть увод. Здесь она нужна сильнее, чем там: генеративный редактор уводит
     тон заметно больше диффузии по маске.
     """
-    import cv2
     import numpy as np
 
     outside = mask <= 8
     if int(np.count_nonzero(outside)) < 64:
         return aligned, {"matched": False}
 
-    fit = []
+    fit, agreement = [], []
     for channel in range(template.shape[2]):
         source = aligned[..., channel][outside].astype(np.float64)
         target = template[..., channel][outside].astype(np.float64)
         variance = float(source.var())
         source_mean, target_mean = float(source.mean()), float(target.mean())
-        gain = 1.0 if variance < 4.0 else float(
-            ((source - source_mean) * (target - target_mean)).mean() / variance)
+        covariance = float(((source - source_mean) * (target - target_mean)).mean())
+        gain = 1.0 if variance < 4.0 else covariance / variance
         fit.append((gain, target_mean - gain * source_mean))
+        # Корреляция отвечает на вопрос, который сами gain и bias не решают:
+        # подгонка ловит увод экспозиции или подгоняется под РАЗНОЕ содержимое.
+        # Вне маски генератор перерисовывает сцену, а не переносит её, и чем
+        # сильнее перерисовал, тем меньше общего у двух наборов пикселей. При
+        # низкой корреляции числа подгонки не значат ничего, какими бы они ни
+        # вышли, и применять их нельзя вне зависимости от порогов
+        spread = float(target.var())
+        agreement.append(0.0 if variance < 4.0 or spread < 4.0
+                         else covariance / (variance * spread) ** 0.5)
 
     if any(not 0.8 <= g <= 1.25 or abs(b) > 24.0 for g, b in fit):
-        return aligned, {"matched": False, "match_reason": "out_of_range"}
+        # Отклонённую подгонку тоже видно в отчёте. Молчаливый отказ обошёлся
+        # дорого: на перегоне 16 кадров из 21 остались без правки тона, и по
+        # `matched: false` было не понять, промахнулась ли мерка или генератор
+        # действительно уехал за границы правдоподобного
+        return aligned, {
+            "matched": False,
+            "match_reason": "out_of_range",
+            "match_gain": [round(g, 3) for g, _ in fit],
+            "match_bias": [round(b, 1) for _, b in fit],
+            "match_r": [round(r, 3) for r in agreement],
+        }
 
     corrected = aligned.astype(np.float32)
     for channel, (gain, bias) in enumerate(fit):
@@ -698,6 +716,7 @@ def _match_tone(template: Any, aligned: Any, mask: Any) -> tuple[Any, dict]:
         "matched": True,
         "match_gain": [round(g, 3) for g, _ in fit],
         "match_bias": [round(b, 1) for _, b in fit],
+        "match_r": [round(r, 3) for r in agreement],
     }
 
 

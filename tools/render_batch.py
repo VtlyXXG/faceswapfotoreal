@@ -39,6 +39,10 @@ def main() -> int:
     ap.add_argument("--url", default=os.environ.get("DEMO_URL", "http://127.0.0.1:8300"))
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--guidance", type=float, default=1.0)
+    # Разбор одного дефекта не стоит сорока минут на все 21: обычно хватает трёх
+    # кадров — сломанного, соседнего и заведомо целого для контроля
+    ap.add_argument("--only", nargs="*", default=None,
+                    help="считать только эти кадры, например dino1_id4 dino2_id6")
     args = ap.parse_args()
 
     base = args.url.rstrip("/")
@@ -54,6 +58,8 @@ def main() -> int:
     for key, template in TEMPLATES.items():
         for tag, donor in DONORS.items():
             name = f"{key}_{tag}"
+            if args.only and name not in args.only:
+                continue
             target = OUT / f"{args.prefix}{name}.png"
             if target.exists():
                 print(f"{name}: уже есть, пропуск", flush=True)
