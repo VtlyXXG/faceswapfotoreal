@@ -84,9 +84,7 @@ def stub(monkeypatch, mesh):
 
 
 def _build(image, dilate=0.12, feather=0.10, neck=0.35) -> head_mask.HeadMask:
-    return head_mask.build(
-        image, dilate_ratio=dilate, feather_ratio=feather, neck_ratio=neck
-    )
+    return head_mask.build(image, dilate_ratio=dilate, feather_ratio=feather, neck_ratio=neck)
 
 
 def test_face_of_the_character_is_inside_the_mask(image, stub):
@@ -282,11 +280,142 @@ def test_meta_reports_how_the_mask_was_built(image, stub):
     assert meta["open_px"] > 0
 
 
-@pytest.mark.parametrize(
-    "ratios", [{"dilate": -0.1}, {"feather": -0.1}, {"neck": -0.1}]
-)
+@pytest.mark.parametrize("ratios", [{"dilate": -0.1}, {"feather": -0.1}, {"neck": -0.1}])
 def test_negative_ratios_are_refused(image, stub, ratios):
     stub()
 
     with pytest.raises(InvalidImageError):
         _build(image, **ratios)
+
+
+# --- Ориентация головы -------------------------------------------------------
+#
+# Поза нужна полосе вдоль щеки: на повёрнутой голове симметричные полосы уезжают
+# на нос и на фон. Проверяется здесь не точность в градусах — её тут нет и не
+# требуется, — а те свойства, на которые полоса опирается: монотонность, верное
+# определение ближней стороны и мёртвая зона наклона.
+
+
+def _pose(mesh, **turn):
+    points = mesh(centre=_CENTRE, **turn)
+    return points, head_mask.head_pose(points, head_mask.face_geometry(points))
+
+
+def test_the_turn_coefficient_grows_all_the_way_to_the_profile(mesh):
+    """
+    Свойство, ради которого коэффициент считается знаковой полушириной, а не
+    отношением расстояний. Порог по немонотонному числу срабатывал бы дважды —
+    на повороте и на возврате, — и профиль читался бы как фас.
+    """
+    coefficients = [abs(_pose(mesh, yaw=degrees)[1]["yaw"]) for degrees in range(0, 61, 10)]
+
+    assert coefficients == sorted(coefficients), "коэффициент поворота немонотонен"
+    assert coefficients[0] < 0.05, "фас обязан читаться нулём"
+    assert coefficients[-1] > 0.9, "профиль обязан упираться в единицу"
+
+
+def test_the_naive_distance_ratio_would_have_failed(mesh):
+    """
+    Тот же прогон для отвергнутого прокси — отношения расстояний от кончика
+    носа до скул. Тест существует, чтобы отвергнутое не вернулось: число растёт
+    до середины диапазона и падает обратно, и на профиле оно меньше, чем на
+    половинном повороте.
+    """
+
+    def naive(degrees):
+        points = mesh(centre=_CENTRE, yaw=degrees)
+        nose = np.asarray(points[1], dtype=np.float64)
+        left = np.linalg.norm(np.asarray(points[234], dtype=np.float64) - nose)
+        right = np.linalg.norm(np.asarray(points[454], dtype=np.float64) - nose)
+        return abs((left - right) / (left + right))
+
+    ratios = [naive(degrees) for degrees in range(0, 81, 10)]
+
+    assert ratios != sorted(ratios), "отношение расстояний вдруг стало монотонным"
+    assert max(ratios) > ratios[-1], "и порог по нему на профиле не сработал бы"
+
+
+def test_the_near_cheek_is_the_wide_one(mesh):
+    """
+    Ближняя к камере щека растягивается проекцией, дальняя сжимается. Стороны
+    при этом противоположны — иначе обе полосы легли бы на одну щеку.
+    """
+    _, pose = _pose(mesh, yaw=30)
+
+    assert pose["near_half"] > pose["far_half"]
+    assert pose["near"] == -pose["far"]
+    assert abs(pose["near"]) == 1.0
+
+
+def test_the_far_cheek_goes_negative_behind_the_silhouette(mesh):
+    """
+    Ноль дальней полуширины означает «щека кончилась», минус — «она уже за
+    силуэтом». Именно ради этого знака полуширина и меряется со знаком: модуль
+    от неё вернул бы растущее число там, где щеки нет вовсе.
+    """
+    _, pose = _pose(mesh, yaw=60)
+
+    assert pose["far_half"] < 0
+    # Знак коэффициента говорит, в какую сторону повёрнута голова; в единицу
+    # упирается его модуль
+    assert abs(pose["yaw"]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_frontal_face_reads_as_frontal(mesh):
+    """Фас обязан давать нули по обеим осям, иначе поправки поедут на ровном месте."""
+    _, pose = _pose(mesh)
+
+    assert abs(pose["yaw"]) < 0.05
+    assert pose["pitch"] == 0.0
+
+
+def test_the_tilt_has_a_dead_band(mesh):
+    """
+    Базовый уровень наклона гуляет между лицами на ±0.06 — это и есть шумовая
+    полка прокси, примерно ±7°. Без мёртвой зоны фронтальные кадры получали бы
+    поправку на пустом месте, и полоса дрожала бы от кадра к кадру.
+    """
+    points = mesh(centre=_CENTRE)
+    geometry = head_mask.face_geometry(points)
+
+    def tilted(shift):
+        moved = list(points)
+        moved[10] = (moved[10][0], moved[10][1] + shift)
+        return head_mask.head_pose(moved, geometry)["pitch"]
+
+    assert tilted(2) == 0.0, "мелкое смещение — это шум, а не наклон"
+    assert tilted(-30) > 0.0, "лоб дальше от носа — голова опущена"
+    assert tilted(20) < 0.0, "лоб ближе к носу — голова поднята"
+
+
+def test_the_jaw_line_lies_below_the_chin(mesh):
+    """
+    По этой прямой обрезается заливка тоном щеки: ниже неё лежит шея с чужим
+    освещением. Прямая обязана пройти НИЖЕ подбородка — контур челюсти выпуклый,
+    и прямая через две его точки срезала бы сам подбородок.
+    """
+    points = mesh(centre=_CENTRE)
+    geometry = head_mask.face_geometry(points)
+
+    anchor, normal = head_mask.jaw_line(points, geometry)
+
+    def below(point):
+        return float(np.dot(np.asarray(point, dtype=np.float64) - anchor, normal))
+
+    assert below(points[152]) <= 0.0, "подбородок оказался ниже линии челюсти"
+    assert below(points[150]) <= 0.0 and below(points[379]) <= 0.0
+    assert below((_CENTRE[0], points[152][1] + 40)) > 0.0, "шея не признана шеей"
+    assert float(np.dot(normal, geometry["up"])) < 0.0, "нормаль смотрит не вниз"
+
+
+def test_the_jaw_line_turns_with_a_tilted_head(mesh):
+    """
+    Прямая живёт в осях головы: у персонажа, склонившего голову набок, срез по
+    горизонтали кадра прошёл бы по щеке с одной стороны и по груди с другой.
+    """
+    points = mesh(centre=_CENTRE, angle=30)
+    geometry = head_mask.face_geometry(points)
+
+    _, normal = head_mask.jaw_line(points, geometry)
+
+    assert abs(float(np.dot(normal, geometry["up"])) + 1.0) < 0.15, "нормаль отвязалась от оси"

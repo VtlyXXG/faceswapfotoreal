@@ -71,9 +71,27 @@ log = get_logger(__name__)
 # Индексы — из канонического FACEMESH_FACE_OVAL, но верхняя (лобная) часть
 # кольца отброшена: именно она заходит на волосы.
 _JAW_ARC = (
-    454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+    454,
+    323,
+    361,
+    288,
+    397,
+    365,
+    379,
+    378,
+    400,
+    377,
     152,  # подбородок
-    148, 176, 149, 150, 136, 172, 58, 132, 93, 234,
+    148,
+    176,
+    149,
+    150,
+    136,
+    172,
+    58,
+    132,
+    93,
+    234,
 )
 
 # Верхняя граница — по бровям, от внешнего края одной к внешнему краю другой.
@@ -81,6 +99,37 @@ _BROW_ARC = (70, 63, 105, 66, 107, 336, 296, 334, 293, 300)
 
 _CHIN = 152
 _CHEEK_LEFT, _CHEEK_RIGHT = 234, 454
+
+# Опорные точки позы головы, см. `head_pose`.
+#
+# Внешний угол глаза — на той же стороне лица, что и скула: пара нужна затем,
+# чтобы полоса вдоль щеки знала, где на ЭТОЙ стороне кончается глаз. Пары
+# анатомические, не по номеру: 33 лежит на одной щеке с 234, 263 — с 454.
+_NOSE_TIP = 1
+_FOREHEAD = 10
+_EYE_OUTER = {_CHEEK_LEFT: 33, _CHEEK_RIGHT: 263}
+
+# Нижний контур челюсти. Пара ЗЕРКАЛЬНАЯ, и это важнее, чем кажется: в сетке
+# зеркало 377 — это 148, а зеркало 150 — 379, поэтому хорда 150→377, выглядящая
+# симметричной, на самом деле идёт наискось. Замерено вращением настоящей сетки:
+# 150→377 отклоняется от поперечной оси на 18° уже в фас и гуляет от -5° до -25°
+# по наклону, тогда как зеркальные 150→379 и 148→377 держатся в пределах 1.2°
+# на том же диапазоне. Косая хорда срезала бы одну щеку выше другой.
+_JAW_PAIR = (150, 379)
+
+# Базовый уровень вертикального прокси на фронтальном кадре. Отношение
+# «лоб→нос» к «нос→подбородок» в фас равно не единице, а примерно 1.4, потому
+# что точка 10 лежит на макушке лба, а не на переносице; ноль коэффициента
+# наклона обязан приходиться на фас, иначе поправка работала бы всегда.
+#
+# Замерено по шести живым кадрам: 0.224, 0.103, 0.207, 0.179, 0.160, 0.179.
+# Разброс между лицами и есть шумовая полка прокси — отсюда мёртвая зона ниже.
+_PITCH_LEVEL = 0.18
+
+# Мёртвая зона коэффициента наклона. Меньше неё — считаем, что наклона нет:
+# разброс базового уровня между лицами (±0.06) отвечает примерно ±7° поворота,
+# и без этой зоны фронтальные кадры получали бы поправку на пустом месте.
+_PITCH_DEADBAND = 0.06
 
 # Геометрия эллипса головы — запасной путь, когда разметки нет. Доли лица:
 # hair — сколько высот лица отложить вверх от подбородка (канон — две до
@@ -201,9 +250,7 @@ def face_polygon(points: list[tuple[int, int]]) -> Any:
     """Замкнутый контур лица: дуга челюсти + линия бровей вместо лба."""
     import numpy as np
 
-    return np.array(
-        [points[i] for i in _JAW_ARC] + [points[i] for i in _BROW_ARC], dtype=np.int32
-    )
+    return np.array([points[i] for i in _JAW_ARC] + [points[i] for i in _BROW_ARC], dtype=np.int32)
 
 
 def face_geometry(points: list[tuple[int, int]]) -> dict:
@@ -232,6 +279,136 @@ def face_geometry(points: list[tuple[int, int]]) -> dict:
         "face_height": face_height,
         "face_width": float(np.linalg.norm(right - left)),
     }
+
+
+def head_pose(points: list[tuple[int, int]], geometry: dict) -> dict | None:
+    """
+    Ориентация головы по проекционным пропорциям. None — сетка не годится.
+
+    Точных градусов здесь нет и не нужно: нужны надёжные нормированные веса, по
+    которым полоса вдоль щеки решает, насколько её раздвинуть и не пора ли
+    убрать совсем. Тяжёлый солвер (`cv2.solvePnP`) ради этого не заводится —
+    он требует трёхмерной модели лица и даёт точность, за которую мы здесь не
+    платим.
+
+    **Поворот меряется не отношением расстояний, а знаковой полушириной.**
+    Разница принципиальная, и она стоила калибровки. Отношение расстояний от
+    кончика носа до скул — хоть евклидовых, хоть поперечных — НЕМОНОТОННО: на
+    настоящей сетке, повёрнутой по шагам, оно растёт до 30-40°, а дальше падает
+    обратно, потому что дальняя скула заходит за силуэт и её проекция
+    возвращается к оси. Замер на живом лице: 0.04 (фас), 0.44 (20°), 0.57
+    (30°), 0.57 (40°), 0.52 (45°), 0.33 (60°), 0.09 (80°). Порог по такому
+    числу срабатывал бы дважды — на повороте и на возврате, — и профиль в 80°
+    выглядел бы для него фасом.
+
+    Знаковая проекция скулы на поперечную ось монотонна на всём диапазоне:
+    355, 283, 203, 116, 27, -17 пикселей на тех же углах. Ноль означает ровно
+    то, что нам нужно знать, — дальняя щека кончилась; минус — она уже за
+    силуэтом. Из неё же берётся и ширина полосы, так что одно измерение
+    отвечает на оба вопроса, и рассогласоваться им негде.
+
+    :param geometry: оси и размеры лица, см. `face_geometry`
+    :return: словарь позы либо None, если сетка короткая или лицо вырождено.
+
+        ``near``/``far`` — направление вдоль поперечной оси (+1 или -1) для
+        ближней к камере и дальней щеки; ``near_half``/``far_half`` — их
+        полуширины в пикселях, у дальней возможен ноль и минус;
+        ``near_eye``/``far_eye`` — туда же спроецированные внешние углы глаз;
+        ``yaw`` — 0 в фас, 1 в момент исчезновения дальней щеки (около 43° на
+        замеренном лице), знак — в какую сторону повёрнута голова;
+        ``pitch`` — 0 в фас, больше нуля голова опущена, с мёртвой зоной
+    """
+    import numpy as np
+
+    if len(points) <= max(_FOREHEAD, _CHEEK_RIGHT, *_EYE_OUTER.values()):
+        return None
+
+    chin, side = geometry["chin"], geometry["side"]
+
+    def lateral(index: int) -> float:
+        return float(np.dot(np.asarray(points[index], dtype=np.float64) - chin, side))
+
+    left, right = lateral(_CHEEK_LEFT), lateral(_CHEEK_RIGHT)
+
+    # Ближняя щека — та, чья проекция шире. Определять её по знаку нельзя:
+    # знак говорит, с какой стороны кадра лежит точка, а на сильном повороте
+    # дальняя скула переходит на сторону ближней, не переставая быть дальней
+    near_index, far_index = (
+        (_CHEEK_RIGHT, _CHEEK_LEFT) if abs(right) >= abs(left) else (_CHEEK_LEFT, _CHEEK_RIGHT)
+    )
+    near_lateral = lateral(near_index)
+    near = 1.0 if near_lateral >= 0 else -1.0
+    near_half = abs(near_lateral)
+    if near_half < 1.0:
+        return None
+
+    # Дальняя сторона меряется в СВОЁМ направлении, то есть с обратным знаком.
+    # Отрицательный результат — не ошибка, а факт: точка ушла за ось, дальней
+    # щеки в кадре больше нет
+    far_half = -near * lateral(far_index)
+    near_eye = abs(lateral(_EYE_OUTER[near_index]))
+    far_eye = -near * lateral(_EYE_OUTER[far_index])
+
+    raw = 0.0
+    forehead = np.asarray(points[_FOREHEAD], dtype=np.float64)
+    nose = np.asarray(points[_NOSE_TIP], dtype=np.float64)
+    upper = float(np.linalg.norm(forehead - nose))
+    lower = float(np.linalg.norm(nose - np.asarray(points[_CHIN], dtype=np.float64)))
+    if upper + lower > 1.0:
+        raw = (upper - lower) / (upper + lower) - _PITCH_LEVEL
+
+    pitch = 0.0 if abs(raw) < _PITCH_DEADBAND else raw - np.sign(raw) * _PITCH_DEADBAND
+
+    return {
+        "near": near,
+        "far": -near,
+        "near_half": near_half,
+        "far_half": far_half,
+        "near_eye": near_eye,
+        "far_eye": far_eye,
+        "yaw": near * float(np.clip(1.0 - far_half / near_half, 0.0, 1.0)),
+        "pitch": float(pitch),
+    }
+
+
+def jaw_line(points: list[tuple[int, int]], geometry: dict) -> tuple[Any, Any] | None:
+    """
+    Нижний контур челюсти: точка на прямой и нормаль, смотрящая ВНИЗ от лица.
+
+    Существует ради одного запрета: тон щеки нельзя размазывать по шее. Под
+    подбородком лежит его собственная тень, освещение там другое, и заливка
+    лицевой медианой ставит на шее светлое пятно — внутри маски, то есть
+    пережившее вклейку.
+
+    Прямая строится по зеркальной паре точек челюсти и сдвигается так, чтобы
+    пройти ниже их обеих и ниже подбородка: контур челюсти выпуклый, и прямая
+    через две его точки срезала бы подбородок.
+
+    :return: (точка, нормаль) либо None. Положительная проекция на нормаль
+        означает «ниже челюсти»
+    """
+    import numpy as np
+
+    first, second = _JAW_PAIR
+    if len(points) <= max(first, second, _CHIN):
+        return None
+
+    left = np.asarray(points[first], dtype=np.float64)
+    right = np.asarray(points[second], dtype=np.float64)
+    chord = right - left
+    length = float(np.linalg.norm(chord))
+    if length < 1.0:
+        return None
+
+    normal = np.array([-chord[1], chord[0]]) / length
+    if float(np.dot(normal, geometry["up"])) > 0:
+        normal = -normal
+
+    anchor = max(
+        (np.asarray(points[index], dtype=np.float64) for index in (first, second, _CHIN)),
+        key=lambda point: float(np.dot(point, normal)),
+    )
+    return anchor, normal
 
 
 def parsed_geometry(parsed: parsing.Parsed) -> dict | None:
@@ -347,9 +524,7 @@ def _region_from_parsing(parsed: parsing.Parsed, seed: Any, face_height: float) 
     distance = cv2.distanceTransform((own == 0).astype(np.uint8), cv2.DIST_L2, 3)
     near_head = (distance <= reach).astype(np.uint8)
 
-    region = cv2.morphologyEx(
-        np.maximum(own, np.minimum(skin, near_head)), cv2.MORPH_CLOSE, kernel
-    )
+    region = cv2.morphologyEx(np.maximum(own, np.minimum(skin, near_head)), cv2.MORPH_CLOSE, kernel)
 
     # Ткань вычитается ДО разбора на компоненты, а не после: в этом весь смысл.
     # Она и есть та граница, по которой область разваливается на «голова с
@@ -506,9 +681,7 @@ def _fabric_guard(
     return guard
 
 
-def _depth_cutoff(
-    shape: tuple[int, int], geometry: dict, neck_ratio: float, feather: int
-) -> Any:
+def _depth_cutoff(shape: tuple[int, int], geometry: dict, neck_ratio: float, feather: int) -> Any:
     """
     Срез по глубине: ниже линии шеи маски нет вообще.
 
@@ -644,9 +817,7 @@ def build(
 
     grow = dilate + feather
     if grow > 0:
-        mask = cv2.dilate(
-            mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2)
-        )
+        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2))
     if feather > 0:
         mask = cv2.GaussianBlur(mask, (2 * feather + 1, 2 * feather + 1), 0)
 
