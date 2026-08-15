@@ -20,7 +20,8 @@ import cv2
 import numpy as np
 
 from _bench import (DONORS, OUT, ROOT, STEMS, TEMPLATES, changed_mask, frame_path,
-                    lightness, lower_zone, parse_prefixes, template_context, tone_step)
+                    lightness, lower_zone, parse_prefixes, strand_pixels,
+                    template_context, tone_step)
 
 from app.pipelines import parsing  # noqa: E402  (путь добавлен в _bench)
 
@@ -68,7 +69,6 @@ def measure(path, key, donor_vec, extractor):
     template, parsed, _silhouette, strand_zone, _fh, _own = template_context(key)
     frame = cv2.imread(str(path))
     changed = changed_mask(frame, template)
-    untouched = ~changed
     skin_frame = np.asarray(parsing.parse(frame).bare_skin) > 127
 
     skin = (np.asarray(parsed.bare_skin) > 127) & skin_frame
@@ -79,6 +79,7 @@ def measure(path, key, donor_vec, extractor):
     area = skin_frame & changed
     L = lightness(frame)
     face = face_vector(extractor, frame, changed)
+    strands, strands_strict = strand_pixels(frame, template, strand_zone)
 
     return {
         "sim": None if (face is None or donor_vec is None) else float(np.dot(face, donor_vec)),
@@ -86,7 +87,11 @@ def measure(path, key, donor_vec, extractor):
         # подбородком и шеей есть законный перепад освещения, и загонять его в
         # ноль нельзя — на замере это переворачивало кадр с +0.4 на -6.3
         "resid": None if (now is None or norm is None) else now - norm,
-        "strands": int((strand_zone & untouched).sum()),
+        # Два счёта прядей, и читать надо строгий: у мерки с допуском вклейка,
+        # подогнанная по тону, проваливается под порог и считается уцелевшим
+        # волосом. Подробно — в `_bench.strand_pixels`
+        "strands": strands,
+        "strands_strict": strands_strict,
         # ровно 255, а не «ярче 250»: мягкий порог считает просто освещённую
         # щёку и показывает несуществующий регресс
         "clipped": 100.0 * float((area & (frame.max(axis=2) == 255)).sum()) / max(1, area.sum()),
@@ -122,7 +127,9 @@ def main() -> int:
     for title, field, spec in (
         ("СХОДСТВО (0.30 — порог «тот же ребёнок»)", "sim", "7.3f"),
         ("ОСТАТОК СТУПЕНИ ТОНА, L* (ближе к нулю — лучше)", "resid", "+7.1f"),
-        ("ПРЯДИ ПРЕЖНЕГО ГЕРОЯ В ПОЛОСЕ У КОНТУРА, px", "strands", "7d"),
+        ("ПРЯДИ, СТРОГО — расхождение с шаблоном ровно ноль, px", "strands_strict", "7d"),
+        ("ПРЯДИ С ДОПУСКОМ в 8 уровней, px (для сравнения с прежними прогонами)",
+         "strands", "7d"),
         ("КОЖА, ВЫБИТАЯ В БЕЛОЕ (ровно 255), %", "clipped", "7.2f"),
     ):
         print(f"\n{title}")
@@ -146,7 +153,10 @@ def main() -> int:
             line += f" | сходство сред {np.mean(sims):.3f} мин {min(sims):.3f}"
         if res:
             line += f" | ступень сред {np.mean(res):.1f} худшая {max(res):.1f} L*"
-        line += (f" | пряди всего {sum(g['strands'] for g in got)}px"
+        # Строгое число впереди и без скобок — читать надо его. С допуском стоит
+        # рядом, чтобы прежние прогоны было с чем сравнить, а не чтобы усреднять
+        line += (f" | пряди строго {sum(g['strands_strict'] for g in got)}px"
+                 f" (с допуском {sum(g['strands'] for g in got)}px)"
                  f" | клиппинг худший {max(g['clipped'] for g in got):.2f}%")
         print(line)
     print(f"\nвсего кадров в наборе: {len(STEMS)}, таблица записана в storage/output/measure_batch.json")
