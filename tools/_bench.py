@@ -41,6 +41,11 @@ STRAND_BAND_PX = 16
 # Порог «пиксель изменён»: ниже него разница списывается на перекодирование
 CHANGED_LEVEL = 8
 
+# Ширина кольца вокруг области правки, доли высоты лица: с ним сравнивается
+# резкость вклеенной головы. Четверть лица — это фон вплотную к голове, тот
+# самый, рядом с которым мягкость и заметна глазу
+_DETAIL_RING_RATIO = 0.25
+
 _cache: dict[str, tuple] = {}
 
 
@@ -153,6 +158,45 @@ def tone_step(frame, changed, skin, zone):
         return None
     L = lightness(frame)
     return float(np.median(L[near]) - np.median(L[far]))
+
+
+def detail_ratio(frame, template, changed, face_height):
+    """
+    Насколько вклеенная голова резче своего окружения — в долях от шаблонной.
+
+    ЗАЧЕМ ЗНАМЕНАТЕЛЬ. Сравнивать резкость головы с резкостью головы шаблона в
+    лоб нельзя: у двух детей разные причёски и разное содержание, и число
+    померяет их, а не мягкость. Здесь обе картинки сперва делятся на СВОЁ
+    окружение — кольцо снаружи области правки, — и только потом сравниваются.
+    Кольцо вне правки, то есть у результата и шаблона оно побитово одно и то же,
+    и знаменатель по построению общий.
+
+    ЧТО ПОКАЗЫВАЕТ. У шаблона голова — самое резкое место кадра: замер даёт 2.15
+    на dino1 и 1.58 на dino2 против размытого фона. После пересадки становится
+    1.01 и 0.97, то есть голова перестаёт быть резче фона за ней. Единица здесь
+    означала бы «перепад сохранён», 0.48 на dino1 — что от него осталась половина.
+
+    ОГОВОРКА. Мерка не отличает равномерное размытие от отсутствия текстуры, а на
+    замере это оказались разные вещи: волосы в генерации детализированы, а кожа
+    лица пуста по высоким частотам. Число одно на обе беды, и лечатся они
+    по-разному — глазами смотреть всё равно придётся.
+    """
+    if changed.sum() < 500:
+        return None
+
+    def sharpness(image, area):
+        grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        return float(cv2.Laplacian(grey, cv2.CV_32F, ksize=3)[area].var())
+
+    grow = max(3, int(face_height * _DETAIL_RING_RATIO))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1,) * 2)
+    ring = (cv2.dilate(changed.astype(np.uint8), kernel) > 0) & ~changed
+    if ring.sum() < 500:
+        return None
+
+    was = sharpness(template, changed) / max(sharpness(template, ring), 1e-6)
+    now = sharpness(frame, changed) / max(sharpness(frame, ring), 1e-6)
+    return now / max(was, 1e-6)
 
 
 def lower_zone(changed):

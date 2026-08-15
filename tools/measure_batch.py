@@ -19,8 +19,8 @@ import sys
 import cv2
 import numpy as np
 
-from _bench import (DONORS, OUT, ROOT, STEMS, TEMPLATES, changed_mask, frame_path,
-                    lightness, lower_zone, parse_prefixes, strand_pixels,
+from _bench import (DONORS, OUT, ROOT, STEMS, TEMPLATES, changed_mask, detail_ratio,
+                    frame_path, lightness, lower_zone, parse_prefixes, strand_pixels,
                     template_context, tone_step)
 
 from app.pipelines import parsing  # noqa: E402  (путь добавлен в _bench)
@@ -66,7 +66,7 @@ def face_vector(extractor, frame, changed):
 
 
 def measure(path, key, donor_vec, extractor):
-    template, parsed, _silhouette, strand_zone, _fh, _own = template_context(key)
+    template, parsed, _silhouette, strand_zone, face_height, _own = template_context(key)
     frame = cv2.imread(str(path))
     changed = changed_mask(frame, template)
     skin_frame = np.asarray(parsing.parse(frame).bare_skin) > 127
@@ -82,6 +82,9 @@ def measure(path, key, donor_vec, extractor):
     strands, strands_strict = strand_pixels(frame, template, strand_zone)
 
     return {
+        # Единица — перепад «голова резче фона» сохранён как у шаблона. Меньше —
+        # смысловой центр разворота перестал быть резче размытого фона за ним
+        "detail": detail_ratio(frame, template, changed, face_height),
         "sim": None if (face is None or donor_vec is None) else float(np.dot(face, donor_vec)),
         # ступень СВЕРХ собственного перепада шаблона: у самого разворота между
         # подбородком и шеей есть законный перепад освещения, и загонять его в
@@ -127,6 +130,7 @@ def main() -> int:
     for title, field, spec in (
         ("СХОДСТВО (0.30 — порог «тот же ребёнок»)", "sim", "7.3f"),
         ("ОСТАТОК СТУПЕНИ ТОНА, L* (ближе к нулю — лучше)", "resid", "+7.1f"),
+        ("РЕЗКОСТЬ ГОЛОВЫ относительно окружения, доля от шаблонной", "detail", "7.2f"),
         ("ПРЯДИ, СТРОГО — расхождение с шаблоном ровно ноль, px", "strands_strict", "7d"),
         ("ПРЯДИ С ДОПУСКОМ в 8 уровней, px (для сравнения с прежними прогонами)",
          "strands", "7d"),
@@ -148,11 +152,14 @@ def main() -> int:
             continue
         sims = [g["sim"] for g in got if g["sim"] is not None]
         res = [abs(g["resid"]) for g in got if g["resid"] is not None]
+        det = [g["detail"] for g in got if g.get("detail") is not None]
         line = f"{prefix.rstrip('_'):<8} кадров {len(got):2d}"
         if sims:
             line += f" | сходство сред {np.mean(sims):.3f} мин {min(sims):.3f}"
         if res:
             line += f" | ступень сред {np.mean(res):.1f} худшая {max(res):.1f} L*"
+        if det:
+            line += f" | резкость сред {np.mean(det):.2f} худшая {min(det):.2f}"
         # Строгое число впереди и без скобок — читать надо его. С допуском стоит
         # рядом, чтобы прежние прогоны было с чем сравнить, а не чтобы усреднять
         line += (f" | пряди строго {sum(g['strands_strict'] for g in got)}px"
