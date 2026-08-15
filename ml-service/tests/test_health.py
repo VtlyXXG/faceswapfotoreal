@@ -70,3 +70,25 @@ def test_openapi_lists_face_swap_routes():
     assert "/health" in paths
     assert "/face-swap" in paths
     assert "/face-swap/analyse" in paths
+
+
+def test_readiness_ignores_fal_when_disabled(monkeypatch):
+    """
+    Выключенный путь через fal не мешает готовности.
+
+    Регрессия дорогая: пока проверка ключа стояла безусловно, свежий клон
+    отвечал 503 с требованием чужого платного ключа, хотя работать собирался
+    локально. Поэтому здесь проверяется не текст, а именно код ответа.
+    """
+    from app.pipelines import fal_api
+
+    monkeypatch.setattr(fal_api.settings, "fal_enabled", False)
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    response = client.get("/health/ready")
+    body = response.json()
+
+    assert body["provider"]["fal_enabled"] is False
+    assert response.status_code == 200, body.get("reason")
+    assert body["status"] == "ready"
+    assert "FAL_KEY" not in (body.get("reason") or "")

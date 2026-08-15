@@ -29,7 +29,7 @@ RUN python -c "import urllib.request, os; os.makedirs('/opt/mediapipe', exist_ok
 COPY pyproject.toml ./
 COPY app ./app
 
-# Генерация идёт на fal.ai; локально работает только mediapipe — сетка лица
+# Локально работает mediapipe — сетка лица; путь через fal.ai выключен
 # (модель внутри пакета) и разметка человека с весами из /opt/mediapipe.
 EXPOSE 8000
 

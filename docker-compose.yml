@@ -48,8 +48,9 @@ services:
       ml-service:
         condition: service_healthy
 
-  # ML-сервис: замена лица. Локальных весов нет — инференс идёт на fal.ai,
-  # локально считается только маска лица (mediapipe везёт модель в пакете).
+  # ML-сервис: маски головы и волос, пересадка головы, подготовка пакета для
+  # своего Flux + PuLID. Стороннего платного сервиса не требует: путь через
+  # fal.ai выключен настройкой и ключа не спрашивает.
   ml-service:
     build: ./ml-service
     ports:
@@ -64,7 +65,10 @@ services:
       ML_HOST: 0.0.0.0
       ML_PORT: '8000'
       ML_ALLOWED_ORIGINS: http://localhost:3000
-      # Сведение стыка выполняется на fal.ai — без ключа /health/ready даёт degraded
+      # Путь через fal.ai выключен: ключ не нужен, /health/ready отвечает 200
+      # без него. Включать осознанно — ML_FAL_ENABLED=true и FAL_KEY в окружении,
+      # плюс `pip install fal-client`, он больше не в обязательных зависимостях
+      ML_FAL_ENABLED: ${ML_FAL_ENABLED:-false}
       FAL_KEY: ${FAL_KEY:-}
       # Веса сегментатора лежат в образе (см. ml-service/Dockerfile), качать их
       # в рантайме не нужно

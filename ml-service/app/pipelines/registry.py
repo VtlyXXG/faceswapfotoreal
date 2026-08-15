@@ -65,6 +65,10 @@ def status() -> dict:
         # тогда всё, что о нём известно, лежит в profile_error
         "provider": {
             "model": profile.endpoint if profile else None,
+            # Первое, на что смотреть при разборе «почему сервис не готов»:
+            # выключенный путь означает, что ни ключ, ни профиль второго шага
+            # к готовности отношения не имеют
+            "fal_enabled": fal_api.enabled(),
             "key_present": fal_api.key_present(),
             "key_env": settings.fal_key_env,
             "strength": profile.strength if profile else None,

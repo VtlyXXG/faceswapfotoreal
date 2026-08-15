@@ -20,7 +20,9 @@
     # Маски и щёки. Ни ключа, ни сети, ни весов — стоит ноль
     ml-service\\.venv\\Scripts\\python.exe runner.py --until B
 
-    # Плюс редактор причёски (нужен FAL_KEY)
+    # Плюс редактор причёски. Единственный шаг, которому нужен старый путь
+    # через fal: он выключен по умолчанию, и без ML_FAL_ENABLED=true шаг
+    # честно откажет с FAL_DISABLED, ничего не спрашивая и никуда не ходя
     ml-service\\.venv\\Scripts\\python.exe runner.py --until C
 
     # Весь граф до пакета для Flux (нужны веса antelopev2, см. bootstrap.py)

@@ -46,6 +46,12 @@ class ProviderStatus(BaseModel):
     """
 
     model: str | None = Field(default=None, description="Идентификатор эндпоинта")
+    # Первое, на что смотреть при разборе «почему сервис не готов». Путь через
+    # fal выключен по умолчанию, и тогда ни ключ, ни профиль второго шага к
+    # готовности отношения не имеют: сервис к fal не обращается вовсе
+    fal_enabled: bool = Field(
+        default=False, description="Разрешён ли облачный путь (ML_FAL_ENABLED)"
+    )
     key_present: bool
     key_env: str
     # Главная ручка пайплайна: подбирается из окружения на живом сервисе

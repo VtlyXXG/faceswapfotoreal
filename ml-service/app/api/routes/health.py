@@ -40,16 +40,23 @@ async def readiness(response: Response) -> ReadinessResponse:
         missing.append("не установлен mediapipe — сетку лица построить нечем")
     if not state["runtime"]["opencv"]:
         missing.append("не установлен opencv")
-    if not state["runtime"]["fal_client"]:
-        missing.append("не установлен fal-client")
-    if not state["provider"]["key_present"]:
-        missing.append(f"не задан {state['provider']['key_env']}")
-    if state["provider"]["profile_error"]:
-        # Несобираемый профиль второго шага — это отказ: заказ дойдёт до fal,
-        # потратит три загрузки в CDN и завернётся там же
-        missing.append(state["provider"]["profile_error"])
+    # Всё, что касается fal, спрашивается только при включённом пути. По
+    # умолчанию он выключен, и тогда ни отсутствие fal-client, ни отсутствие
+    # ключа готовности не мешают: сервис к fal не обращается вовсе. Пока эта
+    # проверка стояла безусловно, свежий клон отвечал 503 и требовал чужой
+    # платный ключ, хотя работать собирался локально.
+    if state["provider"]["fal_enabled"]:
+        if not state["runtime"]["fal_client"]:
+            missing.append("не установлен fal-client")
+        if not state["provider"]["key_present"]:
+            missing.append(f"не задан {state['provider']['key_env']}")
+        if state["provider"]["profile_error"]:
+            # Несобираемый профиль второго шага — это отказ: заказ дойдёт до
+            # fal, потратит три загрузки в CDN и завернётся там же
+            missing.append(state["provider"]["profile_error"])
 
-    if state["hair"]["active"] and not state["runtime"]["parsing_weights"]:
+    if state["provider"]["fal_enabled"] and state["hair"]["active"] \
+            and not state["runtime"]["parsing_weights"]:
         # Для маски ГОЛОВЫ отсутствие весов — снижение точности, для маски
         # ВОЛОС — потеря задачи: форму причёски знает только разметка, а
         # запасное кольцо вокруг лица до длинных волос попросту не дотянется

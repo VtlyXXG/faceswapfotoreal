@@ -52,20 +52,33 @@ Python строго 3.11 (`>=3.11,<3.12` в `pyproject.toml`) — огранич
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-$env:FAL_KEY = "..."
 uvicorn app.main:app --reload --port 8000
 ```
+
+Ключей и учётных записей для запуска не нужно: маски, пересадка головы и
+подготовка пакета считаются локально.
 
 Swagger: <http://localhost:8000/docs>
 
 В составе общего стека — `docker compose up -d ml-service` из корня репозитория;
 образ собирается из `Dockerfile` (python:3.11-slim + libgl/libglib для opencv).
 
-### FAL_KEY
+### FAL_KEY — не нужен
+
+Путь через fal.ai **выключен по умолчанию** (`ML_FAL_ENABLED=false`): личность
+переносится своим Flux + PuLID на GPU-боксе, пересадка головы считается
+локально. При выключенном пути ключ не читается вовсе, `fal-client` не входит в
+обязательные зависимости, а `/health/ready` отвечает `200 ready` без каких-либо
+учётных данных.
+
+Включать осознанно — `ML_FAL_ENABLED=true`, `FAL_KEY=...` и
+`pip install fal-client`. Вызов при выключенном пути возвращает `FAL_DISABLED`,
+а не требование ключа: «возможность отключена» и «сервис недонастроен» — разные
+состояния.
 
 Ключ читается `fal-client` напрямую из окружения как `FAL_KEY` — **без префикса
-`ML_`**, в отличие от остальных настроек. Без него `/health` по-прежнему `ok`
-(процесс жив), а `/health/ready` отдаёт `503 degraded`:
+`ML_`**, в отличие от остальных настроек. При ВКЛЮЧЁННОМ пути без него `/health`
+по-прежнему `ok` (процесс жив), а `/health/ready` отдаёт `503 degraded`:
 
 ```json
 {
@@ -682,7 +695,7 @@ ML_REFINE_STRATEGY=identity_inpaint    # вернуться к инпейнту 
 | Метод | Путь | Назначение |
 | --- | --- | --- |
 | `GET` | `/health` | liveness — процесс жив, ничего не проверяется |
-| `GET` | `/health/ready` | readiness — зависимости и `FAL_KEY`, `503` если не готов |
+| `GET` | `/health/ready` | readiness — зависимости, `503` если не готов. `FAL_KEY` спрашивается только при `ML_FAL_ENABLED=true` |
 | `POST` | `/face-swap/analyse` | детекция лица (multipart `image`) |
 | `POST` | `/face-swap` | замена лица, возвращает изображение + заголовок `X-Swap-Meta` |
 
@@ -788,7 +801,8 @@ curl -X POST http://localhost:8000/face-swap \
 | `EXPRESSION_NOT_SUPPORTED` | 501 | запрошена эмоция вне реестра. Не 400: запрос корректен, возможности пока нет |
 | `REFINER_NOT_SUPPORTED` | 501 | в профиле названа незарегистрированная стратегия |
 | `FAL_REQUEST_FAILED` | 502 | отказ fal: авторизация, баланс, сеть, ошибка модели, пустой ответ |
-| `FAL_NOT_CONFIGURED` | 503 | не задан `FAL_KEY` |
+| `FAL_NOT_CONFIGURED` | 503 | путь включён, но не задан `FAL_KEY` |
+| `FAL_DISABLED` | 503 | путь через fal выключен (`ML_FAL_ENABLED=false`) — штатное состояние свежего клона |
 
 Загрузка изображений в CDN fal обёрнута намеренно: она идёт до инференса и падает
 первой, а необёрнутое httpx-исключение дошло бы до FastAPI как `500 text/plain` и
@@ -801,7 +815,8 @@ curl -X POST http://localhost:8000/face-swap \
 
 | Переменная | По умолчанию | Значение |
 | --- | --- | --- |
-| `FAL_KEY` | — | ключ fal.ai, **без префикса** `ML_` |
+| `ML_FAL_ENABLED` | `false` | разрешён ли путь через fal.ai. Выключен — ключ не читается |
+| `FAL_KEY` | — | ключ fal.ai, **без префикса** `ML_`. Нужен только при `ML_FAL_ENABLED=true` |
 | `ML_PARSING_MODEL` | пусто | путь к весам разметки; пусто — `~/.mediapipe` или `$MEDIAPIPE_HOME` |
 | `ML_MASK_DILATE_RATIO` | из профиля | расширение маски за контур головы |
 | `ML_MASK_FEATHER_RATIO` | из профиля | растушёвка краёв маски |
