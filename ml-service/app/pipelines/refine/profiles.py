@@ -705,6 +705,18 @@ class HairStage:
     # прядь спускается по щеке и кончается на нём, а глубже начинается грудь,
     # где волос не бывает и правке делать нечего
     cheek_ratio: float = 0.35
+    # Разрушение структуры В ПОЛОСЕ щеки, см. `pipelines/cheeks.py`. Сигма
+    # размытия в долях высоты лица; 0 выключает работу целиком. Ориентир —
+    # порядок ширины пряди: сигма меньше неё оставит прядь отчётливой тёмной
+    # полосой, то есть ровно тем, за что редактор и цепляется
+    cheek_wipe_ratio: float = 0.05
+    # Вес плоской заливки против размытого оригинала, 0..1. Единица — буквально
+    # плоское пятно: структуры не остаётся никакой, но исчезает и низкочастотный
+    # градиент щеки. Ровно этой ценой стирание сделало голову лысой, только там
+    # пятно накрывало всю причёску, а здесь — полосу, и силуэт копны цел.
+    # Меньше единицы — тон тянется к чистой коже, градиент выживает, платой
+    # становится мягкое тёмное пятно на месте пряди
+    cheek_flat_ratio: float = 1.0
     # Стирание выключено: прогон показал, что оно не решает задачу (прядь лежит
     # ВНЕ маски, и заливка до неё не достаёт) и вдобавок стоит силуэта причёски
     # и светлого ореола. Оставлено переключателем, как kontext_multi, —
@@ -756,6 +768,8 @@ class HairStage:
             "hair_core_ratio": self.core_ratio,
             "hair_guard_ratio": self.guard_ratio,
             "hair_cheek_ratio": self.cheek_ratio,
+            "hair_cheek_wipe_ratio": self.cheek_wipe_ratio,
+            "hair_cheek_flat_ratio": self.cheek_flat_ratio,
             "hair_erase_ratio": self.erase_ratio,
             "hair_crop_ratio": self.crop_ratio,
             "hair_min_changed": self.min_changed,
@@ -974,6 +988,7 @@ class RefineProfile:
             or self.hair.core_ratio < 0
             or self.hair.guard_ratio < 0
             or self.hair.cheek_ratio < 0
+            or self.hair.cheek_wipe_ratio < 0
             or self.hair.erase_ratio < 0
             or self.hair.crop_ratio < 0
             or self.hair.min_changed < 0
@@ -981,6 +996,13 @@ class RefineProfile:
             raise InvalidImageError(
                 "Доли шага причёски не могут быть отрицательными",
                 {"profile": self.name, **self.hair.report()},
+            )
+        if not 0.0 <= self.hair.cheek_flat_ratio <= 1.0:
+            # Не доля высоты лица, а вес смеси: за единицей нет смысла (тон
+            # уехал бы мимо кожи в обе стороны), за нулём — тем более
+            raise InvalidImageError(
+                "Вес плоской заливки щеки лежит между нулём и единицей",
+                {"profile": self.name, "cheek_flat_ratio": self.hair.cheek_flat_ratio},
             )
         if not self.hair.endpoint:
             raise InvalidImageError(
@@ -1122,6 +1144,8 @@ def from_settings() -> RefineProfile:
         ("core_ratio", settings.hair_core_ratio),
         ("guard_ratio", settings.hair_guard_ratio),
         ("cheek_ratio", settings.hair_cheek_ratio),
+        ("cheek_wipe_ratio", settings.hair_cheek_wipe_ratio),
+        ("cheek_flat_ratio", settings.hair_cheek_flat_ratio),
         ("erase_ratio", settings.hair_erase_ratio),
         ("crop_ratio", settings.hair_crop_ratio),
         ("min_changed", settings.hair_min_changed),
