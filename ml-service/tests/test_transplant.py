@@ -339,7 +339,6 @@ def test_the_erase_silhouette_is_much_tighter_than_the_working_mask(monkeypatch,
 
 def test_the_erase_silhouette_still_covers_the_head(monkeypatch, mesh):
     """Запас поверх силуэта маленький, но кромку антиалиасинга он обязан накрыть."""
-    import cv2
 
     image = _frame(_MARK_TEMPLATE)
     points = mesh(centre=_TEMPLATE_CENTRE)
@@ -648,3 +647,127 @@ def test_the_correction_stops_at_the_edge_of_the_scale(monkeypatch):
     burnt = int((result[60:160, 60:140].max(axis=2) >= 255).sum())
     was = int((aligned[60:160, 60:140].max(axis=2) >= 255).sum())
     assert burnt <= was, f"выбитых стало {burnt} против {was} в генерации"
+
+
+# --- Поправка тона вне маски ------------------------------------------------
+
+
+def _tone_pair(gamma: float, redrawn: float, seed: int = 7):
+    """
+    Пара «шаблон и генерация ТОЙ ЖЕ сцены», разошедшихся экспозицией.
+
+    `redrawn` — доля пикселей, переставленных местами. Именно перестановка, а не
+    шум: генератор вне маски рисует ту же сцену заново, то есть содержимое
+    расходится, а СТАТИСТИКА кадра остаётся прежней. Замер на живых кадрах это
+    и показывает — корреляция 0.60..0.91 при отношении разбросов 1.03..1.12.
+
+    Добавлять шум было бы неверно: он поднимает разброс генерации по-настоящему,
+    и мерка обязана это увидеть. Тогда проверка ловила бы собственную фикстуру,
+    а не дефект.
+    """
+    rng = np.random.default_rng(seed)
+    scene = rng.integers(40, 210, size=(64, 64, 3)).astype(np.float64)
+
+    shuffled = scene.copy()
+    flat = shuffled.reshape(-1, 3)
+    picked = rng.permutation(len(flat))[: int(len(flat) * redrawn)]
+    flat[picked] = flat[rng.permutation(picked)]
+
+    # Генерация — сцена, «снятая» с другой экспозицией: обратная гамма
+    generated = np.clip(np.power(shuffled / 255.0, 1.0 / gamma) * 255.0, 0, 255)
+    return scene.astype(np.uint8), generated.astype(np.uint8)
+
+
+def test_tone_recovers_exposure_when_the_scene_is_redrawn():
+    """
+    Главная проверка: оценка не должна затухать от несовпадения содержимого.
+
+    Наклон регрессии, стоявший здесь раньше, равен `r * s_шаблона / s_генерации`
+    и при корреляции 0.7 занижен примерно на треть — этот дефект и жил в пути
+    через FLUX, беспричинно сжимая контраст головы. Гамма по средним от
+    затухания свободна: экспозиция не расходилась, значит и правки быть не
+    должно.
+    """
+    template, generated = _tone_pair(gamma=1.0, redrawn=0.55)
+    mask = np.zeros(template.shape[:2], np.uint8)
+
+    _, meta = transplant._match_tone(template, generated, mask)
+
+    assert meta["matched"] is True, meta
+    assert max(meta["match_r"]) < 0.95, "перестановка обязана сбить корреляцию"
+    for gamma in meta["match_gamma"]:
+        assert abs(gamma - 1.0) < 0.05, meta["match_gamma"]
+
+
+def test_tone_follows_a_real_exposure_change():
+    """Настоящее расхождение экспозиции поправка обязана поймать."""
+    template, generated = _tone_pair(gamma=1.3, redrawn=0.2)
+    mask = np.zeros(template.shape[:2], np.uint8)
+
+    fixed, meta = transplant._match_tone(template, generated, mask)
+
+    assert meta["matched"] is True, meta
+    for gamma in meta["match_gamma"]:
+        assert abs(gamma - 1.3) < 0.12, meta["match_gamma"]
+    # Средние обязаны сойтись — ради этого поправка и считается
+    assert abs(float(fixed.mean()) - float(template.mean())) < 3.0
+
+
+def test_tone_can_never_burn_the_highlights():
+    """
+    Света не выбиваются в белое ни при какой поправке.
+
+    Ровно этим множитель со сдвигом и провалился: отношение разбросов выходило
+    больше единицы, поправка растягивала контраст, а поверх неё шла гамма кожи —
+    вместе они дали клиппинг до 2.2% там, где был ноль. Гамма выйти за шкалу не
+    может по построению, и проверка стоит здесь, чтобы это не вернулось.
+    """
+    rng = np.random.default_rng(11)
+    template = np.clip(rng.normal(150, 40, size=(64, 64, 3)), 0, 255).astype(np.uint8)
+    # Генерация темнее: поправка обязана тянуть ВВЕРХ, то есть к потолку. Не
+    # сильнее, чем бывает на живых кадрах, — иначе сработает предел гаммы и
+    # проверка выродится в проверку предела
+    generated = np.clip(template.astype(np.float64) * 0.75, 0, 255).astype(np.uint8)
+
+    fixed, meta = transplant._match_tone(template, generated, mask=np.zeros((64, 64), np.uint8))
+
+    assert meta["matched"] is True, meta
+    was = int((generated == 255).sum())
+    assert int((fixed == 255).sum()) <= was, "поправка добавила выбитых в белое пикселей"
+
+
+def test_tone_refuses_when_the_scene_is_not_the_same_at_all():
+    """
+    Несвязанные картинки — отказ с отдельной причиной.
+
+    Гамма посчитается и здесь, и число выйдет правдоподобным: она не
+    спрашивает, об одной ли сцене речь. Спрашивает корреляция.
+    """
+    rng = np.random.default_rng(3)
+    template = rng.integers(0, 255, size=(64, 64, 3)).astype(np.uint8)
+    generated = rng.integers(0, 255, size=(64, 64, 3)).astype(np.uint8)
+    mask = np.zeros(template.shape[:2], np.uint8)
+
+    _, meta = transplant._match_tone(template, generated, mask)
+
+    assert meta["matched"] is False
+    assert meta["match_reason"] == "scene_changed"
+    assert meta["match_r"], "числа отказа обязаны быть видны в отчёте"
+
+
+def test_tone_on_a_flat_area_still_works():
+    """
+    Ровное небо вне маски: корреляции нет, но поправка осмысленна.
+
+    Здесь легко ошибиться, и я ошибся: «корреляцию не из чего посчитать» — не
+    то же самое, что «корреляция нулевая». Нулём этот случай уходил в отказ.
+    """
+    template = np.full((64, 64, 3), 130, np.uint8)
+    generated = np.full((64, 64, 3), 118, np.uint8)
+    mask = np.zeros(template.shape[:2], np.uint8)
+
+    fixed, meta = transplant._match_tone(template, generated, mask)
+
+    assert meta["matched"] is True, meta
+    assert meta["match_r"] == [None, None, None]
+    assert abs(float(fixed.mean()) - 130.0) < 1.5
