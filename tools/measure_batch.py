@@ -20,8 +20,8 @@ import cv2
 import numpy as np
 
 from _bench import (DONORS, OUT, ROOT, STEMS, TEMPLATES, changed_mask, detail_ratio,
-                    frame_path, lightness, lower_zone, parse_prefixes, strand_pixels,
-                    template_context, tone_step)
+                    frame_path, lightness, lower_zone, parse_prefixes, pose_shift,
+                    strand_pixels, template_context, tone_step)
 
 from app.pipelines import parsing  # noqa: E402  (путь добавлен в _bench)
 
@@ -85,6 +85,9 @@ def measure(path, key, donor_vec, extractor):
         # Единица — перепад «голова резче фона» сохранён как у шаблона. Меньше —
         # смысловой центр разворота перестал быть резче размытого фона за ним
         "detail": detail_ratio(frame, template, changed, face_height),
+        # Ноль — ракурс персонажа сохранён. Мерка заведена после того, как
+        # развёрнутую в фас голову приняли за рост сходства
+        "pose": pose_shift(frame, key),
         "sim": None if (face is None or donor_vec is None) else float(np.dot(face, donor_vec)),
         # ступень СВЕРХ собственного перепада шаблона: у самого разворота между
         # подбородком и шеей есть законный перепад освещения, и загонять его в
@@ -130,6 +133,7 @@ def main() -> int:
     for title, field, spec in (
         ("СХОДСТВО (0.30 — порог «тот же ребёнок»)", "sim", "7.3f"),
         ("ОСТАТОК СТУПЕНИ ТОНА, L* (ближе к нулю — лучше)", "resid", "+7.1f"),
+        ("СМЕЩЕНИЕ РАКУРСА от шаблонного (0 — поза сохранена)", "pose", "7.2f"),
         ("РЕЗКОСТЬ ГОЛОВЫ относительно окружения, доля от шаблонной", "detail", "7.2f"),
         ("ПРЯДИ, СТРОГО — расхождение с шаблоном ровно ноль, px", "strands_strict", "7d"),
         ("ПРЯДИ С ДОПУСКОМ в 8 уровней, px (для сравнения с прежними прогонами)",
@@ -160,6 +164,9 @@ def main() -> int:
             line += f" | ступень сред {np.mean(res):.1f} худшая {max(res):.1f} L*"
         if det:
             line += f" | резкость сред {np.mean(det):.2f} худшая {min(det):.2f}"
+        pose = [g["pose"] for g in got if g.get("pose") is not None]
+        if pose:
+            line += f" | ракурс сред {np.mean(pose):.2f} худший {max(pose):.2f}"
         # Строгое число впереди и без скобок — читать надо его. С допуском стоит
         # рядом, чтобы прежние прогоны было с чем сравнить, а не чтобы усреднять
         line += (f" | пряди строго {sum(g['strands_strict'] for g in got)}px"

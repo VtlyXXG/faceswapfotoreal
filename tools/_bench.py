@@ -160,6 +160,53 @@ def tone_step(frame, changed, skin, zone):
     return float(np.median(L[near]) - np.median(L[far]))
 
 
+_pose_cache: dict[str, tuple] = {}
+
+
+def _pose_of(image):
+    """Поза головы: (yaw, pitch). None — сетка не построилась."""
+    from app.pipelines import head_mask, transplant
+
+    points = transplant._full_frame_landmarks(image)
+    if points is None:
+        return None
+    pose = head_mask.head_pose(points, head_mask.face_geometry(points))
+    return None if pose is None else (float(pose["yaw"]), float(pose["pitch"]))
+
+
+def pose_shift(frame, key):
+    """
+    Насколько поза головы в результате разошлась с позой персонажа шаблона.
+
+    ЗАЧЕМ ЭТО ОТДЕЛЬНАЯ МЕРКА. Стенд мерил сходство, тон, пряди, пересвет и
+    резкость — и ни одна из пяти не видит смены ракурса. Это обошлось дорого:
+    прогон с растянутым кадром показал скачок сходства с 0.602 до 0.780 и был
+    принят за находку, а на деле генератор перестал слушать запрет «не менять
+    ракурс» и развернул опущенную голову персонажа в фас. Разворот НАШЛИ ГЛАЗАМИ,
+    и только тогда стало ясно, почему выросло сходство: фронтальное лицо
+    экстрактору мерить легче, чем опущенное. Ложный вывод продержался несколько
+    прогонов, подкреплённый пятью мерками сразу.
+
+    ЧТО СЧИТАЕТСЯ. `head_pose` даёт две нормированные величины: `yaw` — ноль в
+    фас, единица в момент, когда дальняя щека уходит за силуэт (около 43°), и
+    `pitch` — ноль в фас, больше нуля голова опущена. Берётся расхождение с
+    шаблоном по каждой и возвращается большее: ракурс испорчен, если уехала хоть
+    одна ось, и усреднять их значило бы прятать одну за другой.
+
+    Ноль означает «поза персонажа сохранена». Порога здесь нет намеренно: он
+    зависит от того, насколько выразителен ракурс самого шаблона, а замера под
+    это ещё не делали.
+    """
+    if key not in _pose_cache:
+        template = template_context(key)[0]
+        _pose_cache[key] = (_pose_of(template),)
+    was = _pose_cache[key][0]
+    now = _pose_of(frame)
+    if was is None or now is None:
+        return None
+    return max(abs(now[0] - was[0]), abs(now[1] - was[1]))
+
+
 def detail_ratio(frame, template, changed, face_height):
     """
     Насколько вклеенная голова резче своего окружения — в долях от шаблонной.
