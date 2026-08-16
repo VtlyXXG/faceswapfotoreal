@@ -45,12 +45,18 @@ def test_readiness_reports_provider():
     assert body["provider"]["profile"] and body["provider"]["strategy"]
     assert body["provider"]["profile_error"] is None, "профиль обязан собираться"
     assert "pixar_real" in body["provider"]["profiles"]
-    assert {"face_swap", "kontext_multi"} <= set(body["provider"]["strategies"])
+    assert {"face_swap", "fal_face_swap", "kontext_multi"} <= set(
+        body["provider"]["strategies"]
+    )
     # Куда уезжает фотография заказчика — главный вопрос схемы
     assert body["provider"]["identity_field"]
     # И что вообще уедет в теле запроса. Эндпоинт заворачивает весь запрос из-за
     # любого лишнего ключа, поэтому список сверяется целиком, а не на вхождение
-    assert body["provider"]["sends"] == ["base_image_url", "swap_image_url"]
+    assert body["provider"]["sends"] == ["base_image", "donor_photo", "output_format"]
+    # Рабочий путь идёт на свой GPU-сервер, и его адрес виден отдельным блоком:
+    # пустой — единственная причина, по которой заказ ответит 503
+    assert body["render"]["path"] == "/v1/demo-render"
+    assert body["render"]["active"] is True
     # Рабочий путь локальной геометрии не требует: маска в блоке ниже описывает
     # только то, чем она СТРОИЛАСЬ БЫ на диффузионных стратегиях
     assert body["provider"]["needs_mask"] is False
@@ -81,9 +87,13 @@ def test_readiness_ignores_fal_when_disabled(monkeypatch):
     локально. Поэтому здесь проверяется не текст, а именно код ответа.
     """
     from app.pipelines import fal_api
+    from app.pipelines.refine import local_render
 
     monkeypatch.setattr(fal_api.settings, "fal_enabled", False)
     monkeypatch.delenv("FAL_KEY", raising=False)
+    # Адрес GPU-сервера задан: без него сервис не готов по своей причине, и
+    # проверка «fal не мешает» ничего бы не проверила
+    monkeypatch.setattr(local_render.settings, "render_base_url", "http://gpu-box:8300")
 
     response = client.get("/health/ready")
     body = response.json()
@@ -92,3 +102,26 @@ def test_readiness_ignores_fal_when_disabled(monkeypatch):
     assert response.status_code == 200, body.get("reason")
     assert body["status"] == "ready"
     assert "FAL_KEY" not in (body.get("reason") or "")
+
+
+def test_readiness_says_which_address_is_missing(monkeypatch):
+    """
+    Ненастроенный адрес GPU-сервера обязан быть назван словами и заранее.
+
+    Умолчание вроде localhost означало бы «готов» на свежем клоне, а первый же
+    заказ висел бы до таймаута и падал без внятной причины. Это ровно та беда,
+    из-за которой убрали умолчание «fal включён», и повторять её нельзя.
+    """
+    from app.pipelines import fal_api
+    from app.pipelines.refine import local_render
+
+    monkeypatch.setattr(fal_api.settings, "fal_enabled", False)
+    monkeypatch.setattr(local_render.settings, "render_base_url", "")
+
+    response = client.get("/health/ready")
+    body = response.json()
+
+    assert response.status_code == 503
+    assert body["render"]["configured"] is False
+    assert body["render"]["base_url"] is None
+    assert "ML_RENDER_BASE_URL" in body["reason"]

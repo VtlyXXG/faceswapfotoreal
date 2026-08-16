@@ -14,6 +14,11 @@ from importlib.util import find_spec
 from app.config import settings
 from app.core.errors import MLServiceError
 from app.pipelines import expression, fal_api, parsing, refine
+from app.pipelines.refine import local_render
+
+# Стратегии, у которых замена лица идёт на своём GPU-сервере. У двухшаговой это
+# второй вызов, и без адреса она отвалится ровно так же, как одношаговая
+_LOCAL_STRATEGIES = ("face_swap", "hair_swap")
 
 
 def _installed(module: str) -> bool:
@@ -92,6 +97,18 @@ def status() -> dict:
             "profiles": refine.profiles.available(),
             "strategies": refine.available(),
             "styles": refine.profiles.styles(),
+        },
+        # Рабочий путь: свой GPU-сервер. Пустой адрес — единственное, чего ему
+        # не хватает для работы, и на /health/ready это должно быть сказано
+        # словами, а не выясняться таймаутом на первом заказе
+        "render": {
+            "base_url": local_render.base_url() or None,
+            "configured": local_render.configured(),
+            "path": local_render.PATH,
+            "timeout_s": settings.render_timeout_s,
+            # Идёт ли туда текущий профиль. false означает, что выбран один из
+            # путей через fal, и адрес GPU-сервера к готовности отношения не имеет
+            "active": bool(profile and profile.strategy in _LOCAL_STRATEGIES),
         },
         # Единственная локальная работа: какую область шаблона отдаём модели
         "mask": {

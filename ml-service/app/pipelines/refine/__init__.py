@@ -7,8 +7,13 @@
                  идентификаторы эндпоинтов, промпты стилей. Ни одного вызова.
   base.py      — контракт: что стратегия получает, что возвращает, и реестр,
                  через который она находится по имени из профиля.
-  стратегии    — fal_face_swap.py: специализированный фейссвоп, без промпта,
-                 без маски и без локальной вклейки (рабочая);
+  стратегии    — local_render.py: РАБОЧАЯ. Свой GPU-сервер, /v1/demo-render:
+                 FLUX.2 плюс пересадка головы. Ни ключей, ни облака, ни
+                 локальной подготовки — сервер считает геометрию сам. В реестре
+                 зовётся `face_swap`, поэтому её же берёт второй шаг hair_swap;
+                 fal_face_swap.py: специализированный фейссвоп на fal, без
+                 промпта и без маски. В реестре `fal_face_swap`, выключен
+                 вместе со всем путём через fal;
                  hair_swap.py: два вызова — редактор правит одну причёску, затем
                  та же стратегия face_swap переносит лицо. Нужна там, где
                  причёска донора отличается от нарисованной: фейссвоп волос не
@@ -32,10 +37,14 @@
 from __future__ import annotations
 
 # Импорт ради регистрации: модуль стратегии вызывает register() при загрузке.
+# Имена в реестре у всех разные, поэтому порядок здесь ни на что не влияет —
+# и это специально: рабочий путь не должен зависеть от того, кого импортировали
+# позже.
 from app.pipelines.refine import fal_face_swap as _fal_face_swap  # noqa: E402,F401
 from app.pipelines.refine import hair_swap as _hair_swap  # noqa: E402,F401
 from app.pipelines.refine import identity_inpaint as _identity_inpaint  # noqa: E402,F401
 from app.pipelines.refine import kontext_multi as _kontext_multi  # noqa: E402,F401
+from app.pipelines.refine import local_render as _local_render  # noqa: E402,F401
 from app.pipelines.refine import profiles
 from app.pipelines.refine.base import (
     Refiner,

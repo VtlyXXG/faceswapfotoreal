@@ -40,6 +40,14 @@ async def readiness(response: Response) -> ReadinessResponse:
         missing.append("не установлен mediapipe — сетку лица построить нечем")
     if not state["runtime"]["opencv"]:
         missing.append("не установлен opencv")
+    # Рабочий путь идёт на свой GPU-сервер, и адреса по умолчанию у него нет.
+    # Сказать об этом надо словами и заранее: молчаливое умолчание вроде
+    # localhost означало бы, что ненастроенный сервис отвечает «готов», а первый
+    # же заказ висит до таймаута и падает без внятной причины
+    if state["render"]["active"] and not state["render"]["configured"]:
+        missing.append(
+            "не задан ML_RENDER_BASE_URL — адрес GPU-сервера, на котором считается генерация"
+        )
     # Всё, что касается fal, спрашивается только при включённом пути. По
     # умолчанию он выключен, и тогда ни отсутствие fal-client, ни отсутствие
     # ключа готовности не мешают: сервис к fal не обращается вовсе. Пока эта
@@ -74,6 +82,7 @@ async def readiness(response: Response) -> ReadinessResponse:
         status="ready" if ready else "degraded",
         runtime=state["runtime"],
         provider=state["provider"],
+        render=state["render"],
         mask=state["mask"],
         hair=state["hair"],
         expressions=state["expressions"],

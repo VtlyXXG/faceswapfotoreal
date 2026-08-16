@@ -3,7 +3,14 @@
 
 Модуль назван по эндпоинту, а не по стратегии: имя `face_swap.py` внутри
 `refine/` читалось бы как пакет `pipelines/face_swap/`, где лежит оркестрация
-всего заказа. Стратегия в реестре зовётся `face_swap`.
+всего заказа.
+
+**ИМЯ В РЕЕСТРЕ — `fal_face_swap`, и раньше это было `face_swap`.** Под старым
+именем теперь зарегистрирован рабочий локальный путь (`local_render.py`), и
+делить одно имя на двоих нельзя: реестр заменяет по имени, то есть победил бы
+тот, кого позже импортировали, а порядок импортов в `__init__.py` — не то место,
+где такое решают. Стратегия жива и включается явно:
+`ML_REFINE_STRATEGY=fal_face_swap` вместе с `ML_FAL_ENABLED=true` и ключом.
 
 Один вызов, две ссылки, ноль настроек:
 
@@ -52,7 +59,7 @@ _CHANGED_MIN = 0.35
 class FalFaceSwapRefiner:
     """Перенос лица специализированной моделью. Ни промпта, ни маски."""
 
-    name = "face_swap"
+    name = "fal_face_swap"
 
     def refine(self, request: RefineRequest, profile: RefineProfile) -> RefineResult:
         if profile.payload.prompt_field or profile.payload.images_field:

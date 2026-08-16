@@ -16,6 +16,7 @@ num_inference_steps kontext/max/multi не принимает, и каждый �
 на весь запрос.
 """
 
+import base64
 from dataclasses import replace
 
 import numpy as np
@@ -23,7 +24,7 @@ import pytest
 
 from app.core.errors import InvalidImageError, NoFaceDetectedError
 from app.pipelines import fal_api, hair_mask, refine
-from app.pipelines.refine import hair_swap, profiles
+from app.pipelines.refine import hair_swap, local_render, profiles
 from app.utils.image import decode_image, encode_image
 
 # Картинки настоящие, а не заглушки из байтов: безмасочная стратегия декодирует
@@ -66,6 +67,59 @@ def client(monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(fal_api, "client", lambda: fake)
     monkeypatch.setattr(fal_api, "_download", lambda image: _GENERATED_PNG)
+    return fake
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, body, text: str = ""):
+        self.status_code = status_code
+        self._body = body
+        self.text = text or str(body)
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("не JSON")
+        return self._body
+
+
+class _FakeRender:
+    """GPU-сервер, отвечающий готовым разворотом. Записывает, что ему прислали."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+        self.urls: list[str] = []
+        self.timeout: float | None = None
+        self.response: _FakeResponse | None = None
+        self.error: Exception | None = None
+
+    def post(self, url, json, timeout):
+        self.calls.append(json)
+        self.urls.append(url)
+        self.timeout = timeout
+        if self.error is not None:
+            raise self.error
+        return self.response or _FakeResponse(
+            200,
+            {
+                "image": base64.b64encode(_GENERATED_PNG).decode("ascii"),
+                "encoding": "image/png",
+                "meta": {"steps": 8, "total_s": 31.2, "matched": 1},
+            },
+        )
+
+
+@pytest.fixture(autouse=True)
+def render(monkeypatch):
+    """
+    Фальшивый GPU-сервер на рабочем пути — autouse намеренно.
+
+    Под именем `face_swap` в реестре стоит именно он, и без адреса любой заказ
+    отвечал бы 503 RENDER_NOT_CONFIGURED, не дойдя до проверки самого теста.
+    Сеть при этом не трогается: подменён `requests.post`.
+    """
+    fake = _FakeRender()
+    monkeypatch.setattr(local_render.settings, "render_base_url", "http://gpu-box:8300")
+    monkeypatch.setattr(local_render.requests, "post", fake.post)
     return fake
 
 
@@ -114,6 +168,17 @@ def _inpaint() -> profiles.RefineProfile:
     return profiles.get("impasto")
 
 
+def _fal_swap() -> profiles.RefineProfile:
+    """
+    Прежний рабочий путь: специализированный фейссвоп на fal.
+
+    Имя стратегии сменилось с `face_swap` на `fal_face_swap`, когда первое занял
+    свой GPU-сервер. Сама схема запроса не изменилась ни на ключ, и тесты ниже
+    сторожат именно её: лишний ключ заворачивает весь запрос.
+    """
+    return _with("fal_face_swap")
+
+
 # --- Профили: числа и их связность ---
 
 
@@ -134,10 +199,11 @@ def test_default_profile_is_a_face_swap_without_diffusion():
     profile = _profile()
 
     assert profile.strategy == "face_swap"
-    assert profile.endpoint == "fal-ai/face-swap"
-    assert profile.payload.prompt_field is None, "эндпоинт текста не читает"
+    assert profile.endpoint == "local/demo-render", "облака в рабочем пути нет вовсе"
+    assert profile.payload.name == "demo_render"
+    assert profile.payload.prompt_field is None, "промпт-запрет живёт на GPU-сервере"
     assert profile.payload.mask_field is None
-    assert profile.needs_mask is False, "область эндпоинт находит сам"
+    assert profile.needs_mask is False, "маску и силуэт считает сам сервер"
 
 
 def test_maskless_diffusion_stays_available_for_comparison():
@@ -359,7 +425,7 @@ def test_unknown_strategy_is_refused():
         refine.run(_request(), replace(_profile(), strategy="телепатия"))
 
 
-# --- Схема запроса: фейссвоп ---
+# --- Схема запроса: фейссвоп на fal (выключенный путь) ---
 
 
 def test_arguments_match_the_face_swap_schema(client):
@@ -368,7 +434,7 @@ def test_arguments_match_the_face_swap_schema(client):
     наличием: лишний ключ здесь стоит столько же, сколько недостающий, — 422 на
     весь запрос после двух загрузок в CDN.
     """
-    refine.run(_request(), _profile())
+    refine.run(_request(), _fal_swap())
 
     args = client.arguments
     assert client.model == "fal-ai/face-swap"
@@ -380,7 +446,7 @@ def test_the_template_is_the_base_and_the_photo_is_the_face(client):
     Перепутать их местами значит вклеить лицо персонажа в фотографию заказчика:
     запрос пройдёт, картинка вернётся, и это будет не разворот книги.
     """
-    refine.run(_request(), _profile())
+    refine.run(_request(), _fal_swap())
 
     assert client.arguments["base_image_url"] == "https://cdn/1"
     assert client.arguments["swap_image_url"] == "https://cdn/2"
@@ -394,7 +460,7 @@ def test_a_single_image_response_is_understood(client):
     живые, и разбираться они обязаны обе: иначе рабочий путь падает на разборе
     успешного ответа.
     """
-    result = refine.run(_request(), _profile())
+    result = refine.run(_request(), _fal_swap())
 
     assert result.image == _GENERATED_PNG
     assert result.meta["seed"] == 7
@@ -409,7 +475,7 @@ def test_an_unchanged_answer_is_refused(client, monkeypatch):
     monkeypatch.setattr(fal_api, "_download", lambda image: _TEMPLATE_PNG)
 
     with pytest.raises(NoFaceDetectedError) as exc_info:
-        refine.run(_request(), _profile())
+        refine.run(_request(), _fal_swap())
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.details["changed"] < 1.0
@@ -418,7 +484,7 @@ def test_an_unchanged_answer_is_refused(client, monkeypatch):
 def test_a_wrong_schema_never_reaches_the_face_swap(client):
     """Схема с промптом — не для этого эндпоинта: он принимает две ссылки."""
     with pytest.raises(InvalidImageError):
-        refine.run(_request(), replace(_profile(), payload=profiles.KONTEXT_MULTI))
+        refine.run(_request(), replace(_fal_swap(), payload=profiles.KONTEXT_MULTI))
 
     assert client.uploads == []
 
@@ -428,7 +494,7 @@ def test_the_face_swap_needs_no_mask_at_all(client):
     Область эндпоинт находит своим детектором. Маска на этом пути не строится
     вовсе — и её отсутствие в запросе не должно ничего ломать.
     """
-    refine.run(_request(mask=b""), _profile())
+    refine.run(_request(mask=b""), _fal_swap())
 
     assert len(client.uploads) == 2, "в CDN уезжают шаблон и фотография, и только"
 
@@ -442,7 +508,7 @@ def test_face_swap_arguments_carry_no_diffusion_keys(client, key):
     Всё, что было ручками диффузии, здесь не существует. Промпта в том числе:
     фотореализм переносится моделью, а не выпрашивается словами.
     """
-    refine.run(_request(), _profile())
+    refine.run(_request(), _fal_swap())
 
     assert key not in client.arguments
 
@@ -521,7 +587,7 @@ def test_the_hair_preset_only_adds_a_step(client, hair):
     assert profile.needs_mask is False, "маску волос строит стратегия, а не пайплайн"
 
 
-def test_the_hair_goes_first_and_the_face_second(client, hair):
+def test_the_hair_goes_first_and_the_face_second(client, hair, render):
     """
     Порядок шагов — главное решение этого пути. Правка волос это диффузия, и
     всё, что попадёт под неё, вернётся сглаженным; пущенная после переноса, она
@@ -529,12 +595,13 @@ def test_the_hair_goes_first_and_the_face_second(client, hair):
     """
     refine.run(_hair_request(), _hair_profile())
 
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1, "на fal уходит один вызов — редактор причёски"
     assert "image_urls" in client.calls[0], "первым — редактор причёски"
-    assert set(client.calls[1]) == {"base_image_url", "swap_image_url"}, "вторым — фейссвоп"
+    assert len(render.calls) == 1, "вторым — свой GPU-сервер"
+    assert set(render.calls[0]) == {"base_image", "donor_photo", "output_format"}
 
 
-def test_the_photo_never_reaches_the_editor(client, hair):
+def test_the_photo_never_reaches_the_editor(client, hair, render):
     """
     Дыра, стоившая двух прогонов. Получив вторым файлом портрет крупным планом,
     универсальный редактор понимает его не как «вот чья причёска», а как «вот
@@ -549,9 +616,10 @@ def test_the_photo_never_reaches_the_editor(client, hair):
 
     assert client.calls[0]["image_urls"] == ["https://cdn/1"], "в массиве один шаблон"
     assert client.uploads[0][0] != b"photo-bytes"
-    assert len(client.uploads) == 3, "окно, шаблон после правки и фотография — на втором шаге"
-    # Фотография уезжает в CDN только перед фейссвопом, третьей по счёту
-    assert client.uploads[2] == (b"photo-bytes", "image/jpeg")
+    assert len(client.uploads) == 1, "в CDN уезжает одно окно, и больше на fal ничего"
+    # Фотография попадает только на второй шаг, а он идёт на свой GPU-сервер и
+    # мимо CDN вообще
+    assert render.calls[0]["donor_photo"] == base64.b64encode(b"photo-bytes").decode("ascii")
 
 
 def test_a_schema_carrying_the_photo_cannot_be_used_for_hair():
@@ -581,7 +649,7 @@ def test_hair_without_words_is_refused_before_the_network(client, hair):
     assert client.uploads == [], "до загрузки в CDN дойти не должно"
 
 
-def test_the_face_swap_receives_the_edited_template(client, hair):
+def test_the_face_swap_receives_the_edited_template(client, hair, render):
     """
     Смысл вклейки между шагами. Редактор перерисовал кадр целиком, но фейссвопу
     достаётся шаблон, в котором заменена ровно причёска: лицо, фон и одежда —
@@ -589,10 +657,12 @@ def test_the_face_swap_receives_the_edited_template(client, hair):
     """
     refine.run(_hair_request(), _hair_profile())
 
-    edited = decode_image(client.uploads[1][0])
+    edited = decode_image(base64.b64decode(render.calls[0]["base_image"]))
     assert tuple(edited[16, 16]) == (40, 40, 40), "под маской волос — правка редактора"
     assert tuple(edited[1, 1]) == (200, 200, 200), "вне её — шаблон побитово"
-    assert client.uploads[2] == (b"photo-bytes", "image/jpeg"), "фотография уезжает как есть"
+    assert render.calls[0]["donor_photo"] == base64.b64encode(b"photo-bytes").decode(
+        "ascii"
+    ), "фотография уезжает как есть"
 
 
 def test_the_editor_gets_the_template_and_the_words(client, hair):
@@ -720,7 +790,7 @@ def test_the_editor_gets_a_window_around_the_head(client, monkeypatch):
     assert decode_image(client.uploads[0][0]).shape[:2] == (32, 32)
 
 
-def test_outside_the_window_the_spread_is_untouched(client, monkeypatch):
+def test_outside_the_window_the_spread_is_untouched(client, monkeypatch, render):
     """
     Окно возвращается на место копией, а не правкой шаблона под собой. Вне окна
     и вне маски внутри него разворот обязан дойти до фейссвопа исходным.
@@ -729,8 +799,8 @@ def test_outside_the_window_the_spread_is_untouched(client, monkeypatch):
 
     refine.run(_hair_request(target=target), _hair_profile())
 
-    edited = decode_image(client.uploads[1][0])
-    assert edited.shape[:2] == (64, 64), "фейссвопу уезжает разворот, а не окно"
+    edited = decode_image(base64.b64decode(render.calls[0]["base_image"]))
+    assert edited.shape[:2] == (64, 64), "на замену лица уезжает разворот, а не окно"
     assert tuple(edited[32, 32]) == (40, 40, 40), "под маской волос — правка редактора"
     assert tuple(edited[1, 1]) == (200, 200, 200), "за окном — шаблон побитово"
     assert tuple(edited[20, 20]) == (200, 200, 200), "в окне вне маски — тоже шаблон"
@@ -852,7 +922,7 @@ def test_the_wiping_still_works_when_switched_on(client, monkeypatch):
     assert "deliberately wiped out" in client.calls[0]["prompt"]
 
 
-def test_the_wiping_stops_at_the_mask(client, monkeypatch):
+def test_the_wiping_stops_at_the_mask(client, monkeypatch, render):
     """
     Стирание — свойство ЗАПРОСА. В шаблон оно не попадает никогда: вклеивается
     ответ редактора, и вклеивается он в исходный кадр, поэтому вне маски до
@@ -862,7 +932,7 @@ def test_the_wiping_stops_at_the_mask(client, monkeypatch):
 
     refine.run(_hair_request(target=target), _wipes())
 
-    edited = decode_image(client.uploads[1][0])
+    edited = decode_image(base64.b64decode(render.calls[0]["base_image"]))
     assert tuple(edited[1, 1]) == (200, 200, 200), "вне маски — шаблон побитово"
     assert tuple(edited[32, 32]) == (40, 40, 40), "под маской — правка редактора"
 
@@ -909,9 +979,9 @@ def test_meta_reports_both_steps(client, hair):
     assert result.meta["hair"]["source"] == "parsing"
     assert result.meta["hair"]["changed"] > 1.0
     assert result.meta["hair"]["endpoint"] == _hair_profile().hair.endpoint
-    # Результат второго шага — то, что вернул фейссвоп, и он остался прежним
+    # Результат второго шага — то, что вернул GPU-сервер, и он остался прежним
     assert result.image == _GENERATED_PNG
-    assert result.meta["changed"] > 1.0
+    assert result.meta["render"]["steps"] == 8
 
 
 def test_the_hair_stage_is_switched_by_one_variable(monkeypatch):
@@ -1054,14 +1124,15 @@ def test_wrong_schema_fails_before_network(client, profile_factory, wrong_payloa
     assert client.uploads == []
 
 
-def test_one_call_per_order(client):
+def test_one_call_per_order(client, render):
     """
     Прежняя схема стоила до пяти вызовов: фон, шея, фактура, стык, сведение.
     Нынешняя обходится одним — и это половина её смысла.
     """
     refine.run(_request(), _profile())
 
-    assert len(client.calls) == 1
+    assert len(render.calls) == 1
+    assert client.calls == [], "рабочий путь до fal не доходит вовсе"
 
 
 def test_jpeg_alias(client):
@@ -1069,6 +1140,134 @@ def test_jpeg_alias(client):
 
     # Эндпоинт знает только jpeg, но наружу принимаем и jpg
     assert client.arguments["output_format"] == "jpeg"
+
+
+# --- Рабочий путь: свой GPU-сервер ---
+
+
+def test_the_working_path_never_touches_fal(client, render):
+    """
+    Главное свойство рабочего пути, ради которого он и заводился: ни одного
+    обращения к fal — ни к клиенту, ни к CDN, ни к профилю с его эндпоинтом.
+    """
+    refine.run(_request(), _profile())
+
+    assert client.uploads == [] and client.calls == []
+    assert render.urls == ["http://gpu-box:8300/v1/demo-render"]
+
+
+def test_only_two_pictures_and_a_format_leave_the_service(render):
+    """
+    Контракт /v1/demo-render — шаблон и СЫРОЕ фото. Маска, кроп донора и число
+    шагов считаются на той стороне тем же кодом, и слать их отсюда значило бы
+    завести второй источник тех же чисел.
+    """
+    refine.run(_request(), _profile())
+
+    sent = render.calls[0]
+    assert set(sent) == {"base_image", "donor_photo", "output_format"}
+    assert base64.b64decode(sent["base_image"]) == _TEMPLATE_PNG
+    assert base64.b64decode(sent["donor_photo"]) == b"photo-bytes"
+
+
+def test_the_photo_goes_as_the_customer_sent_it(render):
+    """
+    Ни поля вокруг, ни пережатия: сервер сам ищет лицо и строит кроп, а кайма
+    его детектору только мешает — это уже стоило прогонов на прежнем пути.
+    """
+    refine.run(_request(identity=b"exactly-these-bytes"), _profile())
+
+    assert base64.b64decode(render.calls[0]["donor_photo"]) == b"exactly-these-bytes"
+
+
+def test_the_mask_is_not_built_and_not_sent(render):
+    """Пайплайн её не строит (needs_mask=False), стратегия — не читает."""
+    refine.run(_request(mask=b""), _profile())
+
+    assert "mask" not in str(render.calls[0].keys())
+
+
+def test_jpeg_alias_reaches_the_server(render):
+    refine.run(_request(output_format="jpg"), _profile())
+
+    assert render.calls[0]["output_format"] == "jpg"
+
+
+def test_without_an_address_the_order_is_refused_before_the_network(monkeypatch, render):
+    """
+    Умолчания у адреса нет намеренно. Localhost по умолчанию означал бы, что
+    ненастроенный сервис молча ходит в никуда и падает таймаутом на первом
+    заказе — ровно та беда, из-за которой убрали умолчание «fal включён».
+    """
+    monkeypatch.setattr(local_render.settings, "render_base_url", "")
+
+    with pytest.raises(local_render.RenderNotConfiguredError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.status_code == 503
+    assert "ML_RENDER_BASE_URL" in exc_info.value.message
+    assert render.calls == [], "до сети дойти не должно"
+
+
+def test_a_server_that_found_no_face_answers_422(render):
+    """
+    Тот же код, что и у молчаливого отказа фейссвопа, и это не совпадение:
+    422 чинится другой фотографией, а не повтором запроса. Ответить здесь 502
+    значило бы отправить заказ в очередь повторов, где он умрёт трижды.
+    """
+    render.response = _FakeResponse(422, None, text="на шаблоне не найден персонаж")
+
+    with pytest.raises(NoFaceDetectedError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.status_code == 422
+    assert "персонаж" in exc_info.value.details["detail"]
+
+
+def test_an_unreachable_server_answers_502(render):
+    """Туннель упал или бокс перезагружается — это отказ шлюза, а не заказа."""
+    render.error = local_render.requests.ConnectionError("нет соединения")
+
+    with pytest.raises(local_render.RenderRequestFailedError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.details["error"] == "ConnectionError"
+
+
+def test_a_server_error_carries_its_reason_but_not_its_traceback(render):
+    """
+    Причина нужна в деталях, а трейсбек на десятки килобайт — нет: он уедет в
+    JSON ошибки Node и утонет в логах.
+    """
+    render.response = _FakeResponse(500, None, text="Ы" * 5000)
+
+    with pytest.raises(local_render.RenderRequestFailedError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.details["status_code"] == 500
+    assert len(exc_info.value.details["detail"]) <= 300
+
+
+def test_an_answer_without_a_picture_is_an_error_not_an_empty_frame(render):
+    """
+    Пустой ответ обязан быть отказом. Пустые байты, дошедшие до Node, стали бы
+    «успешным» заказом с нечитаемым файлом — и выяснилось бы это на печати.
+    """
+    render.response = _FakeResponse(200, {"meta": {"steps": 8}})
+
+    with pytest.raises(local_render.RenderRequestFailedError) as exc_info:
+        refine.run(_request(), _profile())
+
+    assert exc_info.value.details["keys"] == ["meta"]
+
+
+def test_a_schema_from_another_endpoint_never_reaches_the_server(render):
+    """Профиль, собранный из чужих частей, дешевле завернуть до отправки 30 МБ."""
+    with pytest.raises(InvalidImageError):
+        refine.run(_request(), replace(_profile(), payload=profiles.FACE_SWAP))
+
+    assert render.calls == []
 
 
 # --- Что возвращается наружу ---
@@ -1102,12 +1301,13 @@ def test_meta_reports_the_whole_profile(client):
 
     assert result.meta["profile"] == "pixar_real"
     assert result.meta["strategy"] == "face_swap"
-    assert result.meta["payload"] == "face_swap"
+    assert result.meta["payload"] == "demo_render"
     assert result.meta["needs_mask"] is False
-    assert result.meta["seed"] == 7
-    # Насколько ответ отличается от шаблона: единственный способ отличить
-    # удачную замену от молчаливого отказа, и он обязан быть в мете
-    assert result.meta["changed"] > 1.0
+    assert result.meta["render_url"] == "http://gpu-box:8300/v1/demo-render"
+    # Мета сервера едет целиком и под своим ключом: там числа пересадки, по
+    # которым разбирают кадр, и придумывать им новые имена здесь незачем
+    assert result.meta["render"]["steps"] == 8
+    assert result.meta["render"]["matched"] == 1
 
 
 def test_meta_separates_the_generation_from_the_result(client):
