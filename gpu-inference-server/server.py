@@ -203,6 +203,16 @@ MLSERVICE_PATH = _env("GPU_MLSERVICE_PATH", "")
 FLUX_STEPS = _env_int("GPU_FLUX_STEPS", 8)
 FLUX_GUIDANCE = _env_float("GPU_FLUX_GUIDANCE", 1.0)
 
+# Шаги для кадров с МЕЛКИМ лицом, см. `demo_steps`. Замер на 21 кадре показал,
+# что восьми шагов мало там, где голова занимает малую часть кадра: вклеенная
+# голова выходит вдвое мягче той живописи, в которую садится.
+FLUX_STEPS_SMALL_FACE = _env_int("GPU_FLUX_STEPS_SMALL_FACE", 16)
+
+# Ниже какой высоты лица В ГЕНЕРАЦИИ кадр считается мелколицым, пиксели.
+# Не доля кадра: у dino1 и spread_08 доля почти одна (17.5% против 17.6%), а
+# ведут себя они противоположно — решает абсолютный размер.
+FLUX_SMALL_FACE_PX = _env_float("GPU_FLUX_SMALL_FACE_PX", 200.0)
+
 # Промпт-запрет вместо промпта-описания. Проверено на четырёх формулировках:
 # описание ракурса словами («голова отвёрнута и наклонена вниз») заставляло
 # модель довернуть голову ещё дальше, и лицо переставало находиться вовсе. Этот
@@ -465,6 +475,65 @@ def flux_size(height: int, width: int) -> tuple[int, int]:
     """
     scale = min(1.0, (FLUX_MAX_PIXELS / float(height * width)) ** 0.5)
     return (max(16, int(height * scale) // 16 * 16), max(16, int(width * scale) // 16 * 16))
+
+
+def demo_steps(
+    face_height: float, height: int, width: int, requested: int | None
+) -> tuple[int, dict[str, Any]]:
+    """
+    Сколько шагов диффузии просить у FLUX, если вызывающий не назвал число сам.
+
+    ЗАЧЕМ. Замер на 21 кадре (seed 1234, попарно с восемью шагами) показал, что
+    восьми мало не всем и не везде. Резкость меряется как «голова против своего
+    окружения, в долях от того же у шаблона»: единица значит, что перепад
+    сохранён, а у художника голова — самое резкое место кадра.
+
+        шаблон      лицо в генерации   8 шагов        16 шагов
+        dino2        78 px            0.600 / 0.431   0.691 / 0.453
+        dino1       134 px            0.483 / 0.623   0.574 / 0.635
+        spread_08   324 px            0.889 / 0.753   1.415 / 0.700
+                                      резкость / сходство
+
+    На двух мелколицых шестнадцать шагов дают прибыль ПО ОБЕИМ осям сразу:
+    резкость +0.09, и сходство при этом не падает, а слегка растёт. Это не
+    размен, платить нечем.
+
+    А развороту они противопоказаны. Резкость там улетает за единицу — 1.415,
+    то есть голова становится резче окружения, чем была у самого художника, —
+    и вместе с этим монотонно валится сходство: 0.753 на восьми, 0.700 на
+    шестнадцати, 0.671 на двадцати восьми. Перешарп ломает черты.
+
+    ПОЧЕМУ ПОРОГ ПО АБСОЛЮТНОМУ РАЗМЕРУ, А НЕ ПО ДОЛЕ КАДРА. Доля лица у dino1 и
+    spread_08 почти совпадает (17.5% против 17.6%), а ведут они себя
+    противоположно. Абсолютный размер их разделяет: 134 px против 324 px.
+    Двести — середина этого промежутка, а не измеренная точка перелома;
+    ступенчатого замера между 134 и 324 не делали.
+
+    ПОЧЕМУ МЕРЯЕТСЯ ЛИЦО В ГЕНЕРАЦИИ, А НЕ В ШАБЛОНЕ. Кадр крупнее потолка
+    FLUX уезжает в генерацию уменьшенным, и лицо уменьшается вместе с ним:
+    у spread_08 360 px в шаблоне превращаются в 324 px. Считать надо там, где
+    работает модель.
+
+    Двадцать восемь шагов проверены и отвергнуты: сходство ниже, чем на
+    шестнадцати, перешарп сильнее, а на `dino2_id4` генерация вышла такой, что
+    голову на ней не нашли вовсе — кадр не получился.
+
+    :param face_height: высота лица на ШАБЛОНЕ, пиксели
+    :param height: высота шаблона
+    :param width: ширина шаблона
+    :param requested: число шагов из запроса; None — решать здесь
+    :return: число шагов и что об этом записать в мету
+    """
+    if requested is not None:
+        return requested, {"steps_reason": "задано в запросе"}
+
+    scaled_height, _ = flux_size(height, width)
+    face_px = face_height * scaled_height / max(1, height)
+    small = face_px < FLUX_SMALL_FACE_PX
+    return (FLUX_STEPS_SMALL_FACE if small else FLUX_STEPS), {
+        "steps_reason": "мелкое лицо" if small else "лицо крупное",
+        "face_px_generated": round(float(face_px), 1),
+    }
 
 
 def working_size(height: int, width: int) -> tuple[int, int]:
@@ -1820,7 +1889,10 @@ class DemoRequest(BaseModel):
     donor_photo: str
 
     seed: int | None = None
-    steps: int = Field(default=FLUX_STEPS, ge=1, le=50)
+    # None, а не восьмёрка по умолчанию: иначе «не указали» и «указали восемь»
+    # неразличимы, и правило из `demo_steps` не смогло бы сработать ни разу.
+    # Явно названное число по-прежнему уважается и ничем не переопределяется
+    steps: int | None = Field(default=None, ge=1, le=50)
     guidance_scale: float = Field(default=FLUX_GUIDANCE, ge=0.0, le=10.0)
     output_format: str = "png"
 
@@ -1870,10 +1942,16 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
         head = head_mask.build(template, DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO)
         silhouette = transplant.head_silhouette(template, points, geometry["face_height"])
 
+    # Шаги выбираются ПОСЛЕ геометрии: правило смотрит на высоту лица, а она
+    # известна только отсюда
+    steps, steps_meta = demo_steps(
+        geometry["face_height"], *template.shape[:2], request.steps)
+    meta.update(steps_meta)
+
     with stage(timings, "generate"):
         generated = MODELS.flux.render(
             template, donor,
-            steps=request.steps, guidance=request.guidance_scale, seed=request.seed,
+            steps=steps, guidance=request.guidance_scale, seed=request.seed,
         )
 
     plate = None
@@ -1901,7 +1979,7 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             "face_height": round(float(geometry["face_height"]), 1),
             "donor_face_px": round(float(head_mask.face_geometry(donor_points)["face_height"]), 1),
             "donor_outside": round(_donor_outside(photo, donor_points, modules), 3),
-            "steps": request.steps,
+            "steps": steps,
             "guidance_scale": request.guidance_scale,
             "seed": request.seed,
             "erased": plate is not None,
