@@ -25,7 +25,14 @@ import time
 
 import requests
 
+from pathlib import Path
+
 from _bench import DONORS, OUT, ROOT, TEMPLATES
+
+
+def _fail(message: str) -> int:
+    print(message)
+    return 2
 
 
 def b64(path):
@@ -43,7 +50,23 @@ def main() -> int:
     # кадров — сломанного, соседнего и заведомо целого для контроля
     ap.add_argument("--only", nargs="*", default=None,
                     help="считать только эти кадры, например dino1_id4 dino2_id6")
+    # Подбор формулировки — работа итеративная, и каждый вариант через
+    # переменную окружения на боксе стоит перезапуска сервиса. Отсюда — файлом
+    # или строкой в команде; текст уезжает в мету вместе с кадром, иначе через
+    # три прогона уже не вспомнить, чем получен какой комплект
+    ap.add_argument("--prompt", default=None,
+                    help="текст запроса; умолчание — GPU_FLUX_PROMPT на сервере")
+    ap.add_argument("--prompt-file", default=None,
+                    help="то же, но текстом из файла (UTF-8)")
+    ap.add_argument("--scale-mode", default=None, choices=["face", "head", "blend"],
+                    help="чем мерить размер головы при посадке; умолчание — SCALE_MODE")
     args = ap.parse_args()
+
+    prompt = args.prompt
+    if args.prompt_file:
+        if prompt:
+            return _fail("--prompt и --prompt-file вместе не имеют смысла")
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8").strip()
 
     base = args.url.rstrip("/")
     meta_path = OUT / f"{args.prefix}meta.json"
@@ -67,11 +90,19 @@ def main() -> int:
 
             started = time.perf_counter()
             try:
-                response = requests.post(f"{base}/v1/demo-render", timeout=1200, json={
+                payload = {
                     "base_image": b64(template), "donor_photo": b64(donor),
                     "seed": args.seed, "steps": args.steps,
                     "guidance_scale": args.guidance,
-                })
+                }
+                # Ключи не кладутся вовсе, когда не заданы: сервер отличает
+                # «не просили» от «просили умолчание», и None здесь означал бы
+                # второе только по счастливой случайности
+                if prompt is not None:
+                    payload["prompt"] = prompt
+                if args.scale_mode is not None:
+                    payload["scale_mode"] = args.scale_mode
+                response = requests.post(f"{base}/v1/demo-render", timeout=1200, json=payload)
             except Exception as exc:
                 failed += 1
                 print(f"{name}: сеть {type(exc).__name__}: {exc}", flush=True)

@@ -445,9 +445,17 @@ def head_extent(image: Any, points: list[tuple[int, int]]) -> float | None:
     return float(np.sqrt(area)) if area else None
 
 
-def _scale(source: dict, target: dict) -> float:
+def _scale(source: dict, target: dict, mode: str | None = None) -> float:
     """
     Во сколько раз увеличить генерацию, чтобы её голова села в шаблонную.
+
+    :param mode: чем мерить — `face`, `head` или `blend`. None означает
+        `SCALE_MODE`, то есть выбранный замером умолчательный режим. Явное
+        значение нужно там, где генерация приносит ЧУЖУЮ причёску: `head`
+        меряет силуэт «волосы плюс лицо», и с переносом причёски эта мерка
+        становится неверной по построению — пышные волосы ужмут лицо, гладкие
+        раздуют. Замер ниже сделан на прогонах, где причёска бралась от шаблона,
+        и на перенос причёски он не переносится.
 
     ЗАМЕР НА 21 КАДРЕ, по которому выбран режим. Мерилось отношение размера
     головы в готовом кадре к размеру головы шаблона (идеал — единица) и число
@@ -472,18 +480,19 @@ def _scale(source: dict, target: dict) -> float:
     """
     import numpy as np
 
+    mode = mode or SCALE_MODE
     by_face = float(target["face_height"]) / max(1e-6, float(source["face_height"]))
     extent_s, extent_t = source.get("head_extent"), target.get("head_extent")
-    if SCALE_MODE == "face" or not extent_s or not extent_t:
+    if mode == "face" or not extent_s or not extent_t:
         return by_face
 
     by_head = float(extent_t) / max(1e-6, float(extent_s))
-    if SCALE_MODE == "head":
+    if mode == "head":
         return by_head
     return float(np.sqrt(by_face * by_head))
 
 
-def similarity(source: dict, target: dict) -> Any:
+def similarity(source: dict, target: dict, scale_mode: str | None = None) -> Any:
     """
     Матрица 2x3, сажающая голову `source` на место головы `target`.
 
@@ -497,7 +506,7 @@ def similarity(source: dict, target: dict) -> Any:
     """
     import numpy as np
 
-    scale = _scale(source, target)
+    scale = _scale(source, target, scale_mode)
     up_s, up_t = np.asarray(source["up"], float), np.asarray(target["up"], float)
     angle = float(np.arctan2(up_t[0] * up_s[1] - up_t[1] * up_s[0],
                              up_t[0] * up_s[0] + up_t[1] * up_s[1]))
@@ -524,6 +533,7 @@ def transplant(
     match_tone: bool = True,
     match_skin: bool = True,
     plate: Any = None,
+    scale_mode: str | None = None,
 ) -> Transplanted:
     """
     Возвращает шаблон, в котором заменена только голова.
@@ -552,6 +562,10 @@ def transplant(
         подгонка тона этого не делает и сделать не может: она считается по фону,
         а разрыв возникает на шее, где светлая кожа донора встречается со смуглой
         кожей персонажа
+    :param scale_mode: чем мерить размер головы — `face`, `head` или `blend`.
+        None берёт `SCALE_MODE`. Умолчание выбрано замером на прогонах, где
+        причёска доставалась от шаблона; как только генерация приносит свою,
+        мерка по силуэту головы становится неверной по построению — см. `_scale`
     :param plate: шаблон со стёртой головой. Стирать ОБЯЗАТЕЛЬНО той же маской,
         которой подложка потом применяется, то есть `head_silhouette`, — это
         требование корректности, а не экономии. Проверено дорого: плита,
@@ -587,7 +601,7 @@ def transplant(
     geometry_g = head_mask.face_geometry(points_g)
     geometry_t["head_extent"] = head_extent(template, points_t)
     geometry_g["head_extent"] = head_extent(generated, points_g)
-    matrix = similarity(geometry_g, geometry_t)
+    matrix = similarity(geometry_g, geometry_t, scale_mode)
 
     scale = float(np.sqrt(matrix[0, 0] ** 2 + matrix[0, 1] ** 2))
     angle = float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0])))
@@ -617,6 +631,9 @@ def transplant(
     meta = {
         "orphan_px": orphan,
         "plate": plate is not None,
+        # Чем меряли масштаб. В мете обязательно: с переносом причёски режим
+        # перестаёт быть умолчанием, и глядя на кадр надо знать, каким он был
+        "scale_mode": scale_mode or SCALE_MODE,
         "scale": round(scale, 3),
         "angle": round(angle, 1),
         "shift": [round(float(matrix[0, 2]), 1), round(float(matrix[1, 2]), 1)],

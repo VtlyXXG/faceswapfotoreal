@@ -1184,12 +1184,17 @@ class Flux2Renderer:
         log.info("FLUX.2 загружен", extra={"model": self.model_id})
 
     def render(self, template: np.ndarray, donor: np.ndarray, *, steps: int,
-               guidance: float, seed: int | None) -> np.ndarray:
+               guidance: float, seed: int | None, prompt: str | None = None) -> np.ndarray:
         """
         Кадр по двум картинкам: шаблон первым референсом, лицо донора вторым.
 
         Порядок референсов — часть контракта промпта: он говорит «лицо из ВТОРОЙ
         картинки на ребёнка из ПЕРВОЙ», и перестановка меняет смысл на обратный.
+
+        :param prompt: текст запроса. None — `GPU_FLUX_PROMPT`, то есть
+            умолчание сервера. Передаётся заказом ради подбора формулировки:
+            она итеративная, а через переменную окружения каждый вариант стоит
+            перезапуска сервиса
         """
         import torch
         from PIL import Image
@@ -1210,7 +1215,7 @@ class Flux2Renderer:
         result = self._pipe(
             image=[to_pil(template, (width, height)),
                    to_pil(donor, (donor_side, donor_side))],
-            prompt=FLUX_PROMPT,
+            prompt=prompt if prompt is not None else FLUX_PROMPT,
             height=height,
             width=width,
             guidance_scale=guidance,
@@ -1888,6 +1893,21 @@ class DemoRequest(BaseModel):
     base_image: str
     donor_photo: str
 
+    # Текст запроса. None — берётся GPU_FLUX_PROMPT, то есть промпт-запрет,
+    # подобранный под перенос ОДНОГО лица. Поле нужно затем, что подбор
+    # формулировки — работа итеративная: каждый вариант через переменную
+    # окружения стоит правки .env и перезапуска сервиса на боксе, а через
+    # запрос — одной строки в команде. Значение по умолчанию не меняется,
+    # поэтому прежние вызовы работают ровно как раньше
+    prompt: str | None = Field(default=None, max_length=2000)
+
+    # Чем меряется масштаб посадки головы: face | head | blend. None — как
+    # зашито в ml-service (SCALE_MODE="head"). Ручка появилась не про запас:
+    # "head" меряет силуэт «волосы плюс лицо», и как только генерация начинает
+    # приносить ЧУЖУЮ причёску, эта мерка становится неверной по построению —
+    # пышные волосы ужмут лицо, гладкие раздуют
+    scale_mode: str | None = None
+
     seed: int | None = None
     # None, а не восьмёрка по умолчанию: иначе «не указали» и «указали восемь»
     # неразличимы, и правило из `demo_steps` не смогло бы сработать ни разу.
@@ -1901,6 +1921,22 @@ class DemoRequest(BaseModel):
     def _known_format(cls, value: str) -> str:
         if value.lower() not in {"png", "jpg", "jpeg"}:
             raise ValueError("output_format: только png или jpg")
+        return value.lower()
+
+    @field_validator("scale_mode")
+    @classmethod
+    def _known_scale_mode(cls, value: str | None) -> str | None:
+        """
+        Опечатка в режиме — это молча другой масштаб головы, а не отказ.
+
+        Проверять здесь, а не в ml-service: там неизвестное значение просто
+        провалится в ветку `head`, и кадр выйдет правдоподобным, но посчитанным
+        не тем способом, о котором просили. Ловить такое по числам потом дорого.
+        """
+        if value is None:
+            return None
+        if value.lower() not in {"face", "head", "blend"}:
+            raise ValueError("scale_mode: только face, head или blend")
         return value.lower()
 
 
@@ -1952,6 +1988,7 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
         generated = MODELS.flux.render(
             template, donor,
             steps=steps, guidance=request.guidance_scale, seed=request.seed,
+            prompt=request.prompt,
         )
 
     plate = None
@@ -1968,6 +2005,7 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             template, generated,
             DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO,
             plate=plate,
+            scale_mode=request.scale_mode,
         )
 
     meta.update(pasted.meta)
@@ -1976,6 +2014,11 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             "size": {"height": int(template.shape[0]), "width": int(template.shape[1])},
             "flux_size": dict(zip(("height", "width"), flux_size(*template.shape[:2]))),
             "mask_px": int(np.count_nonzero(head.mask > 127)),
+            # Промпт едет в мету целиком, а не флагом «был переопределён»: при
+            # подборе формулировки кадр без текста, которым он получен, —
+            # бесполезен, а перебирать варианты предстоит десятками
+            "prompt": request.prompt if request.prompt is not None else FLUX_PROMPT,
+            "prompt_override": request.prompt is not None,
             "face_height": round(float(geometry["face_height"]), 1),
             "donor_face_px": round(float(head_mask.face_geometry(donor_points)["face_height"]), 1),
             "donor_outside": round(_donor_outside(photo, donor_points, modules), 3),

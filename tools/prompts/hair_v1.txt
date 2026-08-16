@@ -1,0 +1,1 @@
+Replace the facial features and the hairstyle of the child in the first image with the facial features and the hairstyle of the child in the second image. Do not change the head orientation, the gaze direction, the body pose or anything else in the first image.

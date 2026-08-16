@@ -1,0 +1,1 @@
+Replace the facial features and the hairstyle of the child in the first image with the facial features and the hairstyle of the child in the second image. The head must stay turned and tilted exactly as in the first image, the gaze must keep its direction, and the body pose must not move. Change nothing else in the first image.
