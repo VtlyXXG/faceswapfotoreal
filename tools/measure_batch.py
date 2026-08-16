@@ -127,7 +127,8 @@ def main() -> int:
             rows.append(row)
             print(f"  посчитан {stem}", flush=True)
 
-    (OUT / "measure_batch.json").write_text(
+    report_path = OUT / "measure_batch.json"
+    report_path.write_text(
         json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
 
     for title, field, spec in (
@@ -173,7 +174,9 @@ def main() -> int:
                  f" (с допуском {sum(g['strands'] for g in got)}px)"
                  f" | клиппинг худший {max(g['clipped'] for g in got):.2f}%")
         print(line)
-    print(f"\nвсего кадров в наборе: {len(STEMS)}, таблица записана в storage/output/measure_batch.json")
+    # Путь берётся из OUT, а не пишется строкой: тот же скрипт гоняют и по
+    # отдельному набору (tools/_probe.py), где папка вывода другая
+    print(f"\nвсего кадров в наборе: {len(STEMS)}, таблица записана в {report_path}")
     return 0
 
 
