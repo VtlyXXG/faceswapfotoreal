@@ -62,7 +62,9 @@ def main() -> int:
     # Задаётся отдельно, потому что и включается отдельно — кадр за два прохода
     # стоит вдвое дороже кадра за один
     ap.add_argument("--prompt2-file", default=None,
-                    help="текст ВТОРОГО прохода; без него проход один")
+                    help="текст ВТОРОГО прохода; без него берётся умолчание сервера")
+    ap.add_argument("--passes", type=int, default=None, choices=[1, 2],
+                    help="проходов генерации: 1 — как было раньше, 2 — умолчание сервера")
     ap.add_argument("--scale-mode", default=None, choices=["face", "head", "blend"],
                     help="чем мерить размер головы при посадке; умолчание — SCALE_MODE")
     # Доли маски головы: когда генерация приносит причёску крупнее шаблонной,
@@ -116,6 +118,8 @@ def main() -> int:
                     payload["prompt"] = prompt
                 if prompt2 is not None:
                     payload["prompt2"] = prompt2
+                if args.passes is not None:
+                    payload["passes"] = args.passes
                 if args.scale_mode is not None:
                     payload["scale_mode"] = args.scale_mode
                 # Имя переменной здесь НЕ `name`: этим именем выше назван кадр,

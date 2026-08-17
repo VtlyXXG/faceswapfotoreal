@@ -225,6 +225,32 @@ FLUX_PROMPT = _env(
     "anything else in the first image.",
 )
 
+# Проход по причёске. Текст просит ТОЛЬКО волосы и прямым текстом защищает черты
+# лица: их принесёт следующий проход, и мешать ему здесь нечем.
+FLUX_HAIR_PROMPT = _env(
+    "GPU_FLUX_HAIR_PROMPT",
+    "Replace only the hairstyle of the child in the first image with the "
+    "hairstyle of the child in the second image: the same length, shape, volume, "
+    "texture and colour of hair. Do not change the facial features, the head "
+    "orientation, the gaze direction, the body pose or anything else in the "
+    "first image.",
+)
+
+# Сколько проходов генерации на кадр. ДВА ПО УМОЛЧАНИЮ, и это измеренное решение,
+# а не осторожность.
+#
+# Когда одну генерацию просят сразу про лицо и про волосы, сходство падает на
+# 0.04-0.07 и словами не возвращается: перебраны три формулировки на двух зёрнах,
+# все три хуже, самая подробная на трудном кадре разрушила лицо до неузнаваемости
+# детектором. Разделение прохода вернуло личность: 0.512 -> 0.532 на зерне 1234 и
+# 0.450 -> 0.587 на 4242, то есть на втором зерне ВЫШЕ прежнего переноса одного
+# лица (0.521). Кадр, уходивший под порог «тот же ребёнок», вернулся к 0.423.
+#
+# Цена — вдвое дороже кадр (70 с против 35) и заметно больший разброс от зерна к
+# зерну. Поэтому единица здесь остаётся рабочим режимом: она в точности повторяет
+# прежнее поведение, промптом ей служит FLUX_PROMPT.
+FLUX_PASSES = _env_int("GPU_FLUX_PASSES", 2)
+
 # Рабочее разрешение демо-пути. У модели потолок 4 мегапикселя, берём с запасом:
 # на 8 шагах активации толще, и на 2048x2048 рядом с занятой картой уже ловился
 # OutOfMemory.
@@ -1901,7 +1927,13 @@ class DemoRequest(BaseModel):
     # поэтому прежние вызовы работают ровно как раньше
     prompt: str | None = Field(default=None, max_length=2000)
 
-    # Второй проход генерации. None — прохода нет, и путь работает как раньше.
+    # Сколько проходов: 1 или 2. None — умолчание сервера (GPU_FLUX_PASSES, ныне
+    # два). Единица в точности повторяет прежнее однопроходное поведение и нужна
+    # для сравнения: без неё «стало лучше» не отличить от «поменяли две вещи».
+    passes: int | None = Field(default=None, ge=1, le=2)
+
+    # Текст ВТОРОГО прохода. None — умолчание сервера (FLUX_PROMPT, тот же
+    # промпт-запрет, который на двух проходах защищает уже перенесённые волосы).
     #
     # ЗАЧЕМ. Перебор трёх формулировок на двух зёрнах показал: когда одну
     # генерацию просят сразу про лицо и про волосы, сходство падает на 0.04-0.07
@@ -2015,14 +2047,27 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
         geometry["face_height"], *template.shape[:2], request.steps)
     meta.update(steps_meta)
 
+    # Сколько проходов и каким текстом каждый. Явно названный prompt2 включает
+    # второй проход сам: так задавались измеренные прогоны, и ломать их нельзя
+    passes = request.passes
+    if passes is None:
+        passes = 2 if request.prompt2 is not None else FLUX_PASSES
+
+    # На одном проходе текстом служит промпт-запрет: единица обязана в точности
+    # повторять прежнее поведение. На двух первый проход несёт причёску
+    first = request.prompt
+    if first is None:
+        first = FLUX_HAIR_PROMPT if passes == 2 else FLUX_PROMPT
+    second = request.prompt2 if request.prompt2 is not None else FLUX_PROMPT
+
     with stage(timings, "generate"):
         generated = MODELS.flux.render(
             template, donor,
             steps=steps, guidance=request.guidance_scale, seed=request.seed,
-            prompt=request.prompt,
+            prompt=first,
         )
 
-    if request.prompt2 is not None:
+    if passes == 2:
         # Второй проход идёт по РЕЗУЛЬТАТУ первого, а не по шаблону: причёска
         # уже перенесена, и её надо сохранить, а не переносить заново. Донор
         # тот же — личность берётся с той же фотографии.
@@ -2034,7 +2079,7 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             generated = MODELS.flux.render(
                 generated, donor,
                 steps=steps, guidance=request.guidance_scale, seed=request.seed,
-                prompt=request.prompt2,
+                prompt=second,
             )
 
     plate = None
@@ -2063,12 +2108,13 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             # Промпт едет в мету целиком, а не флагом «был переопределён»: при
             # подборе формулировки кадр без текста, которым он получен, —
             # бесполезен, а перебирать варианты предстоит десятками
-            "prompt": request.prompt if request.prompt is not None else FLUX_PROMPT,
+            # В мете лежат РАЗРЕШЁННЫЕ тексты, а не то, что прислали: кадр без
+            # промпта, которым он получен, при разборе бесполезен, а умолчания
+            # сервера меняются
+            "prompt": first,
             "prompt_override": request.prompt is not None,
-            # Второй проход виден в мете всегда: кадр, собранный за два прохода,
-            # и кадр за один — разные по цене и по поведению, и путать их нельзя
-            "prompt2": request.prompt2,
-            "passes": 2 if request.prompt2 is not None else 1,
+            "prompt2": second if passes == 2 else None,
+            "passes": passes,
             # Доли маски — в мете всегда: с переносом причёски они перестают быть
             # умолчанием, и кадр без них не разобрать
             "dilate_ratio": dilate,

@@ -119,3 +119,23 @@ def test_the_second_pass_is_independent_of_the_first():
 def test_a_second_prompt_longer_than_the_limit_is_refused():
     with pytest.raises(ValidationError):
         DemoRequest(**_PAIR, prompt2="ы" * 2001)
+
+
+def test_passes_defaults_to_the_server():
+    """None — «не просили»: сервер подставит GPU_FLUX_PASSES, ныне два."""
+    assert DemoRequest(**_PAIR).passes is None
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_one_and_two_passes_are_accepted(count):
+    assert DemoRequest(**_PAIR, passes=count).passes == count
+
+
+@pytest.mark.parametrize("count", [0, 3])
+def test_other_pass_counts_are_refused(count):
+    """
+    Третий проход не пробовали и мерок под него нет; ноль означал бы кадр без
+    генерации вовсе. И то, и другое — почти наверняка опечатка.
+    """
+    with pytest.raises(ValidationError):
+        DemoRequest(**_PAIR, passes=count)
