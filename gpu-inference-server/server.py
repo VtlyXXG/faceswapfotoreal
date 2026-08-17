@@ -1901,6 +1901,20 @@ class DemoRequest(BaseModel):
     # поэтому прежние вызовы работают ровно как раньше
     prompt: str | None = Field(default=None, max_length=2000)
 
+    # Второй проход генерации. None — прохода нет, и путь работает как раньше.
+    #
+    # ЗАЧЕМ. Перебор трёх формулировок на двух зёрнах показал: когда одну
+    # генерацию просят сразу про лицо и про волосы, сходство падает на 0.04-0.07
+    # и словами не возвращается — это цена совмещения, а не свойство текста.
+    # Разделение на два прохода — единственный оставшийся рычаг: первый приносит
+    # причёску, второй занят исключительно личностью и идёт по результату первого.
+    #
+    # ПОРЯДОК НЕ ПЕРЕСТАВЛЯЕТСЯ, и это то же решение, что и в двухшаговой схеме
+    # ml-service: проход по волосам — диффузия, и всё, что попадёт под неё,
+    # вернётся сглаженным. Пущенный вторым, он прошёл бы по уже перенесённому
+    # лицу, то есть по единственному, ради чего всё делается.
+    prompt2: str | None = Field(default=None, max_length=2000)
+
     # Чем меряется масштаб посадки головы: face | head | blend. None — как
     # зашито в ml-service (SCALE_MODE="head"). Ручка появилась не про запас:
     # "head" меряет силуэт «волосы плюс лицо», и как только генерация начинает
@@ -2008,6 +2022,21 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             prompt=request.prompt,
         )
 
+    if request.prompt2 is not None:
+        # Второй проход идёт по РЕЗУЛЬТАТУ первого, а не по шаблону: причёска
+        # уже перенесена, и её надо сохранить, а не переносить заново. Донор
+        # тот же — личность берётся с той же фотографии.
+        #
+        # Зерно тоже то же самое, и это осознанно: два прохода с разными зёрнами
+        # означали бы два независимых броска, и разницу между «второй проход
+        # помог» и «повезло с зерном» было бы не отличить.
+        with stage(timings, "generate2"):
+            generated = MODELS.flux.render(
+                generated, donor,
+                steps=steps, guidance=request.guidance_scale, seed=request.seed,
+                prompt=request.prompt2,
+            )
+
     plate = None
     if silhouette is not None and MODELS.eraser.kind != "none":
         with stage(timings, "erase"):
@@ -2036,6 +2065,10 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             # бесполезен, а перебирать варианты предстоит десятками
             "prompt": request.prompt if request.prompt is not None else FLUX_PROMPT,
             "prompt_override": request.prompt is not None,
+            # Второй проход виден в мете всегда: кадр, собранный за два прохода,
+            # и кадр за один — разные по цене и по поведению, и путать их нельзя
+            "prompt2": request.prompt2,
+            "passes": 2 if request.prompt2 is not None else 1,
             # Доли маски — в мете всегда: с переносом причёски они перестают быть
             # умолчанием, и кадр без них не разобрать
             "dilate_ratio": dilate,

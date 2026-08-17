@@ -58,6 +58,11 @@ def main() -> int:
                     help="текст запроса; умолчание — GPU_FLUX_PROMPT на сервере")
     ap.add_argument("--prompt-file", default=None,
                     help="то же, но текстом из файла (UTF-8)")
+    # Второй проход: первый приносит причёску, второй занят только личностью.
+    # Задаётся отдельно, потому что и включается отдельно — кадр за два прохода
+    # стоит вдвое дороже кадра за один
+    ap.add_argument("--prompt2-file", default=None,
+                    help="текст ВТОРОГО прохода; без него проход один")
     ap.add_argument("--scale-mode", default=None, choices=["face", "head", "blend"],
                     help="чем мерить размер головы при посадке; умолчание — SCALE_MODE")
     # Доли маски головы: когда генерация приносит причёску крупнее шаблонной,
@@ -66,6 +71,10 @@ def main() -> int:
         ap.add_argument(f"--{name}", type=float, default=None,
                         help=f"доля маски {name} в высотах лица; умолчание — на сервере")
     args = ap.parse_args()
+
+    prompt2 = None
+    if args.prompt2_file:
+        prompt2 = Path(args.prompt2_file).read_text(encoding="utf-8").strip()
 
     prompt = args.prompt
     if args.prompt_file:
@@ -105,6 +114,8 @@ def main() -> int:
                 # второе только по счастливой случайности
                 if prompt is not None:
                     payload["prompt"] = prompt
+                if prompt2 is not None:
+                    payload["prompt2"] = prompt2
                 if args.scale_mode is not None:
                     payload["scale_mode"] = args.scale_mode
                 # Имя переменной здесь НЕ `name`: этим именем выше назван кадр,

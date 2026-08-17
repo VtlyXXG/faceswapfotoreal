@@ -88,3 +88,34 @@ def test_a_ratio_outside_the_range_is_refused(value):
 def test_a_zero_feather_is_allowed():
     """Ноль законен: жёсткая кромка — осмысленный опыт при разборе дефекта."""
     assert DemoRequest(**_PAIR, feather=0.0).feather == 0.0
+
+
+def test_a_single_pass_stays_the_default():
+    """
+    None — прохода нет. Умолчание обязано остаться однопроходным: второй проход
+    удваивает время кадра, и включаться он должен по просьбе, а не сам.
+    """
+    request = DemoRequest(**_PAIR)
+
+    assert request.prompt2 is None
+
+
+def test_the_second_pass_prompt_is_carried():
+    text = "Replace only the facial features."
+    assert DemoRequest(**_PAIR, prompt2=text).prompt2 == text
+
+
+def test_the_second_pass_is_independent_of_the_first():
+    """
+    Второй проход можно просить и без переопределения первого: тогда первый
+    идёт на умолчании сервера, второй — по заданному тексту.
+    """
+    request = DemoRequest(**_PAIR, prompt2="only the face")
+
+    assert request.prompt is None
+    assert request.prompt2 == "only the face"
+
+
+def test_a_second_prompt_longer_than_the_limit_is_refused():
+    with pytest.raises(ValidationError):
+        DemoRequest(**_PAIR, prompt2="ы" * 2001)
