@@ -62,3 +62,29 @@ def test_a_prompt_longer_than_the_limit_is_refused():
     """Ограничение не про вкус: промпт целиком уезжает в мету каждого кадра."""
     with pytest.raises(ValidationError):
         DemoRequest(**_PAIR, prompt="ы" * 2001)
+
+
+@pytest.mark.parametrize("field", ["dilate", "feather", "neck"])
+def test_mask_ratios_default_to_the_server(field):
+    """None — «не просили»: сервер подставит GPU_DEMO_* и оставит боевые доли."""
+    assert getattr(DemoRequest(**_PAIR), field) is None
+
+
+@pytest.mark.parametrize("field", ["dilate", "feather", "neck"])
+def test_mask_ratios_are_carried(field):
+    assert getattr(DemoRequest(**_PAIR, **{field: 0.2}), field) == 0.2
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5])
+def test_a_ratio_outside_the_range_is_refused(value):
+    """
+    Доля больше высоты лица — почти наверняка опечатка (0.12 против 1.2), и
+    молча она означала бы маску во весь кадр: пересадка накрыла бы полразворота.
+    """
+    with pytest.raises(ValidationError):
+        DemoRequest(**_PAIR, dilate=value)
+
+
+def test_a_zero_feather_is_allowed():
+    """Ноль законен: жёсткая кромка — осмысленный опыт при разборе дефекта."""
+    assert DemoRequest(**_PAIR, feather=0.0).feather == 0.0

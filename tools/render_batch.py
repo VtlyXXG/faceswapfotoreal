@@ -60,6 +60,11 @@ def main() -> int:
                     help="то же, но текстом из файла (UTF-8)")
     ap.add_argument("--scale-mode", default=None, choices=["face", "head", "blend"],
                     help="чем мерить размер головы при посадке; умолчание — SCALE_MODE")
+    # Доли маски головы: когда генерация приносит причёску крупнее шаблонной,
+    # видимым контуром становится кромка маски, и лечится это этими двумя числами
+    for name in ("dilate", "feather", "neck"):
+        ap.add_argument(f"--{name}", type=float, default=None,
+                        help=f"доля маски {name} в высотах лица; умолчание — на сервере")
     args = ap.parse_args()
 
     prompt = args.prompt
@@ -102,6 +107,13 @@ def main() -> int:
                     payload["prompt"] = prompt
                 if args.scale_mode is not None:
                     payload["scale_mode"] = args.scale_mode
+                # Имя переменной здесь НЕ `name`: этим именем выше назван кадр,
+                # и цикл затирал его — отчёт уезжал под ключом «neck», а в логе
+                # вместо стема печаталось то же слово
+                for ratio in ("dilate", "feather", "neck"):
+                    value = getattr(args, ratio)
+                    if value is not None:
+                        payload[ratio] = value
                 response = requests.post(f"{base}/v1/demo-render", timeout=1200, json=payload)
             except Exception as exc:
                 failed += 1

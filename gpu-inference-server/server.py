@@ -1908,6 +1908,18 @@ class DemoRequest(BaseModel):
     # пышные волосы ужмут лицо, гладкие раздуют
     scale_mode: str | None = None
 
+    # Доли маски головы, в высотах лица персонажа. None — умолчания сервера
+    # (GPU_DEMO_DILATE / _FEATHER / _NECK), совпадающие с боевым MaskProfile.
+    #
+    # ЗАЧЕМ ЗАПРОСОМ. Когда генерация приносит причёску КРУПНЕЕ шаблонной, видимым
+    # контуром головы становится не прядь, а кромка маски: снаружи шаблон, внутри
+    # генерация, между ними геометрический спад на `feather`. На пёстром фоне это
+    # читается как вырезанная накладка. Лечится подбором двух чисел, а подбор
+    # через переменные окружения — это перезапуск сервиса на каждую попытку.
+    dilate: float | None = Field(default=None, ge=0.0, le=1.0)
+    feather: float | None = Field(default=None, ge=0.0, le=1.0)
+    neck: float | None = Field(default=None, ge=0.0, le=1.0)
+
     seed: int | None = None
     # None, а не восьмёрка по умолчанию: иначе «не указали» и «указали восемь»
     # неразличимы, и правило из `demo_steps` не смогло бы сработать ни разу.
@@ -1975,7 +1987,12 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
                 "хотя бы пятую часть кадра — это предел детектора, а не каприз",
             )
         donor = _donor_crop(photo, donor_points, modules)
-        head = head_mask.build(template, DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO)
+        # Доли маски разрешаются один раз и идут и в маску, и в пересадку: разъехавшись,
+        # они дадут плиту, посчитанную по одной геометрии, и вклейку по другой
+        dilate = DEMO_DILATE_RATIO if request.dilate is None else request.dilate
+        feather = DEMO_FEATHER_RATIO if request.feather is None else request.feather
+        neck = DEMO_NECK_RATIO if request.neck is None else request.neck
+        head = head_mask.build(template, dilate, feather, neck)
         silhouette = transplant.head_silhouette(template, points, geometry["face_height"])
 
     # Шаги выбираются ПОСЛЕ геометрии: правило смотрит на высоту лица, а она
@@ -2003,7 +2020,7 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
     with stage(timings, "transplant"):
         pasted = transplant.transplant(
             template, generated,
-            DEMO_DILATE_RATIO, DEMO_FEATHER_RATIO, DEMO_NECK_RATIO,
+            dilate, feather, neck,
             plate=plate,
             scale_mode=request.scale_mode,
         )
@@ -2019,6 +2036,11 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
             # бесполезен, а перебирать варианты предстоит десятками
             "prompt": request.prompt if request.prompt is not None else FLUX_PROMPT,
             "prompt_override": request.prompt is not None,
+            # Доли маски — в мете всегда: с переносом причёски они перестают быть
+            # умолчанием, и кадр без них не разобрать
+            "dilate_ratio": dilate,
+            "feather_ratio": feather,
+            "neck_ratio": neck,
             "face_height": round(float(geometry["face_height"]), 1),
             "donor_face_px": round(float(head_mask.face_geometry(donor_points)["face_height"]), 1),
             "donor_outside": round(_donor_outside(photo, donor_points, modules), 3),
