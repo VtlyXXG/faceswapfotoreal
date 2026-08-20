@@ -10,6 +10,7 @@ mediapipe и разметка в тестах не запускаются — о
 Проверяется арифметика подобия и логика вклейки, а не качество детектора.
 """
 
+import cv2
 import numpy as np
 import pytest
 
@@ -413,6 +414,45 @@ def test_without_a_plate_it_still_works_but_warns(scene, caplog):
     assert result.meta["plate"] is False
     assert result.meta["orphan_px"] > 0
     assert any("стирание не передано" in r.message for r in caplog.records)
+
+
+def test_the_allowance_reaches_half_a_face_beyond_the_head_and_no_further():
+    """
+    Ограничение маски по генерации: докуда разрешено и где кончается.
+
+    Впритык по шаблону нельзя — у длинноволосой девочки на стриженом персонаже
+    причёска законно выходит за голову, и замер это показал: впритык срезало бы
+    12% нарисованного. Половина высоты лица — измеренный размен, а не круглое
+    число, поэтому и проверяется как размер, а не как «что-то расширилось».
+    """
+    face_height = 100.0
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.circle(mask, (300, 300), 50, 255, -1)
+    head = head_mask.HeadMask(mask=mask, face_height=face_height)
+
+    allowance = transplant._allowance(head, feather_ratio=0.10)
+
+    assert allowance[300, 300] > 250, "внутри головы разрешено полностью"
+    # 50 (радиус головы) + 50 (полвысоты лица) = 100; на 90 ещё разрешено
+    assert allowance[300, 300 + 90] > 200, "в пределах запаса разрешено"
+    # За 100 + растушёвка запас обязан кончиться, иначе ограничение ничего не даёт
+    assert allowance[300, 300 + 160] < 40, "за пределами запаса хода нет"
+
+
+def test_the_allowance_edge_is_soft():
+    """
+    Жёсткая отсечка поменяла бы один заметный дефект на другой: шов ровно там,
+    где ограничение сработало. Край обязан быть размыт, как и у самих масок.
+    """
+    mask = np.zeros((600, 600), np.uint8)
+    cv2.circle(mask, (300, 300), 50, 255, -1)
+    head = head_mask.HeadMask(mask=mask, face_height=100.0)
+
+    allowance = transplant._allowance(head, feather_ratio=0.10)
+    profile = allowance[300, 300:460]
+    edge = [v for v in profile if 20 < v < 235]
+
+    assert len(edge) > 8, "переход должен занимать десятки пикселей, а не один"
 
 
 def test_meta_reports_what_was_done(scene):

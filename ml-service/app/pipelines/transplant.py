@@ -524,6 +524,51 @@ def similarity(source: dict, target: dict, scale_mode: str | None = None) -> Any
     return matrix
 
 
+# Запас вокруг головы шаблона, в высотах лица: дальше маске, посчитанной по
+# генерации, ходу нет. Половина выбрана замером, а не на глаз — см. `_allowance`.
+_ALLOWANCE_RATIO = 0.5
+
+
+def _allowance(head_old: Any, feather_ratio: float) -> Any:
+    """
+    Докуда маске по генерации разрешено доходить.
+
+    ЗАЧЕМ. Итоговая маска — объединение двух: посчитанной по шаблону (постоянна)
+    и посчитанной по ВЫРОВНЕННОЙ ГЕНЕРАЦИИ (каждый раз новая). Вторая иногда
+    оказывается крупнее или уезжает подгонкой, и тогда замена уходит с головы на
+    туловище: в кадр попадают руки и плечи генерации поверх шаблонных. На стенде
+    (5 страниц x 3 донора x 2 броска) это случилось на 7 кадрах из 29, на всех
+    страницах без исключения, с заходом до 67 px ниже шаблонной маски.
+
+    ПОЧЕМУ ПОЛОВИНА ВЫСОТЫ ЛИЦА, А НЕ ВПРИТЫК. Впритык — это не «строго», это
+    неверно: у длинноволосой девочки на коротко стриженном персонаже причёска
+    ЗАКОННО выходит за голову шаблона. Замер долей заменённого вне шаблонной
+    маски:
+
+        донор              впритык   с запасом 0.5
+        donor2 (короткие)     6.0%          0.0%
+        donor6                12.3%          2.8%
+        фото заказчика         9.4%          1.8%
+
+    Впритык срезало бы у donor6 в среднем 12% нарисованного, и это волосы.
+    С запасом в полвысоты лица цена падает до 2-3% у длинноволосых и до нуля у
+    коротко стриженного, а переполнение при этом остаётся ограниченным.
+
+    КРАЙ РАЗМЫТ той же растушёвкой, что у самих масок. Жёсткая отсечка дала бы
+    шов ровно там, где ограничение сработало, — то есть поменяла бы один
+    заметный дефект на другой.
+    """
+    import cv2
+    import numpy as np
+
+    radius = max(1, int(round(head_old.face_height * _ALLOWANCE_RATIO)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+    grown = cv2.dilate((np.asarray(head_old.mask) > 127).astype(np.uint8) * 255, kernel)
+
+    feather = max(1, int(round(head_old.face_height * feather_ratio)))
+    return cv2.GaussianBlur(grown, (0, 0), feather)
+
+
 def transplant(
     template: Any,
     generated: Any,
@@ -624,12 +669,18 @@ def transplant(
     # если её не накрыть, от прежнего героя останется ободок причёски
     head_new = head_mask.build(aligned, dilate_ratio, feather_ratio, neck_ratio)
     head_old = head_mask.build(template, dilate_ratio, feather_ratio, neck_ratio)
-    mask = np.maximum(head_new.mask, head_old.mask)
+    allowance = _allowance(head_old, feather_ratio)
+    # Маска по генерации ограничена окрестностью головы ШАБЛОНА, см. `_allowance`
+    mask = np.maximum(np.minimum(head_new.mask, allowance), head_old.mask)
 
+    clipped = int(np.count_nonzero((head_new.mask > 127) & (allowance <= 127)))
     orphan = int(np.count_nonzero((head_old.mask > 127) & (head_new.mask <= 127)))
 
     meta = {
         "orphan_px": orphan,
+        # Сколько маски по генерации срезано ограничением. Ноль означает, что
+        # ограничение на этом кадре не работало вовсе, — а не что его нет
+        "clipped_px": clipped,
         "plate": plate is not None,
         # Чем меряли масштаб. В мете обязательно: с переносом причёски режим
         # перестаёт быть умолчанием, и глядя на кадр надо знать, каким он был

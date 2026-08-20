@@ -141,10 +141,19 @@ def analyse(frame: np.ndarray, facts: dict, meta: dict) -> dict:
     changed = np.abs(frame.astype(np.int16) - facts["image"].astype(np.int16)).max(axis=2) > 32
     total = int(changed.sum())
     ys = np.nonzero(changed)[0]
+    below = (int(ys.max()) - facts["bottom"]) if total else 0
     row = {
         "changed_px": total,
         "bottom": int(ys.max()) if total else 0,
-        "below_template_mask": (int(ys.max()) - facts["bottom"]) if total else 0,
+        "below_template_mask": below,
+        # Тот же заход В ДОЛЯХ ВЫСОТЫ ЛИЦА. Абсолютные пиксели тут обманывают:
+        # ограничение задано долей, и на странице с крупным лицом сто пикселей
+        # укладываются в допуск, а на странице с мелким — уже нет
+        "below_faces": round(below / facts["face_h"], 3),
+        "face_h": round(facts["face_h"], 1),
+        # Сколько маски по генерации срезано ограничением. Ноль на всех кадрах
+        # означал бы, что ограничение не работало вовсе
+        "clipped_px": meta.get("clipped_px"),
     }
     for k in CLAMPS:
         outside = int((changed & ~facts["grown"][k]).sum())
