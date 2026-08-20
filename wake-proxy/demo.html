@@ -81,7 +81,7 @@
   <label><input type="radio" name="mode" value="full" checked>
     <span><b>Всю книгу</b><i>обложка и 10 разворотов, 20–25 минут</i></span></label>
   <label><input type="radio" name="mode" value="preview">
-    <span><b>Превью</b><i>3 случайные страницы, 5–7 минут</i></span></label>
+    <span><b>Превью</b><i>3 случайные страницы, 2–4 минуты</i></span></label>
 </div></fieldset>
 
 <button id="go" disabled>Сделать книгу</button>
@@ -110,6 +110,19 @@ const PAGES = [
   {id: BOOK + '/spread_10', title: 'Разворот 10'},
 ];
 const PREVIEW_PAGES = 3;
+
+// Превью считается ОДНИМ проходом вместо двух, книга — двумя.
+//
+// Проход по причёске и проход по личности стоят поровну, поэтому единица режет
+// время страницы ровно вдвое (замер: 47 с против 86 с на развороте). Платой
+// идёт сходство: один проход заметно слабее на среднем кадре. Для превью это
+// уместный размен — оно нужно, чтобы человек посмотрел и решил, а не чтобы
+// печатать. Книга остаётся на умолчании сервера, там качество важнее времени.
+//
+// Пусто, а не `passes: 2` для книги: умолчание живёт в GPU_FLUX_PASSES на
+// сервере, и панель, дублирующая его числом, однажды разойдётся с ним молча.
+const QUICK = {passes: 1};
+const FULL = {};
 
 const $ = (id) => document.getElementById(id);
 const photo = $('photo'), go = $('go'), status = $('status'), hint = $('hint'), out = $('out');
@@ -222,7 +235,10 @@ function say(box, text, failed){
 }
 
 // Одна страница: запрос, таймер, картинка либо причина отказа.
-async function draw(page, box){
+//
+// `quality` — то, чем режимы отличаются на сервере. Для книги он пуст, и сервер
+// берёт своё умолчание (два прохода). Для превью в нём `passes: 1`, см. QUICK.
+async function draw(page, box, quality){
   box.classList.remove('waiting');
   const started = Date.now();
   const tick = setInterval(() => say(box, 'рисуем, ' + spent(Date.now() - started)), 500);
@@ -230,13 +246,14 @@ async function draw(page, box){
   try {
     const response = await fetch('v1/demo-render', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.assign({template_id: page.id, donor_photo: donor}, child())),
+      body: JSON.stringify(Object.assign(
+        {template_id: page.id, donor_photo: donor}, child(), quality)),
     });
     clearInterval(tick);
 
     if (!response.ok){
       say(box, 'не получилось: ' + await reason(response), true);
-      retry(page, box);
+      retry(page, box, quality);
       return false;
     }
 
@@ -257,21 +274,25 @@ async function draw(page, box){
   } catch (e){
     clearInterval(tick);
     say(box, 'обрыв связи: ' + e, true);
-    retry(page, box);
+    retry(page, box, quality);
     return false;
   }
 }
 
 // Повтор ОДНОЙ страницы: упавшая обложка не должна стоить всей книги. Кнопка
 // ждёт, пока освободится очередь во вкладке, — параллельно ходить нельзя.
-function retry(page, box){
+//
+// `quality` протаскивается сюда не для порядка: повтор без него считал бы
+// страницу превью в два прохода, то есть вдвое дольше остальных в том же
+// заказе. Выглядело бы это как «повтор почему-то тормозит».
+function retry(page, box, quality){
   const button = document.createElement('button');
   button.textContent = 'Повторить страницу';
   button.onclick = async () => {
     if (busy) return;
     busy = true; button.remove();
     box.querySelectorAll('img,a').forEach(node => node.remove());
-    if (await draw(page, box) && order){ order.done++; order.failed--; summarise(); }
+    if (await draw(page, box, quality) && order){ order.done++; order.failed--; summarise(); }
     busy = false;
   };
   box.appendChild(button);
@@ -279,7 +300,9 @@ function retry(page, box){
 
 go.onclick = async () => {
   const mode = document.querySelector('input[name=mode]:checked').value;
-  const pages = mode === 'preview' ? pick(PREVIEW_PAGES) : PAGES;
+  const preview = mode === 'preview';
+  const pages = preview ? pick(PREVIEW_PAGES) : PAGES;
+  const quality = preview ? QUICK : FULL;
 
   busy = true;
   go.disabled = true;
@@ -300,7 +323,7 @@ go.onclick = async () => {
   for (let i = 0; i < pages.length; i++){
     status.textContent = 'Страница ' + (i + 1) + ' из ' + pages.length
                        + ' · всего ' + spent(Date.now() - started);
-    if (await draw(pages[i], boxes[i])) order.done++; else order.failed++;
+    if (await draw(pages[i], boxes[i], quality)) order.done++; else order.failed++;
     hint.textContent = 'Не закрывайте вкладку — готовые страницы хранятся только в ней.';
   }
 
