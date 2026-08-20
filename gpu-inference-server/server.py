@@ -61,6 +61,7 @@ import asyncio
 import base64
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -72,7 +73,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 log = logging.getLogger("gpu-inference")
 
@@ -195,6 +196,27 @@ FLUX_MODEL = _env("GPU_FLUX_MODEL", "black-forest-labs/FLUX.2-klein-4B")
 # разошлась бы с оригиналом на первой же правке.
 MLSERVICE_PATH = _env("GPU_MLSERVICE_PATH", "")
 
+# Каталог шаблонов на диске сервера. Книга — это 11 страниц подряд, и возить их
+# с клиента base64-ом на каждый заказ значит гонять по кругу ~90 МБ одних и тех
+# же файлов. Поэтому в запросе — идентификатор, а картинка берётся отсюда.
+#
+# Раскладка: <корень>/<книга>/<страница>.<расширение>. Файла-манифеста нет
+# намеренно: порядок страниц уже задан именами (`cover` < `spread_01` < ... <
+# `spread_10` при обычной сортировке), а отдельное описание состава — это ещё
+# одно место, которое разъедется с диском на первой же заливке.
+TEMPLATES_ROOT = Path(_env("GPU_TEMPLATES_ROOT", "./templates")).expanduser().resolve()
+
+# Расширения перебираются в этом порядке. Все присланные шаблоны — PNG, но отказ
+# «шаблон не найден» на однажды положенном рядом jpg разбирался бы дольше, чем
+# стоят эти три строки.
+TEMPLATE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+# Грамматика идентификатора страницы. Разрешённая, а не запрещённая, и это не
+# вкусовщина: идентификатор превращается в путь на диске сервера, и всё, что
+# грамматика не пропускает — точки, слэши, обратные слэши, — это попытка
+# прочитать чужой файл. Перечислить допустимое надёжнее, чем угадать вредное.
+_TEMPLATE_ID = re.compile(r"[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)?")
+
 # Параметры генерации демо-пути. Подобраны замером и менять их без нового замера
 # не следует:
 #   8 шагов  — +0.05 к сходству против 4; на 16 уже хуже, чем на 8, при
@@ -303,7 +325,20 @@ QUEUE_SLOTS = _env_int("GPU_QUEUE_SLOTS", 1)
 # минут в очереди: воркеров у ml-service три, они повторяют по таймауту, и без
 # верхней границы очередь растёт быстрее, чем разбирается.
 QUEUE_MAX_WAITING = _env_int("GPU_QUEUE_MAX_WAITING", 8)
-QUEUE_WAIT_TIMEOUT = _env_float("GPU_QUEUE_WAIT_TIMEOUT", 240.0)
+
+# Сколько заказ имеет право ЖДАТЬ слот. Прежние 240 с рассчитаны на одиночный
+# кадр раз в минуту; книга держит карту 20–24 минуты, и при двух-трёх заказах
+# подряд четырёх минут не хватает никому.
+#
+# ПОТОЛОК ЗАДАН НЕ НАМИ. Ожидание и рендер идут внутри ОДНОГО HTTP-запроса, а
+# перед сервером стоит прокси автозапуска с `urlopen(timeout=900)`. Значит
+# `ожидание + рендер` обязаны влезть в 900 с: 600 + 167 (самая дорогая страница,
+# обложка) = 767, запас есть. Поставить здесь щедрые 1500 значит получить у
+# клиента 502 от прокси вместо честного 503 от очереди — ровно ту непонятную
+# ошибку, ради которой всё это и правится.
+#
+# Поднимать выше — только вместе с таймаутом прокси, и в этом порядке.
+QUEUE_WAIT_TIMEOUT = _env_float("GPU_QUEUE_WAIT_TIMEOUT", 600.0)
 
 # Освобождать кэш аллокатора после каждого кадра. По умолчанию выключено: вызов
 # синхронизирует устройство и стоит десятки миллисекунд, а фрагментация на 48 ГБ
@@ -375,7 +410,16 @@ class GpuQueue:
         started = time.perf_counter()
         try:
             await asyncio.wait_for(self._sem.acquire(), timeout=self._wait_timeout)
-        except TimeoutError as exc:
+        # ОБА КЛАССА, И ЭТО НЕ ИЗБЫТОЧНОСТЬ. На боевой машине Python 3.10.12, где
+        # `asyncio.TimeoutError` — отдельный класс, а не второе имя встроенного
+        # `TimeoutError`; слиты они только с 3.11. Оставленный здесь один
+        # встроенный ловил ровно ничего: перегрузка выходила наружу необработанной
+        # и приезжала клиенту голым 500 вместо 503 «перегрузка» — то есть
+        # ошибкой, которую нельзя повторить и не видно в мониторинге.
+        #
+        # НЕ «УПРОЩАТЬ» до одного имени: на 3.11 это правда одно и то же, на
+        # боевой 3.10 — разные вещи, и упрощение вернёт дефект на место.
+        except (asyncio.TimeoutError, TimeoutError) as exc:
             self._rejected += 1
             raise QueueTimeout(f"слот не освободился за {self._wait_timeout:.0f} с") from exc
         finally:
@@ -415,6 +459,84 @@ def decode_image(data: str, field_name: str, *, grayscale: bool = False) -> np.n
     if image is None:
         raise HTTPException(422, f"{field_name}: не удалось разобрать как изображение")
     return image
+
+
+def template_file(template_id: str) -> Path:
+    """
+    Идентификатор -> файл шаблона на диске.
+
+    Идентификатор проверен грамматикой ещё в схеме запроса, поэтому выйти корнем
+    за пределы каталога им нельзя. `is_relative_to` здесь всё равно есть: она
+    стоит одной строки, а цена промаха — чтение произвольного файла сервера.
+
+    :raises HTTPException: 404, если файла с таким именем нет ни с одним из
+        известных расширений
+    """
+    for suffix in TEMPLATE_SUFFIXES:
+        path = (TEMPLATES_ROOT / f"{template_id}{suffix}").resolve()
+        if not path.is_relative_to(TEMPLATES_ROOT):
+            raise HTTPException(422, f"template_id: {template_id!r} выходит за каталог шаблонов")
+        if path.is_file():
+            return path
+    raise HTTPException(404, f"template_id: шаблон {template_id!r} на сервере не найден")
+
+
+def read_template(template_id: str) -> np.ndarray:
+    """
+    Шаблон с диска -> BGR.
+
+    Файл читается на каждый заказ и не кэшируется намеренно: разбор PNG обложки
+    4096x4096 стоит долей секунды против 167 с рендера той же страницы, а держать
+    одиннадцать страниц распакованными — это сотни мегабайт памяти ради экономии,
+    которой не видно на часах.
+
+    Читается байтами через `imdecode`, а не путём через `imread`: `imread` берёт
+    имя файла в кодировке системы и на не-ascii именах молча возвращает None —
+    а присланные шаблоны приехали именно с кириллическими именами.
+    """
+    path = template_file(template_id)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(500, f"template_id: {template_id!r} не читается: {exc}") from exc
+
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(500, f"template_id: {path.name} не разбирается как изображение")
+    return image
+
+
+def template_catalog() -> list[dict[str, Any]]:
+    """
+    Что лежит в каталоге — книгами и страницами, в порядке страниц.
+
+    Считается по диску, а не по списку в коде. После пересоздания ВМ шаблонов на
+    ней нет вовсе, и узнать об этом надо здесь, одним ответом, а не по
+    одиннадцати одинаковым отказам посреди заказа.
+
+    Размер файла отдаётся с той же целью: недокачанный шаблон — самая вероятная
+    беда заливки, и он виден числом, не открывая картинку.
+    """
+    if not TEMPLATES_ROOT.is_dir():
+        return []
+
+    # Перечисляется только ЗАКАЗУЕМОЕ: имя, не проходящее грамматику
+    # идентификатора, в списке было бы страницей, которую нельзя попросить.
+    # Присланные шаблоны приехали с кириллическими именами, поэтому это не
+    # осторожность про запас, а ровно тот случай, что будет на диске при заливке
+    # мимо инструкции.
+    books: list[dict[str, Any]] = []
+    for book in sorted(p for p in TEMPLATES_ROOT.iterdir() if p.is_dir()):
+        if not _TEMPLATE_ID.fullmatch(book.name):
+            continue
+        pages = [
+            {"id": f"{book.name}/{page.stem}", "bytes": page.stat().st_size}
+            for page in sorted(book.iterdir())
+            if page.suffix.lower() in TEMPLATE_SUFFIXES and _TEMPLATE_ID.fullmatch(page.stem)
+        ]
+        if pages:
+            books.append({"id": book.name, "pages": pages})
+    return books
 
 
 def encode_image(image: np.ndarray, fmt: str = "png", quality: int = 95) -> str:
@@ -1291,6 +1413,9 @@ class Models:
                 "reason": self.flux.reason,
                 "model": FLUX_MODEL,
                 "pipelines": _mlservice_reason() or "ok",
+                # Сколько страниц лежит на диске. Пересозданная ВМ приходит без
+                # шаблонов, и увидеть это в здоровье дешевле, чем по отказам
+                "templates": sum(len(book["pages"]) for book in template_catalog()),
             },
             "restore": {
                 "enabled": RESTORE_ENABLED,
@@ -1916,7 +2041,15 @@ class DemoRequest(BaseModel):
     получили картинку», а не как последовательность из четырёх запросов.
     """
 
-    base_image: str
+    # Шаблон приходит ОДНИМ из двух способов, см. `_one_source_of_template`.
+    #
+    # `template_id` — файл из каталога на сервере, и это рабочий путь книги:
+    # одиннадцать страниц подряд означали бы одиннадцать пересылок одних и тех
+    # же 90 МБ. `base_image` остаётся, потому что на нём висят прежние вызовы и
+    # `tools/render_batch.py`, которому нужен произвольный кадр со стенда, а не
+    # страница книги.
+    base_image: str | None = None
+    template_id: str | None = None
     donor_photo: str
 
     # Текст запроса. None — берётся GPU_FLUX_PROMPT, то есть промпт-запрет,
@@ -1966,6 +2099,38 @@ class DemoRequest(BaseModel):
     feather: float | None = Field(default=None, ge=0.0, le=1.0)
     neck: float | None = Field(default=None, ge=0.0, le=1.0)
 
+    # --- Поля заказчика: пол, возраст, цвет волос ----------------------------
+    #
+    # Принимаются, проверяются и уезжают в мету. С генерацией не делают НИЧЕГО,
+    # и это осознанное решение, а не незаконченная проводка.
+    #
+    # ЗАЧЕМ ТОГДА ПРИНИМАТЬ. Продукту они нужны и без генерации: обращение в
+    # тексте книги, аналитика, будущий подбор профиля под пол. Собрать их сейчас
+    # дёшево, а задним числом по готовым заказам — уже никак.
+    #
+    # ПОЧЕМУ НЕ ДАЛЬШЕ МЕТЫ. Единственный руль, который к ним подошёл бы, —
+    # текст промпта, а он по замерам проекта сходство ОТНИМАЕТ: перебраны четыре
+    # формулировки на двух зёрнах, самая подробная (длина, форма, объём, фактура
+    # и цвет волос) дала худший результат из всех, а на трудном кадре разрушила
+    # лицо так, что детектор его не нашёл (`tools/HAIR_EXPERIMENT.md`). Пол и
+    # возраст и без слов приходят с фотографии: проход по причёске копирует её с
+    # донора вместе с длиной и цветом.
+    #
+    # Отдельно про длинные волосы у девочки на коротко стриженном персонаже —
+    # случай, который в проекте прямо назван непроверенным. Маска головы считается
+    # от геометрии ШАБЛОНА, и причёска крупнее шаблонной упирается в её кромку;
+    # на пёстром фоне это читается как вырезанная накладка. Лечится подбором
+    # `dilate`/`feather` с замером, а не полем в запросе — и до замера включать
+    # такое по полю значит портить кадры молча.
+    gender: str | None = None
+    # Границы широкие: единственная их задача — поймать опечатку вроде 500, а не
+    # решать за заказчика, кому книга. Поле всё равно только хранится.
+    age: int | None = Field(default=None, ge=0, le=18)
+    # Свободная строка, а не список цветов: «русый», «тёмно-русый» и «пшеничный»
+    # заказчик пишет как хочет, и отказывать книге из-за слова, которое ничего
+    # не делает, — худший размен из возможных.
+    hair_color: str | None = Field(default=None, max_length=40)
+
     seed: int | None = None
     # None, а не восьмёрка по умолчанию: иначе «не указали» и «указали восемь»
     # неразличимы, и правило из `demo_steps` не смогло бы сработать ни разу.
@@ -1997,6 +2162,73 @@ class DemoRequest(BaseModel):
             raise ValueError("scale_mode: только face, head или blend")
         return value.lower()
 
+    @field_validator("template_id")
+    @classmethod
+    def _known_template_id(cls, value: str | None) -> str | None:
+        """
+        Идентификатор проверяется ДО обращения к диску, грамматикой `_TEMPLATE_ID`.
+
+        Отказ здесь — это 422 с внятным текстом вместо 404 на странном пути или,
+        хуже, чтения файла вне каталога шаблонов.
+        """
+        if value is None:
+            return None
+        if not _TEMPLATE_ID.fullmatch(value):
+            raise ValueError(
+                "template_id: строчная латиница, цифры, дефис и подчёркивание, "
+                "необязательный один слэш — например dino_pixar_real/cover"
+            )
+        return value
+
+    @field_validator("gender")
+    @classmethod
+    def _known_gender(cls, value: str | None) -> str | None:
+        """
+        Пол — закрытый список, в отличие от цвета волос.
+
+        Список закрыт не из строгости, а ради будущего: по этому полю однажды
+        будет выбираться профиль промптов и долей маски, и разнобой «girl» /
+        «девочка» / «ж», накопленный в заказах, придётся разбирать руками. Форма
+        панели наша и шлёт ровно эти два значения, поэтому третье означает, что
+        сломалась панель, — и узнать это надо на первой странице, а не на одиннадцатой.
+        """
+        if value is None:
+            return None
+        if value.lower() not in {"boy", "girl"}:
+            raise ValueError("gender: только boy или girl")
+        return value.lower()
+
+    @field_validator("hair_color")
+    @classmethod
+    def _tidy_hair_color(cls, value: str | None) -> str | None:
+        """
+        Пробелы по краям снимаются, пустая строка — это «не указали».
+
+        Здесь пустое и None намеренно СЛИТЫ, в отличие от `prompt`, где пустая
+        строка — законный опыт «текста не давать вовсе». Хранимая подпись такого
+        различия не несёт: пустое поле формы и незаполненное поле формы — одно и
+        то же событие.
+        """
+        if value is None:
+            return None
+        return value.strip() or None
+
+    @model_validator(mode="after")
+    def _one_source_of_template(self) -> DemoRequest:
+        """
+        Шаблон задаётся ровно одним способом.
+
+        Ни одного — заказ без картинки. Оба сразу — заказ, про который нельзя
+        сказать, что именно отрисовано: выбрать одно из двух молча значит однажды
+        получить страницу не той книги и не найти причину.
+        """
+        if (self.base_image is None) == (self.template_id is None):
+            raise ValueError(
+                "нужно ровно одно из двух: base_image (картинка в запросе) "
+                "или template_id (файл из каталога сервера)"
+            )
+        return self
+
 
 def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
     """
@@ -2016,7 +2248,12 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
     timings: dict[str, float] = {}
     meta: dict[str, Any] = {}
 
-    template = decode_image(request.base_image, "base_image")
+    # Схема гарантирует ровно одно из двух, поэтому ветка без else-отказа
+    template = (
+        read_template(request.template_id)
+        if request.template_id is not None
+        else decode_image(request.base_image, "base_image")
+    )
     photo = decode_image(request.donor_photo, "donor_photo")
 
     with stage(timings, "geometry"):
@@ -2102,6 +2339,19 @@ def run_demo(request: DemoRequest) -> tuple[np.ndarray, dict[str, Any]]:
     meta.update(pasted.meta)
     meta.update(
         {
+            # Откуда взялся шаблон. None означает картинку из запроса: на серии
+            # из одиннадцати страниц по кадру надо уметь сказать, какая это
+            # страница, не сверяя картинки глазами
+            "template_id": request.template_id,
+            # Поля заказчика — отдельным блоком, а не вперемешку с параметрами
+            # генерации. Разделение здесь и есть напоминание, что на картинку
+            # они не влияли: кадр, разобранный через год, не должен наводить на
+            # мысль, что цвет волос ему что-то задал
+            "child": {
+                "gender": request.gender,
+                "age": request.age,
+                "hair_color": request.hair_color,
+            },
             "size": {"height": int(template.shape[0]), "width": int(template.shape[1])},
             "flux_size": dict(zip(("height", "width"), flux_size(*template.shape[:2]))),
             "mask_px": int(np.count_nonzero(head.mask > 127)),
@@ -2183,6 +2433,40 @@ def _donor_outside(photo: np.ndarray, points: list, modules: dict[str, Any]) -> 
     return 1.0 - float(np.count_nonzero(inside)) / float(side * side)
 
 
+def domain_error(exc: Exception) -> HTTPException | None:
+    """
+    Доменная ошибка ml-service -> HTTP. None, если это не она.
+
+    Ошибки ml-service (`app/core/errors.py`) несут всё нужное сами: свой код
+    HTTP, машинный код и человеческий текст. Но отображает их в ответ обработчик,
+    зарегистрированный в ПРИЛОЖЕНИИ ml-service, а сюда приезжает только пакет
+    `app` — поэтому здесь они долетали до FastAPI неопознанными и отдавались
+    голым «Internal Server Error» без единого слова о причине. На одиночном
+    заказе это неприятно; на книге из одиннадцати страниц это заказ, вставший
+    непонятно почему и на чём.
+
+    ОПОЗНАЮТСЯ ПО СОСТАВУ ПОЛЕЙ, А НЕ ИМПОРТОМ КЛАССА. Путь к пакету приходит из
+    окружения, импорт отложенный, и на машине без ml-service его нет вовсе — а
+    обработчик исключений пришлось бы регистрировать на старте, то есть до
+    всякого импорта. Утиная проверка здесь не хитрость, а единственный способ
+    не привязывать подъём сервиса к наличию чужого пакета.
+
+    Всё неопознанное возвращается как None и уходит дальше нетронутым: это
+    настоящий сбой, и ему полагается традиционный 500 с трассировкой в журнале,
+    а не выдуманный код и подробности сервера, отданные в интернет.
+    """
+    status = getattr(exc, "status_code", None)
+    code = getattr(exc, "code", None)
+    message = getattr(exc, "message", None)
+    if not (isinstance(status, int) and isinstance(code, str) and isinstance(message, str)):
+        return None
+
+    # Машинный код едет В ТЕКСТЕ: ответы сервера везде `{"detail": "..."}`, и
+    # заводить второй формат ради одного поля значит заставить каждого клиента
+    # разбирать два. Кода в начале строки хватает и человеку, и grep по журналу
+    return HTTPException(status, f"{code}: {message}")
+
+
 @app.post("/v1/demo-render", summary="Фото ребёнка + шаблон -> готовый разворот")
 async def demo_endpoint(request: DemoRequest) -> dict[str, Any]:
     """
@@ -2206,12 +2490,41 @@ async def demo_endpoint(request: DemoRequest) -> dict[str, Any]:
         raise HTTPException(503, f"очередь переполнена: {exc}") from exc
     except QueueTimeout as exc:
         raise HTTPException(503, f"перегрузка: {exc}") from exc
+    except HTTPException:
+        # Отказы самого пути — «на шаблоне не найден персонаж», «нет такой
+        # страницы» — сформулированы там, где случились, и трогать их нечем
+        raise
+    except Exception as exc:
+        # Доменная ошибка ml-service отдаётся своим кодом и текстом. Всё
+        # остальное уходит дальше нетронутым: это настоящий сбой, и ему
+        # полагается 500 с трассировкой в журнале, а не выдуманный код
+        http = domain_error(exc)
+        if http is None:
+            raise
+        raise http from exc
 
     return {
         "image": encode_image(image, request.output_format),
         "encoding": f"image/{'jpeg' if request.output_format in {'jpg', 'jpeg'} else 'png'}",
         "meta": meta,
     }
+
+
+@app.get("/v1/templates", summary="Шаблоны, лежащие на диске сервера")
+async def templates_endpoint() -> dict[str, Any]:
+    """
+    Состав каталога: книги, страницы, размеры файлов.
+
+    Нужен для проверки заливки — «долетели ли все одиннадцать и целыми» — и для
+    клиента, который не хочет знать имена файлов наизусть.
+
+    Панель на него НЕ завязана, и это осознанно: GET через прокси намеренно не
+    будит GPU-машину (открытие страницы не должно включать карту), поэтому на
+    спящем сервере список пришёл бы 503-м, и панель не смогла бы даже показать
+    форму. Одиннадцать страниц одного стиля она знает сама, а этот адрес
+    отвечает на другой вопрос — что реально лежит на диске.
+    """
+    return {"root": str(TEMPLATES_ROOT), "books": template_catalog()}
 
 
 _DEMO_PAGE = """<!doctype html>
