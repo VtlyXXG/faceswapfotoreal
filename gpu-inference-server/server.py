@@ -2467,6 +2467,69 @@ def domain_error(exc: Exception) -> HTTPException | None:
     return HTTPException(status, f"{code}: {message}")
 
 
+def order_asked(request: DemoRequest) -> str:
+    """
+    Чем заказ пришёл — одной строкой, ДО очереди и до генерации.
+
+    ЗАЧЕМ. Пока этой строки не было, на вопрос «этот конкретный заказ шёл в один
+    проход или в два» ответить было нечем: журнал знал только код ответа. Ответ
+    искали раскопками по времени между запросами, и он остался догадкой.
+
+    ПОЧЕМУ В САМО СООБЩЕНИЕ, А НЕ В `extra`. Формат журнала — `%(message)s`
+    (см. `lifespan`), полей `extra` он не печатает вовсе. Соседние вызовы в этом
+    файле передают `extra={...}` и теряют его молча; повторять эту ошибку в
+    строке, которая заводится РАДИ диагностики, было бы особенно обидно.
+
+    ПОЧЕМУ ЗНАЧЕНИЯ ПЕЧАТАЮТСЯ ВМЕСТЕ С None. `passes=None` и `passes=2` — это
+    разные события: первое значит «клиент не просил ничего, взято умолчание
+    сервера», второе — «клиент попросил два». Ровно на этом различии стоит
+    вопрос про старую вкладку со старым JS, которая поля не шлёт вообще.
+
+    Картинок здесь нет и быть не должно: в теле запроса детская фотография.
+    От неё остаётся только размер — по нему видно, что фото вообще дошло.
+    """
+    return "[order] принят: " + " ".join(
+        f"{name}={value}"
+        for name, value in (
+            ("source", request.template_id or "base_image"),
+            ("passes", request.passes),
+            ("steps", request.steps),
+            ("scale_mode", request.scale_mode),
+            ("seed", request.seed),
+            ("prompt", request.prompt is not None),
+            ("prompt2", request.prompt2 is not None),
+            ("donor_kb", round(len(request.donor_photo) / 1024)),
+        )
+    )
+
+
+def order_done(meta: dict[str, Any]) -> str:
+    """
+    Чем заказ оказался — одной строкой, после генерации.
+
+    Пара к `order_asked`: та говорит, что просили, эта — что сделали. Вместе они
+    отвечают на «почему так долго» без захода на машину: видно и число проходов,
+    и число шагов с причиной, и сколько заказ простоял в очереди за чужим.
+
+    Подгонки тона здесь же: обе умеют молча отказаться, и этот отказ виден
+    только в мете ответа, которая до журнала не доезжает.
+    """
+    return "[order] отдан: " + " ".join(
+        f"{name}={meta.get(key)}"
+        for name, key in (
+            ("source", "template_id"),
+            ("passes", "passes"),
+            ("steps", "steps"),
+            ("steps_reason", "steps_reason"),
+            ("face_px", "face_px_generated"),
+            ("queue_wait_s", "queue_wait_s"),
+            ("total_s", "total_s"),
+            ("tone", "matched"),
+            ("skin_tone", "skin_matched"),
+        )
+    )
+
+
 @app.post("/v1/demo-render", summary="Фото ребёнка + шаблон -> готовый разворот")
 async def demo_endpoint(request: DemoRequest) -> dict[str, Any]:
     """
@@ -2480,12 +2543,17 @@ async def demo_endpoint(request: DemoRequest) -> dict[str, Any]:
     if not MODELS.flux.ready:
         raise HTTPException(503, MODELS.flux.reason or "FLUX.2 не загружен")
 
+    # ДО очереди, а не после: заказ, застрявший в ожидании слота, обязан быть
+    # виден в журнале именно как ожидающий, иначе он неотличим от не дошедшего
+    log.info(order_asked(request))
+
     try:
         async with QUEUE.slot() as waited:
             started = time.perf_counter()
             image, meta = await asyncio.to_thread(run_demo, request)
             meta["queue_wait_s"] = round(waited, 3)
             meta["total_s"] = round(time.perf_counter() - started, 3)
+            log.info(order_done(meta))
     except QueueFull as exc:
         raise HTTPException(503, f"очередь переполнена: {exc}") from exc
     except QueueTimeout as exc:
