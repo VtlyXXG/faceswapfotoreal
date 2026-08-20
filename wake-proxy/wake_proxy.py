@@ -59,6 +59,17 @@ CFG = {
 # ничего не должно стоить. Будит только настоящий заказ (POST).
 PAGE_PATHS = ("/", "/demo", "/index.html")
 
+# Маркер «клиент ушёл, отдавать некому». Отдельный объект, а не None и не
+# исключение: None — законное значение, а исключением уход клиента не является,
+# это штатный исход, на который у каждого вызывающего свой ответ.
+GONE = object()
+
+# Как часто напоминать о себе в сокет, пока GPU-сервер считает. Пятнадцать
+# секунд — заметно ниже самых жадных таймаутов простоя, которые встречаются у
+# операторов (обычно минута и выше), и достаточно редко, чтобы не превратить
+# ожидание в поток мусора.
+KEEPALIVE_S = float(os.environ.get("KEEPALIVE_S", "15"))
+
 def log(msg):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", flush=True)
 
@@ -251,11 +262,18 @@ class Handler(BaseHTTPRequestHandler):
         if wake:
             LAST_REQUEST = time.time()
             try:
-                ok, msg = ensure_awake()
+                # Пробуждение прикрыто тем же keepalive, что и рендер, и это не
+                # симметрия ради симметрии. Подъём машины — 46-54 секунды
+                # молчания, и на них соединение рвётся ровно так же, как на
+                # рендере, только раньше: на ПЕРВОЙ странице заказа.
+                woken = self._pump(ensure_awake, "во время пробуждения")
             except Exception as e:
                 log(f"ошибка пробуждения: {e}")
                 self._reply(503, {"detail": f"не удалось разбудить сервер: {e}"})
                 return
+            if woken is GONE:
+                return
+            ok, msg = woken
             if not ok:
                 # 504 — не уложились по времени; панель различает это и «занято».
                 self._reply(504, {"detail": msg})
@@ -274,19 +292,91 @@ class Handler(BaseHTTPRequestHandler):
             gpu_url(self.path), data=payload,
             headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
             method=self.command)
+        got = self._pump(lambda: self._fetch(req), "во время рендера")
         try:
-            with urllib.request.urlopen(req, timeout=900) as r:
-                self._reply(r.status, r.read(),
-                            r.headers.get("Content-Type", "application/json"))
-        except urllib.error.HTTPError as e:
-            # Ошибку GPU-сервера отдаём как есть, не подменяя своей.
-            self._reply(e.code, e.read(),
-                        e.headers.get("Content-Type", "application/json"))
-        except Exception as e:
-            self._reply(502, {"detail": f"GPU-сервер недоступен: {e}"})
+            if got is GONE:
+                return
+            if "error" in got:
+                self._reply(502, {"detail": f"GPU-сервер недоступен: {got['error']}"})
+            else:
+                self._reply(got["status"], got["body"], got["ctype"])
+        except ConnectionError:
+            # Клиент ушёл, пока считалось. Это не наш сбой и не повод для
+            # трассировки в журнале: раньше здесь падало дважды подряд —
+            # сначала отдача картинки, потом отдача сообщения об ошибке в тот
+            # же закрытый сокет.
+            log(f"клиент ушёл, ответ отдавать некому: {self.client_address[0]}")
         finally:
             if wake:
                 LAST_REQUEST = time.time()
+
+    # ------------------------------------------------------------------------
+    # Ожидание GPU-сервера с признаками жизни в сокете.
+    #
+    # ЗАЧЕМ. Рендер идёт 70-170 секунд, и всё это время по соединению не шло НИ
+    # ОДНОГО байта. Промежуточные NAT и мобильные операторы режут простаивающие
+    # соединения по таймауту в минуту-другую, и картинка приезжала в закрытый
+    # сокет: сервер посчитал, деньги потрачены, человек видит вечное «рисуем».
+    # За один день так потерялось 13 заказов из 46.
+    #
+    # ЧЕМ ИМЕННО ШУМИМ. Промежуточным ответом `100 Continue`. Выбран он, а не
+    # ранняя отдача заголовков с `200`, по одной причине: статус ответа до конца
+    # рендера НЕИЗВЕСТЕН. Пообещав `200` авансом, мы больше не сможем отдать ни
+    # 422 «на шаблоне не найден персонаж», ни 503 «перегрузка» — и панель,
+    # которая их различает, ослепнет. Промежуточный ответ бьёт по проводу, но
+    # финальный статус оставляет нетронутым: клиент 1xx пропускает и читает
+    # настоящий ответ следом.
+    #
+    # ПОБОЧНАЯ ПОЛЬЗА. Запись в сокет — единственный способ УЗНАТЬ, что клиент
+    # ушёл, не дожидаясь конца рендера. Раньше это выяснялось в момент отдачи
+    # готовой картинки, то есть всегда слишком поздно.
+    def _pump(self, work, what):
+        """
+        Выполняет `work()` в потоке, пока напоминает о себе в сокет.
+
+        Возвращает то, что вернул `work`, либо `GONE`, если клиент ушёл.
+        Исключение из `work` пробрасывается наружу как есть: разбираться с ним —
+        дело вызывающего, у пробуждения и у пересылки ответы на сбой разные.
+
+        Ждать после ухода клиента незачем — отдавать будет некому. Работа на
+        карте при этом продолжается: прервать генерацию отсюда нечем, и это
+        отдельная задача.
+        """
+        box = {}
+
+        def run():
+            try:
+                box["value"] = work()
+            except Exception as e:
+                box["error"] = e
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        while True:
+            worker.join(KEEPALIVE_S)
+            if not worker.is_alive():
+                if "error" in box:
+                    raise box["error"]
+                return box["value"]
+            try:
+                self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                self.wfile.flush()
+            except ConnectionError:
+                log(f"клиент ушёл {what}: {self.client_address[0]}")
+                return GONE
+
+    @staticmethod
+    def _fetch(req):
+        """Запрос к GPU-серверу. Ошибку отдаёт как есть, не подменяя своей."""
+        try:
+            with urllib.request.urlopen(req, timeout=900) as r:
+                return {"status": r.status, "body": r.read(),
+                        "ctype": r.headers.get("Content-Type", "application/json")}
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "body": e.read(),
+                    "ctype": e.headers.get("Content-Type", "application/json")}
+        except Exception as e:
+            return {"error": e}
 
 
 def main():
