@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     Компилятор C++ больше не нужен: insightface убран, локальных весов нет.
-    Замена лица выполняется на fal.ai — задайте FAL_KEY перед запуском.
+    Стороннего платного сервиса не требуется: путь через fal.ai выключен
+    настройкой (ML_FAL_ENABLED=false), и ключа сервис не спрашивает.
 
 .EXAMPLE
     .\scripts\setup_venv.ps1
@@ -79,10 +80,12 @@ if (-not $NoDev) {
 $ErrorActionPreference = 'Continue'
 
 Write-Host '=> Проверяю установку' -ForegroundColor Cyan
-& $python -c "import fastapi, mediapipe, cv2, fal_client; print('  mediapipe', mediapipe.__version__, '| opencv', cv2.__version__)"
+# fal_client в проверку не входит: он больше не в обязательных зависимостях
+& $python -c "import fastapi, mediapipe, cv2; print('  mediapipe', mediapipe.__version__, '| opencv', cv2.__version__)"
 
 Write-Host ''
 Write-Host 'Готово. Запуск сервиса:' -ForegroundColor Green
 Write-Host '  .\.venv\Scripts\Activate.ps1'
-Write-Host '  $env:FAL_KEY = "..."'
+Write-Host '  # ключ нужен только старому пути через fal:'
+Write-Host '  # $env:ML_FAL_ENABLED = "true"; $env:FAL_KEY = "..."; pip install fal-client'
 Write-Host '  uvicorn app.main:app --reload --port 8000'

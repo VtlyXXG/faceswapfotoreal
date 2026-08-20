@@ -3,7 +3,8 @@
 #   ./scripts/setup_venv.sh [--recreate] [--no-dev]
 #
 # Компилятор C++ больше не нужен: insightface убран, локальных весов нет.
-# Замена лица выполняется на fal.ai — не забудьте задать FAL_KEY.
+# Стороннего платного сервиса не требуется: путь через fal.ai выключен
+# настройкой (ML_FAL_ENABLED=false), и ключа сервис не спрашивает.
 set -euo pipefail
 
 SERVICE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,12 +61,14 @@ fi
 
 # --- 6. Проверка ---
 echo "=> Проверяю установку"
-"$PYTHON" -c "import fastapi, mediapipe, cv2, fal_client; print('  mediapipe', mediapipe.__version__, '| opencv', cv2.__version__)"
+# fal_client в проверку не входит: он больше не в обязательных зависимостях
+"$PYTHON" -c "import fastapi, mediapipe, cv2; print('  mediapipe', mediapipe.__version__, '| opencv', cv2.__version__)"
 
 cat <<'EOF'
 
 Готово. Запуск сервиса:
   source .venv/bin/activate
-  export FAL_KEY=...
+  # ключ нужен только старому пути через fal:
+  # export ML_FAL_ENABLED=true FAL_KEY=... && pip install fal-client
   uvicorn app.main:app --reload --port 8000
 EOF

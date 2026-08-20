@@ -1,0 +1,1 @@
+Replace the facial features of the child in the first image with the facial features of the child in the second image, and give this child the hairstyle of the child in the second image: the same length, shape, volume, texture and colour of hair. Do not change the head orientation, the gaze direction, the body pose, the clothing, the background or the lighting of the first image.

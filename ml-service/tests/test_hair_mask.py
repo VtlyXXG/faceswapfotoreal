@@ -76,9 +76,7 @@ def stub(monkeypatch, mesh):
         # им и проверяется путь «весов разметки нет»
         landmarks = points if points is not None else mesh(centre=(200, 200))
         monkeypatch.setattr(head_mask, "try_landmarks", lambda _: landmarks)
-        monkeypatch.setattr(
-            parsing, "parse", lambda _: default if parsed is _DEFAULT else parsed
-        )
+        monkeypatch.setattr(parsing, "parse", lambda _: default if parsed is _DEFAULT else parsed)
         return landmarks
 
     return setup
@@ -570,3 +568,316 @@ def test_meta_explains_what_was_built(image, stub):
     assert meta["hair_px"] > 0
     assert meta["protected_px"] > 0, "защита лица обязана что-то вычесть"
     assert 0 < meta["open_share"] < 0.35
+
+
+# --- Полоса на повёрнутой голове ---------------------------------------------
+#
+# Симметричная полоса живёт ровно до первого разворота: `face_width` сокращается
+# проекцией, и полуширина, посчитанная из него, сужает ОБЕ полосы разом — тогда
+# как ближняя щека в проекции РАСТЯГИВАЕТСЯ. Ближнюю недокрываем, дальнюю уводим
+# на нос. Заглушка сетки умеет поворот (см. conftest), и проверяется он здесь.
+
+
+def _bands(image, stub, mesh, **turn):
+    """Сырая полоса и мета для головы, повёрнутой на заданный угол."""
+    stub(points=mesh(centre=(200, 200), **turn))
+    built = _build(image, cheek_ratio=0.35)
+    return built.cheeks, built.meta
+
+
+def _side_pixels(bands, geometry, positive: bool) -> int:
+    """Сколько пикселей полосы лежит по одну сторону от оси лица."""
+    rows, columns = np.nonzero(bands)
+    chin, side = geometry["chin"], geometry["side"]
+    lateral = (columns - chin[0]) * side[0] + (rows - chin[1]) * side[1]
+    return int(np.count_nonzero(lateral >= 0 if positive else lateral < 0))
+
+
+def test_the_frontal_bands_stay_symmetric(image, stub, mesh):
+    """
+    Ничего из написанного ниже не должно менять фронтальный кадр: на нём
+    прежняя доля полуширины выигрывает у прижима к глазу, и полосы остаются
+    двумя зеркальными прямоугольниками. Это защита от регресса — фас работает.
+    """
+    bands, meta = _bands(image, stub, mesh)
+    geometry = head_mask.face_geometry(mesh(centre=(200, 200)))
+
+    assert [band["bound_by"] for band in meta["cheek_bands"]] == ["geometry", "geometry"]
+    assert abs(meta["cheek_pose"]["yaw"]) < 0.05
+
+    near, far = meta["cheek_bands"]
+    assert near["width_px"] == far["width_px"], "полосы разной ширины на фасе"
+
+    left = _side_pixels(bands, geometry, positive=False)
+    right = _side_pixels(bands, geometry, positive=True)
+    assert abs(left - right) < max(left, right) * 0.05, "полосы разъехались на фасе"
+
+
+@pytest.mark.parametrize("degrees", [30, 45, 55, 70])
+def test_the_far_cheek_band_survives_the_profile(image, stub, mesh, degrees):
+    """
+    Регрессия, стоившая композита, и главное свойство этой правки.
+
+    Прежняя версия снимала дальнюю полосу на повороте: «камера не видит эту
+    щеку, значит, и правки там не нужно». Рассуждение неверно в самой посылке.
+    Маска работает в ПЛОСКОСТИ КАДРА, а прядь на дальней стороне от поворота
+    головы никуда не девается — она висит на своём месте. Оставшись вне маски,
+    она доезжала до готового разворота нетронутой.
+
+    Поэтому дальняя полоса обязана быть на месте на любом угле, и не тоньше
+    доли от фронтальной ширины.
+    """
+    points = mesh(centre=(200, 200), yaw=degrees)
+    bands, meta = _bands(image, stub, mesh, yaw=degrees)
+    geometry = head_mask.face_geometry(points)
+
+    assert bands is not None, "полоса исчезла целиком"
+
+    far = next(band for band in meta["cheek_bands"] if band["side"] == "far")
+    floor = (
+        geometry["face_height"]
+        * hair_mask._HALF_PER_HEIGHT
+        * (hair_mask._CHEEK_OUTER - hair_mask._CHEEK_INNER)
+        * hair_mask._CHEEK_MIN_FAR_SHARE
+    )
+    assert far["width_px"] >= floor - 0.5, "дальняя полоса уже хард-лимита"
+
+    # И она действительно нарисована, а не только посчитана
+    pose = head_mask.head_pose(points, geometry)
+    assert (
+        _side_pixels(bands, geometry, positive=pose["far"] > 0) > 0
+    ), "дальняя полоса посчитана, но в маску не попала"
+
+
+def test_the_far_band_is_pulled_out_to_the_hair_the_parser_sees(image, stub, mesh):
+    """
+    Привязка к силуэту. Сетка на повороте показывает на дальней стороне воздух,
+    а сегментатор видит там волосы — права разметка, волосы в кадре есть.
+
+    Проверяется сравнением двух разметок на одном и том же повороте: у второй
+    копна на дальней стороне длиннее, и кромка полосы обязана уйти за ней.
+    """
+    turned = mesh(centre=(200, 200), yaw=40)
+    geometry = head_mask.face_geometry(turned)
+    pose = head_mask.head_pose(turned, geometry)
+
+    # Куда именно вытягивать — зависит от того, какая сторона дальняя
+    far_left = pose["far"] < 0
+    short = _parsed(hair_box=(110, 320, 130, 270), face_box=(160, 260, 160, 240))
+    long = _parsed(
+        hair_box=(110, 320, 60, 270) if far_left else (110, 320, 130, 340),
+        face_box=(160, 260, 160, 240),
+    )
+
+    stub(points=turned, parsed=short)
+    tight = _build(image, cheek_ratio=0.35).meta
+    stub(points=turned, parsed=long)
+    wide = _build(image, cheek_ratio=0.35).meta
+
+    far_tight = next(band for band in tight["cheek_bands"] if band["side"] == "far")
+    far_wide = next(band for band in wide["cheek_bands"] if band["side"] == "far")
+
+    assert far_wide["outer_px"] > far_tight["outer_px"], "полоса не пошла за разметкой"
+    assert far_wide["bound_by"] == "hair"
+
+
+def test_the_silhouette_never_pulls_the_band_past_the_frontal_envelope(image, stub, mesh):
+    """
+    Обратная сторона той же привязки: разметка тянет кромку наружу, но не
+    дальше, чем полоса дотягивалась бы в фас. Без этого предела длинная копна
+    уводила бы полосу на весь кадр, а размытие — на силуэт причёски, который
+    редактору служит единственным указанием, где растут волосы.
+    """
+    stub(
+        parsed=_parsed(
+            # Копна во весь кадр — заведомо шире любого фронтального конверта
+            hair_box=(20, 380, 10, 390),
+            face_box=(160, 260, 160, 240),
+        )
+    )
+
+    meta = _build(image, cheek_ratio=0.35).meta
+    points = mesh(centre=(200, 200))
+    geometry = head_mask.face_geometry(points)
+    pose = head_mask.head_pose(points, geometry)
+    envelope = geometry["face_height"] * hair_mask._HALF_PER_HEIGHT * hair_mask._CHEEK_OUTER
+
+    halves = (pose["near_half"], pose["far_half"])
+    for band, half in zip(meta["cheek_bands"], halves, strict=True):
+        # Своя геометрия полосу не ограничивает — она её задаёт; предел ставится
+        # именно РАЗМЕТКЕ, и потому сравнивается с большим из двух
+        assert (
+            band["outer_px"] <= max(half * hair_mask._CHEEK_OUTER, envelope) + 0.5
+        ), "разметка утащила полосу за конверт"
+        assert band["bound_by"] == "geometry", "копна во весь кадр не должна ничего двигать"
+
+
+def test_the_near_cheek_band_widens_with_the_turn(image, stub, mesh):
+    """
+    Обратная сторона того же: ближняя щека разворачивается к камере и занимает
+    БОЛЬШЕ пикселей, чем в фас. Симметричная полоса, считавшая полуширину из
+    сократившегося `face_width`, сужала бы её вместе с дальней.
+    """
+    _, frontal = _bands(image, stub, mesh)
+    _, turned = _bands(image, stub, mesh, yaw=35)
+
+    assert turned["cheek_pose"]["near_half_px"] > frontal["cheek_pose"]["near_half_px"] * 1.1
+    assert turned["cheek_pose"]["far_half_px"] < frontal["cheek_pose"]["far_half_px"] * 0.5
+
+
+@pytest.mark.parametrize("degrees", [0, 10, 20, 30, 40, 50])
+def test_the_band_never_climbs_into_the_eye(image, stub, mesh, degrees):
+    """
+    Ловушка, в которую пропорциональное сужение попадает само. На дальней
+    стороне полуширина сжимается быстрее, чем глаз, и доля от неё заезжает под
+    веко: внешний угол глаза, замеренный на живой сетке, отходит с 0.71
+    полуширины в фас до 2.27 на 35°. Кромка прижата к самому углу глаза, и
+    проверяется это на всём диапазоне, а не на одном удобном угле.
+
+    Проверяется именно УГОЛ глаза, и этого достаточно: глаз лежит от него
+    внутрь, к оси лица, а полоса — наружу. Чист угол — чист и весь глаз.
+    """
+    points = mesh(centre=(200, 200), yaw=degrees)
+    bands, _ = _bands(image, stub, mesh, yaw=degrees)
+    if bands is None:
+        return
+
+    for corner in (33, 263):
+        column, row = points[corner]
+        assert bands[row, column] == 0, f"полоса накрыла внешний угол глаза {corner} на {degrees}°"
+
+
+def test_without_the_mesh_the_bands_stay_symmetric(image, stub, mesh, monkeypatch):
+    """
+    Путь через разметку: сетки лица нет, точек нет, мерить поворот нечем.
+    Гадать хуже, чем не поправлять, — полоса остаётся прежней, симметричной, и
+    мета честно говорит, что позы не было.
+    """
+    stub()
+    with_mesh = _build(image, cheek_ratio=0.35).meta
+    assert with_mesh["cheek_pose"] is not None
+
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: None)
+    without = _build(image, cheek_ratio=0.35).meta
+
+    assert without["cheek_pose"] is None
+    assert without["cheek_px"] > 0, "без сетки полоса обязана остаться"
+    near, far = without["cheek_bands"]
+    assert near["width_px"] == far["width_px"], "без позы полосы обязаны быть зеркальны"
+
+
+# --- Глаза: полигон вместо кромки --------------------------------------------
+#
+# Прежде глаз оберегала сама внутренняя кромка полосы: она останавливалась
+# снаружи от внешнего угла. Защита была грубой в обе стороны — глаз всё равно
+# накрывался на повороте, а корень пряди между углом глаза и кромкой не
+# накрывался никогда, и на висках оставался тёмный остаток. Теперь кромка
+# опущена на висок, а глаза вычитаются точным полигоном с буфером.
+
+
+def _eye_extent(points, geometry, ring) -> float:
+    """Докуда контур глаза дотягивается вбок от оси, доли полуширины лица."""
+    chin, side = geometry["chin"], geometry["side"]
+    half = geometry["face_width"] / 2.0
+    return max(
+        abs(float(np.dot(np.asarray(points[index], dtype=np.float64) - chin, side))) / half
+        for index in ring
+    )
+
+
+def test_the_band_now_reaches_the_temple(image, stub, mesh):
+    """
+    Шаг первый: кромка опущена. Полоса обязана заходить ЗАМЕТНО глубже прежних
+    0.75 полуширины — иначе корню пряди по-прежнему негде оказаться внутри неё.
+    """
+    stub()
+
+    meta = _build(image, cheek_ratio=0.35).meta
+
+    assert meta["cheek_inner_ratio"] == hair_mask._CHEEK_INNER_TEMPLE
+    assert meta["cheek_inner_ratio"] < hair_mask._CHEEK_INNER
+
+    points = mesh(centre=(200, 200))
+    geometry = head_mask.face_geometry(points)
+    for band in meta["cheek_bands"]:
+        assert band["inner_px"] < hair_mask._CHEEK_INNER * geometry["face_width"] / 2.0
+
+
+def test_the_root_between_the_eye_and_the_old_edge_is_covered(image, stub, mesh):
+    """
+    Сам дефект. Между внешним концом глаза (0.67-0.71 полуширины на живой
+    сетке) и прежней кромкой (0.75) оставалась полоска в считанные пиксели — в
+    ней и сидел корень пряди на виске, не попадая под заливку ни разу.
+
+    Проверяется, что эта полоска теперь ВНУТРИ полосы: точка сразу снаружи от
+    буфера глаза, на уровне глаза, обязана быть накрыта.
+    """
+    points = stub()
+    bands = _build(image, cheek_ratio=0.35).cheeks
+    geometry = head_mask.face_geometry(points)
+
+    reach = _eye_extent(points, geometry, hair_mask._EYE_RING_A)
+    half = geometry["face_width"] / 2.0
+    buffer = geometry["face_height"] * hair_mask._CHEEK_EYE_BUFFER
+
+    # Висок: сразу за буфером глаза, на его же высоте
+    chin, side, up = geometry["chin"], geometry["side"], geometry["up"]
+    eye_row = points[hair_mask._EYE_RING_A[0]][1]
+    along = float(np.dot(np.array([0.0, eye_row]) - chin, up))
+    root = chin + up * along - side * (reach * half + buffer + 3)
+
+    assert (
+        bands[int(round(root[1])), int(round(root[0]))] == 255
+    ), "корень пряди у глаза снова вне полосы"
+
+
+@pytest.mark.parametrize("degrees", [0, 20, 35])
+def test_the_eye_is_carved_out_with_a_buffer(image, stub, mesh, degrees):
+    """
+    Шаг третий: вычитание не пиксель-в-пиксель. У полосы растушёванная альфа, и
+    у самой кромки дыры вес ещё не ноль — размытие затянуло бы туда тьму ресниц
+    и зрачка. Поэтому проверяется не только контур, но и кольцо вокруг него.
+    """
+    points = stub(points=mesh(centre=(200, 200), yaw=degrees))
+    built = _build(image, cheek_ratio=0.35)
+    geometry = head_mask.face_geometry(points)
+    buffer = int(round(geometry["face_height"] * hair_mask._CHEEK_EYE_BUFFER))
+
+    for ring in (hair_mask._EYE_RING_A, hair_mask._EYE_RING_B):
+        for index in ring:
+            column, row = points[index]
+            window = built.cheeks[
+                max(0, row - buffer // 2) : row + buffer // 2 + 1,
+                max(0, column - buffer // 2) : column + buffer // 2 + 1,
+            ]
+            assert not window.any(), f"полоса накрыла глаз у точки {index} на {degrees}°"
+
+
+def test_the_eye_hole_is_reported(image, stub):
+    """
+    Число в мете. Ноль при построенной сетке означал бы, что кромка до глаз не
+    дошла, — то есть корень пряди снова вне заливки, и дефект вернулся молча.
+    """
+    stub()
+
+    meta = _build(image, cheek_ratio=0.35).meta
+
+    assert meta["cheek_eye_px"] > 0, "полоса до глаз не дошла — вычитать нечего"
+    assert meta["cheek_eye_px"] < meta["cheek_px"] * 0.25, "глазам отдана четверть полосы"
+
+
+def test_without_the_mesh_the_edge_stays_conservative(image, stub, monkeypatch):
+    """
+    Агрессия кромки лицензирована возможностью вырезать глаза. Полигон строится
+    только по сетке; нет сетки — нет и права заходить на висок, иначе полоса
+    легла бы на веко без всякой защиты.
+    """
+    stub()
+    with_mesh = _build(image, cheek_ratio=0.35).meta
+
+    monkeypatch.setattr(head_mask, "try_landmarks", lambda _: None)
+    without = _build(image, cheek_ratio=0.35).meta
+
+    assert with_mesh["cheek_inner_ratio"] == hair_mask._CHEEK_INNER_TEMPLE
+    assert without["cheek_inner_ratio"] == hair_mask._CHEEK_INNER
+    assert without["cheek_eye_px"] == 0

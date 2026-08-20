@@ -133,3 +133,45 @@ def test_extract_image_understands_a_single_image_response():
 def test_extract_image_rejects_empty_response(response):
     with pytest.raises(fal_api.FalError):
         fal_api._extract_image(response)
+
+
+# --- Выключатель пути ---
+
+
+def test_client_refuses_when_disabled(monkeypatch):
+    """
+    Выключенный путь отсекается ДО проверки ключа.
+
+    Свежий клон не обязан иметь чужой платный ключ, и требование его выглядит
+    поломкой. Код отличается от FAL_NOT_CONFIGURED намеренно: «возможность
+    отключена» и «сервис недонастроен» — разные состояния.
+    """
+    monkeypatch.setattr(fal_api.settings, "fal_enabled", False)
+    monkeypatch.setenv("FAL_KEY", "живой-ключ-который-не-должен-читаться")
+
+    with pytest.raises(fal_api.FalDisabledError) as exc:
+        fal_api.client()
+
+    assert exc.value.code == "FAL_DISABLED"
+    assert "ML_FAL_ENABLED" in str(exc.value.details)
+
+
+def test_key_not_read_when_disabled(monkeypatch):
+    """При выключенном пути ключ не читается даже если он задан."""
+    monkeypatch.setattr(fal_api.settings, "fal_enabled", False)
+    monkeypatch.setenv("FAL_KEY", "живой-ключ")
+    assert fal_api.key_present() is False
+
+    monkeypatch.setattr(fal_api.settings, "fal_enabled", True)
+    assert fal_api.key_present() is True
+
+
+def test_disabled_by_default():
+    """
+    Умолчание — выключено. Проверка стоит отдельно и намеренно: включённое
+    умолчание требовало платного ключа у всякого, кто просто склонировал
+    репозиторий.
+    """
+    from app.config import Settings
+
+    assert Settings().fal_enabled is False

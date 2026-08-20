@@ -86,6 +86,13 @@ from app.core.errors import InvalidImageError
 # InstantID отдельным эндпоинтом на fal не выставлен вовсе. ControlNet задаёт
 # структуру, а не личность, и нашей задачи не решает ни в каком виде: старый
 # inpaint_controlnet.py удалён именно поэтому.
+# Рабочий путь никуда не «уезжает»: генерация считается на своём GPU-сервере,
+# адрес которого задаётся ML_RENDER_BASE_URL, а не профилем. Здесь стоит метка,
+# а не URL, и это осознанно: профиль описывает ЧТО вызывается, а не ГДЕ стоит
+# сервер — иначе один и тот же профиль нельзя было бы использовать на боксе, в
+# туннеле и в контейнере. В /health/ready и в X-Swap-Meta эта метка означает
+# «облака в пути нет вовсе».
+_LOCAL_RENDER = "local/demo-render"
 _FAL_FACE_SWAP = "fal-ai/face-swap"
 _KONTEXT_MAX_MULTI = "fal-ai/flux-pro/kontext/max/multi"
 _KONTEXT_INPAINT = "fal-ai/flux-kontext-lora/inpaint"
@@ -275,6 +282,23 @@ FACE_SWAP = PayloadSchema(
     format_field=None,
 )
 
+# Свой GPU-сервер, POST /v1/demo-render. Две картинки в base64 и формат ответа —
+# больше он ничего не принимает: маску, силуэт, кроп донора и число шагов он
+# считает сам. Имена полей описаны здесь, а не зашиты в стратегию, по той же
+# причине, что и у остальных схем: чтобы контракт сервера был виден в одном
+# месте и попадал в /health/ready как `sends`.
+DEMO_RENDER = PayloadSchema(
+    name="demo_render",
+    image_field="base_image",
+    identity_field="donor_photo",
+    prompt_field=None,
+    mask_field=None,
+    strength_field=None,
+    guidance_field=None,
+    steps_field=None,
+    format_field="output_format",
+)
+
 # Мультикартиночные редакторы: шаблон и фотография массивом, замена описывается
 # промптом. Схема совпадает с kontext/max/multi, поэтому работают они на той же
 # стратегии — вместе с локальной вклейкой, которая защищает шаблон. Нужны там,
@@ -361,6 +385,7 @@ def payload(name: str) -> PayloadSchema:
 
 register_payload(KONTEXT)
 register_payload(KONTEXT_MULTI)
+register_payload(DEMO_RENDER)
 register_payload(FACE_SWAP)
 register_payload(NANO_BANANA)
 register_payload(SEEDREAM_EDIT)
@@ -705,6 +730,18 @@ class HairStage:
     # прядь спускается по щеке и кончается на нём, а глубже начинается грудь,
     # где волос не бывает и правке делать нечего
     cheek_ratio: float = 0.35
+    # Разрушение структуры В ПОЛОСЕ щеки, см. `pipelines/cheeks.py`. Сигма
+    # размытия в долях высоты лица; 0 выключает работу целиком. Ориентир —
+    # порядок ширины пряди: сигма меньше неё оставит прядь отчётливой тёмной
+    # полосой, то есть ровно тем, за что редактор и цепляется
+    cheek_wipe_ratio: float = 0.05
+    # Вес плоской заливки против размытого оригинала, 0..1. Единица — буквально
+    # плоское пятно: структуры не остаётся никакой, но исчезает и низкочастотный
+    # градиент щеки. Ровно этой ценой стирание сделало голову лысой, только там
+    # пятно накрывало всю причёску, а здесь — полосу, и силуэт копны цел.
+    # Меньше единицы — тон тянется к чистой коже, градиент выживает, платой
+    # становится мягкое тёмное пятно на месте пряди
+    cheek_flat_ratio: float = 1.0
     # Стирание выключено: прогон показал, что оно не решает задачу (прядь лежит
     # ВНЕ маски, и заливка до неё не достаёт) и вдобавок стоит силуэта причёски
     # и светлого ореола. Оставлено переключателем, как kontext_multi, —
@@ -756,6 +793,8 @@ class HairStage:
             "hair_core_ratio": self.core_ratio,
             "hair_guard_ratio": self.guard_ratio,
             "hair_cheek_ratio": self.cheek_ratio,
+            "hair_cheek_wipe_ratio": self.cheek_wipe_ratio,
+            "hair_cheek_flat_ratio": self.cheek_flat_ratio,
             "hair_erase_ratio": self.erase_ratio,
             "hair_crop_ratio": self.crop_ratio,
             "hair_min_changed": self.min_changed,
@@ -974,6 +1013,7 @@ class RefineProfile:
             or self.hair.core_ratio < 0
             or self.hair.guard_ratio < 0
             or self.hair.cheek_ratio < 0
+            or self.hair.cheek_wipe_ratio < 0
             or self.hair.erase_ratio < 0
             or self.hair.crop_ratio < 0
             or self.hair.min_changed < 0
@@ -981,6 +1021,13 @@ class RefineProfile:
             raise InvalidImageError(
                 "Доли шага причёски не могут быть отрицательными",
                 {"profile": self.name, **self.hair.report()},
+            )
+        if not 0.0 <= self.hair.cheek_flat_ratio <= 1.0:
+            # Не доля высоты лица, а вес смеси: за единицей нет смысла (тон
+            # уехал бы мимо кожи в обе стороны), за нулём — тем более
+            raise InvalidImageError(
+                "Вес плоской заливки щеки лежит между нулём и единицей",
+                {"profile": self.name, "cheek_flat_ratio": self.hair.cheek_flat_ratio},
             )
         if not self.hair.endpoint:
             raise InvalidImageError(
@@ -1122,6 +1169,8 @@ def from_settings() -> RefineProfile:
         ("core_ratio", settings.hair_core_ratio),
         ("guard_ratio", settings.hair_guard_ratio),
         ("cheek_ratio", settings.hair_cheek_ratio),
+        ("cheek_wipe_ratio", settings.hair_cheek_wipe_ratio),
+        ("cheek_flat_ratio", settings.hair_cheek_flat_ratio),
         ("erase_ratio", settings.hair_erase_ratio),
         ("crop_ratio", settings.hair_crop_ratio),
         ("min_changed", settings.hair_min_changed),
@@ -1152,9 +1201,29 @@ def from_settings() -> RefineProfile:
     return replace(profile, **changes).validate() if changes else profile.validate()
 
 
+# РАБОЧИЙ ПУТЬ. Генерация на своём GPU-сервере: FLUX.2 рисует голову, LaMa
+# стирает старую по силуэту, пересадка возвращает остальное из шаблона побитово.
 register_strategy_defaults(
     StrategyDefaults(
         name="face_swap",
+        endpoint=_LOCAL_RENDER,
+        payload=DEMO_RENDER,
+        # Текст у этого пути есть, но он не наш: промпт-запрет живёт на сервере
+        # в GPU_FLUX_PROMPT, потому что подбирался вместе с числом шагов и
+        # моделью. Пустая строка здесь — утверждение, что отсюда не передаётся
+        # ничего
+        instruction="",
+        # Ни маски, ни поля вокруг фотографии: геометрию, силуэт и кроп донора
+        # сервер считает сам, тем же кодом app.pipelines
+        needs_mask=False,
+        reference_pad_max=1.0,
+    )
+)
+# Прежний путь на fal. Живой только вместе с ML_FAL_ENABLED=true и ключом;
+# переименован из face_swap, потому что это имя занял рабочий путь выше
+register_strategy_defaults(
+    StrategyDefaults(
+        name="fal_face_swap",
         endpoint=_FAL_FACE_SWAP,
         payload=FACE_SWAP,
         # Текста эндпоинт не читает. Пустая строка здесь — не забывчивость, а
@@ -1179,8 +1248,8 @@ register_strategy_defaults(
 register_strategy_defaults(
     StrategyDefaults(
         name="hair_swap",
-        endpoint=_FAL_FACE_SWAP,
-        payload=FACE_SWAP,
+        endpoint=_LOCAL_RENDER,
+        payload=DEMO_RENDER,
         instruction="",
         needs_mask=False,
         # Поле вокруг фотографии мешает обоим шагам: детектору фейссвопа — искать
@@ -1218,15 +1287,16 @@ register(
     RefineProfile(
         name="pixar_real",
         strategy="face_swap",
-        endpoint=_FAL_FACE_SWAP,
-        payload=FACE_SWAP,
+        endpoint=_LOCAL_RENDER,
+        payload=DEMO_RENDER,
         # Фотореализм здесь не выпрашивается словами: переносится настоящее
         # лицо, и просить его «быть фотографией» некого. Отсюда и пустая
-        # инструкция — эндпоинт текст не принимает вовсе
+        # инструкция — отсюда в генерацию не уезжает ни слова, промпт-запрет
+        # живёт на GPU-сервере
         instruction="",
         style="pixar_real",
-        # Локальной геометрии нет: область эндпоинт находит сам, а поле вокруг
-        # фотографии мешает его детектору (pad_max=1.0 выключает подготовку)
+        # Локальной геометрии нет: маску, силуэт и кроп донора считает сам
+        # GPU-сервер (pad_max=1.0 выключает подготовку фотографии)
         needs_mask=False,
         reference_pad_max=1.0,
         # Ни одно из этих чисел в фейссвоп не уезжает — все они про диффузию. По

@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Книга с твоим лицом</title>
+<!--
+  Панель книги. Отдаётся прокси автозапуска (wake_proxy.py) с диска на каждый
+  GET, поэтому обновляется простым scp — перезапускать прокси не нужно.
+
+  ЗАКАЗ СОБИРАЕТСЯ ПОСТРАНИЧНО, ОДИННАДЦАТЬЮ ОТДЕЛЬНЫМИ ЗАПРОСАМИ, и это главное
+  решение здесь, а не деталь реализации:
+
+  * Батч-эндпоинт на всю книгу упёрся бы в таймаут прокси: `urlopen(timeout=900)`
+    против 20-24 минут рендера. Клиент получил бы 502, а карта продолжила бы
+    считать в пустоту.
+  * Каждая страница обновляет `LAST_REQUEST` на прокси, поэтому сторож гашения
+    не погасит машину посреди заказа. Одним длинным запросом — погасил бы.
+  * Прогресс по страницам получается сам собой, а упавшая страница повторяется
+    поштучно, не переделывая книгу.
+
+  СТРОГО ПО ОДНОЙ ЗА РАЗ. Слот на карте один (GPU_QUEUE_SLOTS=1); одиннадцать
+  параллельных запросов не ускорили бы ничего, а упёрлись бы в предел длины
+  очереди и вернули 503 на большей части страниц.
+
+  Состояния заказа нет НАМЕРЕННО: заказ живёт во вкладке, перезагрузка его
+  теряет. Так решено осознанно — постоянное хранилище заказов это отдельная
+  работа, а показывать книгу надо сейчас.
+
+  Ни одной внешней зависимости: прокси живёт без интернета для клиента, CDN ему
+  недоступен.
+-->
+<style>
+ body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;
+      background:#101418;color:#e8eaed;max-width:900px;margin:0 auto}
+ h1{font-size:22px;margin:0 0 4px} p.sub{color:#9aa0a6;margin:0 0 24px;font-size:14px}
+ .row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+ label{flex:1;min-width:220px;background:#1b2026;border:1px solid #2c333b;border-radius:12px;
+       padding:16px;cursor:pointer;display:block}
+ label span{display:block;font-size:13px;color:#9aa0a6;margin-bottom:8px}
+ input,select{width:100%;color:#e8eaed;font-size:15px;background:#101418;border:1px solid #2c333b;
+              border-radius:8px;padding:8px}
+ input[type=file]{border:0;background:none;padding:0}
+ fieldset{border:1px solid #2c333b;border-radius:12px;padding:12px 16px;margin:0 0 16px}
+ legend{color:#9aa0a6;font-size:13px;padding:0 6px}
+ .mode{display:flex;gap:16px;flex-wrap:wrap}
+ .mode label{display:flex;align-items:flex-start;gap:10px;border:0;background:none;padding:6px 0;
+             cursor:pointer;min-width:260px}
+ .mode input{width:auto;margin-top:3px}
+ .mode b{display:block;font-weight:600;font-size:15px}
+ .mode i{font-style:normal;color:#9aa0a6;font-size:13px}
+ button{width:100%;padding:16px;font-size:17px;border:0;border-radius:12px;
+        background:#3b82f6;color:#fff;cursor:pointer}
+ button:disabled{background:#2c333b;color:#6b7280;cursor:default}
+ #status{margin-top:16px;color:#9aa0a6;font-size:14px;min-height:20px}
+ #hint{color:#6b7280;font-size:13px;margin-top:4px;min-height:18px}
+ .err{color:#f28b82}
+ .page{margin-top:24px;border-top:1px solid #2c333b;padding-top:16px}
+ .page h2{font-size:16px;margin:0 0 6px;display:flex;justify-content:space-between;gap:12px}
+ .page h2 em{font-style:normal;color:#9aa0a6;font-size:13px;font-weight:400;text-align:right}
+ .page img{width:100%;border-radius:12px;display:block;margin-top:10px}
+ .page a{color:#8ab4f8;font-size:13px;display:inline-block;margin-top:8px}
+ .page button{width:auto;padding:8px 14px;font-size:14px;margin-top:10px;background:#2c333b;
+              color:#e8eaed}
+ .waiting{opacity:.45}
+</style></head><body>
+<h1>Книга с твоим лицом</h1>
+<p class="sub">Загрузите фотографию ребёнка — сервер соберёт книгу «Путешествие с динозаврами»
+постранично и покажет каждую страницу сразу, как она будет готова.</p>
+
+<div class="row">
+  <label><span>Фотография ребёнка</span><input type="file" id="photo" accept="image/*"></label>
+</div>
+<div class="row">
+  <label><span>Пол</span><select id="gender">
+    <option value="">не указан</option><option value="boy">мальчик</option>
+    <option value="girl">девочка</option></select></label>
+  <label><span>Возраст</span><input type="number" id="age" min="0" max="18" placeholder="лет"></label>
+  <label><span>Цвет волос</span><input type="text" id="hair" maxlength="40" placeholder="например, русый"></label>
+</div>
+
+<fieldset><legend>Что рисуем</legend><div class="mode">
+  <label><input type="radio" name="mode" value="full" checked>
+    <span><b>Всю книгу</b><i>обложка и 10 разворотов, 20–25 минут</i></span></label>
+  <label><input type="radio" name="mode" value="preview">
+    <span><b>Превью</b><i>3 случайные страницы, 2–4 минуты</i></span></label>
+</div></fieldset>
+
+<button id="go" disabled>Сделать книгу</button>
+<div id="status"></div>
+<div id="hint"></div>
+<div id="out"></div>
+
+<script>
+// Список страниц зашит здесь НАМЕРЕННО, а не читается с `GET /v1/templates`.
+// Прокси не будит GPU-машину на GET (открытие панели не должно включать карту и
+// жечь деньги), поэтому на спящем сервере список пришёл бы 503-м и панель не
+// смогла бы показать даже форму. Стиль один — Реалистичный 3D: остальные три из
+// поставки пайплайн берёт не целиком.
+const BOOK = 'dino_pixar_real';
+const PAGES = [
+  {id: BOOK + '/cover',     title: 'Обложка'},
+  {id: BOOK + '/spread_01', title: 'Разворот 1'},
+  {id: BOOK + '/spread_02', title: 'Разворот 2'},
+  {id: BOOK + '/spread_03', title: 'Разворот 3'},
+  {id: BOOK + '/spread_04', title: 'Разворот 4'},
+  {id: BOOK + '/spread_05', title: 'Разворот 5'},
+  {id: BOOK + '/spread_06', title: 'Разворот 6'},
+  {id: BOOK + '/spread_07', title: 'Разворот 7'},
+  {id: BOOK + '/spread_08', title: 'Разворот 8'},
+  {id: BOOK + '/spread_09', title: 'Разворот 9'},
+  {id: BOOK + '/spread_10', title: 'Разворот 10'},
+];
+const PREVIEW_PAGES = 3;
+
+// Превью считается ОДНИМ проходом вместо двух, книга — двумя.
+//
+// Проход по причёске и проход по личности стоят поровну, поэтому единица режет
+// время страницы ровно вдвое (замер: 47 с против 86 с на развороте). Платой
+// идёт сходство: один проход заметно слабее на среднем кадре. Для превью это
+// уместный размен — оно нужно, чтобы человек посмотрел и решил, а не чтобы
+// печатать. Книга остаётся на умолчании сервера, там качество важнее времени.
+//
+// Пусто, а не `passes: 2` для книги: умолчание живёт в GPU_FLUX_PASSES на
+// сервере, и панель, дублирующая его числом, однажды разойдётся с ним молча.
+const QUICK = {passes: 1};
+const FULL = {};
+
+const $ = (id) => document.getElementById(id);
+const photo = $('photo'), go = $('go'), status = $('status'), hint = $('hint'), out = $('out');
+
+let donor = null;      // base64 фотографии: читается один раз на заказ, а не на страницу
+let busy = false;      // и цикл, и повтор страницы ходят по одному: слот на карте один
+let order = null;      // счётчики текущего заказа: по ним пересобирается итоговая строка
+
+photo.onchange = () => { go.disabled = !photo.files[0]; };
+
+function b64(file){
+  return new Promise((ok, bad) => { const r = new FileReader();
+    r.onload = () => ok(r.result.split(',')[1]); r.onerror = bad; r.readAsDataURL(file); });
+}
+
+// Картинка кладётся в Blob, а не в data:-ссылку. Одиннадцать страниц по 2-8 МБ
+// в base64 внутри DOM — это под сотню мегабайт строк, на телефоне вкладка такого
+// не переживает. Blob держится вне DOM и отдаёт короткий URL.
+function blobUrl(base64, type){
+  const bin = atob(base64), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return URL.createObjectURL(new Blob([buf], {type: type || 'image/png'}));
+}
+
+function pick(n){
+  // Случайные страницы, но В ПОРЯДКЕ КНИГИ: превью, идущее вразнобой, читается
+  // как сбой, а не как выборка.
+  const chosen = PAGES.slice();
+  for (let i = chosen.length - 1; i > 0; i--){
+    const j = Math.floor(Math.random() * (i + 1));
+    [chosen[i], chosen[j]] = [chosen[j], chosen[i]];
+  }
+  const ids = new Set(chosen.slice(0, n).map(p => p.id));
+  return PAGES.filter(p => ids.has(p.id));
+}
+
+// Длительность словами. Минуты появляются только когда их есть о чём сказать:
+// «за 0 мин» на быстром заказе читается как поломка, а не как «быстро».
+function spent(ms){
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 90) return seconds + ' с';
+  const minutes = Math.floor(seconds / 60), rest = seconds - minutes * 60;
+  return rest ? (minutes + ' мин ' + rest + ' с') : (minutes + ' мин');
+}
+
+function word(n){
+  const ten = n % 100, one = n % 10;
+  if (ten >= 11 && ten <= 14) return 'страниц';
+  if (one === 1) return 'страница';
+  if (one >= 2 && one <= 4) return 'страницы';
+  return 'страниц';
+}
+
+// Итог пересобирается и после повтора страницы: «1 не вышло» над книгой, где всё
+// готово, — это противоречие, которое заказчик заметит раньше нас.
+function summarise(){
+  if (!order) return;
+  status.className = order.failed ? 'err' : '';
+  status.textContent = order.failed
+    ? ('Готово ' + order.done + ' из ' + order.pages + ' за ' + order.total + '; '
+       + order.failed + ' не вышло — их можно повторить поштучно')
+    : ('Готово: ' + order.done + ' ' + word(order.done) + ' за ' + order.total);
+}
+
+function child(){
+  const fields = {};
+  const gender = $('gender').value, age = $('age').value, hair = $('hair').value.trim();
+  if (gender) fields.gender = gender;
+  if (age !== '') fields.age = Number(age);
+  if (hair) fields.hair_color = hair;
+  return fields;
+}
+
+// Причина отказа человеческими словами. Текст сервера идёт как есть — он для
+// того и написан, — а код HTTP добавляет то, чего сервер сказать не может:
+// 502 и 504 приходят от ПРОКСИ, и про них сервер не знает ничего.
+async function reason(response){
+  let detail = '';
+  try {
+    const body = JSON.parse(await response.text());
+    if (typeof body.detail === 'string') detail = body.detail;
+    else if (Array.isArray(body.detail)) detail = body.detail.map(e => e.msg || '').join('; ');
+    else if (body.detail) detail = JSON.stringify(body.detail);
+  } catch (e) { /* не JSON — обойдёмся кодом */ }
+
+  const known = {
+    404: 'страницы нет в каталоге сервера',
+    422: 'сервер не смог разобрать запрос или не нашёл лицо',
+    503: 'сервер рендера занят или ещё не готов',
+    502: 'сервер рендера не ответил',
+    504: 'сервер не успел проснуться',
+  }[response.status];
+  return detail || known || ('код ' + response.status);
+}
+
+function card(page){
+  const box = document.createElement('div');
+  box.className = 'page waiting';
+  box.innerHTML = '<h2><span></span><em></em></h2>';
+  box.querySelector('span').textContent = page.title;
+  box.querySelector('em').textContent = 'в очереди';
+  out.appendChild(box);
+  return box;
+}
+
+function say(box, text, failed){
+  const em = box.querySelector('em');
+  em.textContent = text;
+  em.className = failed ? 'err' : '';
+}
+
+// Одна страница: запрос, таймер, картинка либо причина отказа.
+//
+// `quality` — то, чем режимы отличаются на сервере. Для книги он пуст, и сервер
+// берёт своё умолчание (два прохода). Для превью в нём `passes: 1`, см. QUICK.
+async function draw(page, box, quality){
+  box.classList.remove('waiting');
+  const started = Date.now();
+  const tick = setInterval(() => say(box, 'рисуем, ' + spent(Date.now() - started)), 500);
+
+  try {
+    const response = await fetch('v1/demo-render', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.assign(
+        {template_id: page.id, donor_photo: donor}, child(), quality)),
+    });
+    clearInterval(tick);
+
+    if (!response.ok){
+      say(box, 'не получилось: ' + await reason(response), true);
+      retry(page, box, quality);
+      return false;
+    }
+
+    const data = await response.json();
+    const url = blobUrl(data.image, data.encoding);
+    const image = new Image();
+    image.src = url;
+    box.appendChild(image);
+
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = page.title.replace(/\s+/g, '_') + (data.encoding === 'image/jpeg' ? '.jpg' : '.png');
+    link.textContent = 'скачать страницу';
+    box.appendChild(link);
+
+    say(box, 'готово за ' + spent(Date.now() - started));
+    return true;
+  } catch (e){
+    clearInterval(tick);
+    say(box, 'обрыв связи: ' + e, true);
+    retry(page, box, quality);
+    return false;
+  }
+}
+
+// Повтор ОДНОЙ страницы: упавшая обложка не должна стоить всей книги. Кнопка
+// ждёт, пока освободится очередь во вкладке, — параллельно ходить нельзя.
+//
+// `quality` протаскивается сюда не для порядка: повтор без него считал бы
+// страницу превью в два прохода, то есть вдвое дольше остальных в том же
+// заказе. Выглядело бы это как «повтор почему-то тормозит».
+function retry(page, box, quality){
+  const button = document.createElement('button');
+  button.textContent = 'Повторить страницу';
+  button.onclick = async () => {
+    if (busy) return;
+    busy = true; button.remove();
+    box.querySelectorAll('img,a').forEach(node => node.remove());
+    if (await draw(page, box, quality) && order){ order.done++; order.failed--; summarise(); }
+    busy = false;
+  };
+  box.appendChild(button);
+}
+
+go.onclick = async () => {
+  const mode = document.querySelector('input[name=mode]:checked').value;
+  const preview = mode === 'preview';
+  const pages = preview ? pick(PREVIEW_PAGES) : PAGES;
+  const quality = preview ? QUICK : FULL;
+
+  busy = true;
+  go.disabled = true;
+  out.innerHTML = '';
+  status.className = '';
+  donor = await b64(photo.files[0]);
+
+  // Первая страница дороже остальных, и молчащая панель на минуту выглядит как
+  // поломка. Машина гасится по простою, и заказ её будит — это 46-54 секунды
+  // ещё до начала рисования.
+  hint.textContent = 'Первая страница дольше остальных: сервер просыпается, это около минуты. '
+                   + 'Не закрывайте вкладку — готовые страницы хранятся только в ней.';
+
+  const boxes = pages.map(card);
+  const started = Date.now();
+  order = {pages: pages.length, done: 0, failed: 0, total: ''};
+
+  for (let i = 0; i < pages.length; i++){
+    status.textContent = 'Страница ' + (i + 1) + ' из ' + pages.length
+                       + ' · всего ' + spent(Date.now() - started);
+    if (await draw(pages[i], boxes[i], quality)) order.done++; else order.failed++;
+    hint.textContent = 'Не закрывайте вкладку — готовые страницы хранятся только в ней.';
+  }
+
+  // Время заказа считается по проходу книги и повторами не растёт: между отказом
+  // и нажатием «Повторить» проходит время человека, а не сервера.
+  order.total = spent(Date.now() - started);
+  summarise();
+  hint.textContent = '';
+
+  busy = false;
+  go.disabled = false;
+};
+</script></body></html>

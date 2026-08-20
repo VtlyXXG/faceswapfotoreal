@@ -40,6 +40,19 @@ class FalNotConfiguredError(MLServiceError):
     code = "FAL_NOT_CONFIGURED"
 
 
+class FalDisabledError(MLServiceError):
+    """
+    Путь через fal выключен настройкой, и это не ошибка окружения.
+
+    Отдельный код нужен, чтобы отличать «возможность отключена» от «ключ не
+    задан»: первое — штатное состояние свежего клона, второе — недонастроенный
+    сервис, которому fal действительно нужен.
+    """
+
+    status_code = 503
+    code = "FAL_DISABLED"
+
+
 class MaskMissingError(MLServiceError):
     """
     Инпейнтинг без маски невозможен. Это дефект вызывающего кода, а не отказ
@@ -50,12 +63,33 @@ class MaskMissingError(MLServiceError):
     code = "MASK_MISSING"
 
 
+def enabled() -> bool:
+    """Разрешён ли путь через fal вообще. По умолчанию нет, см. `settings`."""
+    return bool(settings.fal_enabled)
+
+
 def key_present() -> bool:
+    # При выключенном пути ключ не читается: окружение чужого клона нас не
+    # касается, и сообщать «не задан FAL_KEY» там не о чем
+    if not enabled():
+        return False
     return bool(os.environ.get(settings.fal_key_env, "").strip())
 
 
 def client():
-    """Клиент fal. Отсутствие ключа — состояние окружения, а не дефект запроса."""
+    """
+    Клиент fal. Отсутствие ключа — состояние окружения, а не дефект запроса.
+
+    Выключенный путь отсекается ДО проверки ключа и говорит об этом прямо.
+    Иначе свежий клон получает требование чужого платного ключа и выглядит это
+    как поломка, а не как отключённая по умолчанию возможность.
+    """
+    if not enabled():
+        raise FalDisabledError(
+            "Путь через fal.ai выключен (ML_FAL_ENABLED=false). Личность "
+            "переносится своим Flux + PuLID, пересадка головы считается локально",
+            {"switch": "ML_FAL_ENABLED"},
+        )
     if not key_present():
         raise FalNotConfiguredError(
             f"Не задана переменная окружения {settings.fal_key_env}",

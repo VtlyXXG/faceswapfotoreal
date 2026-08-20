@@ -46,6 +46,12 @@ class ProviderStatus(BaseModel):
     """
 
     model: str | None = Field(default=None, description="Идентификатор эндпоинта")
+    # Первое, на что смотреть при разборе «почему сервис не готов». Путь через
+    # fal выключен по умолчанию, и тогда ни ключ, ни профиль второго шага к
+    # готовности отношения не имеют: сервис к fal не обращается вовсе
+    fal_enabled: bool = Field(
+        default=False, description="Разрешён ли облачный путь (ML_FAL_ENABLED)"
+    )
     key_present: bool
     key_env: str
     # Главная ручка пайплайна: подбирается из окружения на живом сервисе
@@ -121,10 +127,28 @@ class HairStatus(BaseModel):
     )
 
 
+class RenderStatus(BaseModel):
+    """
+    Рабочий путь: свой GPU-сервер, на котором считается генерация.
+
+    Адреса по умолчанию у него нет намеренно, поэтому `configured: false` —
+    штатное состояние свежего клона и единственная причина, по которой заказ
+    ответит 503 RENDER_NOT_CONFIGURED. Видно это до первого заказа, а не после
+    его таймаута.
+    """
+
+    base_url: str | None = Field(default=None, description="ML_RENDER_BASE_URL")
+    configured: bool = Field(description="Задан ли адрес GPU-сервера")
+    path: str = Field(description="Эндпоинт генерации на сервере")
+    timeout_s: int
+    active: bool = Field(description="Идёт ли туда текущий профиль")
+
+
 class ReadinessResponse(BaseModel):
     status: str = Field(description="ready | degraded")
     runtime: RuntimeStatus
     provider: ProviderStatus
+    render: RenderStatus
     mask: MaskStatus
     hair: HairStatus
     expressions: list[str] = Field(description="Допустимые значения параметра emotion")

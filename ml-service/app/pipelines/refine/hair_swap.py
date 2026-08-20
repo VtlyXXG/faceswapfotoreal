@@ -57,7 +57,7 @@ from dataclasses import replace
 
 from app.core.errors import InvalidImageError, MLServiceError
 from app.core.logging import get_logger
-from app.pipelines import composite, erase, fal_api, hair_mask
+from app.pipelines import cheeks, composite, erase, fal_api, hair_mask
 from app.pipelines.refine.base import RefineRequest, RefineResult, get, register
 from app.pipelines.refine.profiles import RefineProfile, strategy_defaults
 from app.utils.image import decode_image, encode_image
@@ -207,8 +207,27 @@ class HairThenFaceSwapRefiner:
         # рабочий кадр модели около мегапикселя — и на сотню пикселей волос она
         # отдаёт мыльную шапку, потому что стричь там нечего. В окне те же
         # волосы получают тысячи пикселей, и стрижка становится стрижкой.
+        # Структура старой пряди разрушается в полосе вдоль щеки ДО всего
+        # остального, см. `cheeks.py`. Полоса эту прядь давно открывает
+        # (cheek_open_px тому свидетель), но открытая маска — разрешение
+        # рисовать, а не приказ: тёмная линия на светлой щеке читается
+        # редактором как тень скулы, то есть как лицо, которое ему запрещено
+        # трогать. Уезжают пиксели, в которых читать нечего.
+        #
+        # По полному развороту, а не по окну: геометрия лица посчитана в его
+        # координатах, а окно вырезается ниже. Резать сначала значило бы
+        # вычитать (left, top) руками — молчаливый промах ценой одной правки
+        flat, cheek_meta = cheeks.flatten(
+            target, hair, stage.cheek_wipe_ratio, stage.cheek_flat_ratio
+        )
+
         window = _window(target.shape[:2], hair, stage.crop_ratio)
+
+        # Два разреза, и они не взаимозаменяемы. `scene` — нетронутый кадр, в
+        # него пойдёт вклейка; `sent` — то, что увидит редактор. Склеить их
+        # значило бы вклеивать причёску в кадр с разрушенной щекой
         scene, scene_mask = _cut(target, hair.mask, window)
+        sent, _ = _cut(flat, hair.mask, window)
 
         # Под маской у редактора не должно остаться СТРУКТУРЫ старых волос, см.
         # `erase.py`. Геометрия маски эту прядь давно отдаёт (hair_left_px
@@ -216,10 +235,10 @@ class HairThenFaceSwapRefiner:
         # место: тёмная линия на щеке читается им как тень скулы или край
         # челюсти, то есть как лицо, которое ему запрещено трогать. Слова против
         # пикселей проигрывают, поэтому уезжают пиксели без пряди
-        sent, erase_meta = erase.wipe(scene, scene_mask, hair.face_height, stage.erase_ratio)
+        sent, erase_meta = erase.wipe(sent, scene_mask, hair.face_height, stage.erase_ratio)
 
         client = fal_api.client()
-        if window is None and not erase_meta["erased"]:
+        if window is None and not erase_meta["erased"] and not cheek_meta["flattened"]:
             # Разворот уходит теми же байтами, что прислали: перекодировать
             # незачем, мы в нём ничего не меняли
             scene_bytes, scene_mime = request.target, request.target_mime
@@ -295,6 +314,9 @@ class HairThenFaceSwapRefiner:
             "changed": round(changed, 3),
             "endpoint": stage.endpoint,
             "window": window,
+            # Разрушение структуры в полосе щеки: чем залито, по скольким
+            # пикселям кожи замерен тон и насколько упала структура
+            "cheeks": cheek_meta,
             "erase": erase_meta,
             "composite": pasted.meta,
             "generated_url": call_meta.get("image_url"),

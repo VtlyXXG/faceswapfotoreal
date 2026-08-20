@@ -1,0 +1,1 @@
+The first image is the scene. The second image is a photograph of a child. Give the child in the first image both the face and the hair of the child in the second image. Keep everything else exactly as it is in the first image: the head orientation, the gaze direction, the body pose, the clothing, the background and the lighting.
