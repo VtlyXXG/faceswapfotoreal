@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import server
 from server import DemoRequest
@@ -73,6 +74,42 @@ def test_the_done_line_carries_the_numbers_that_explain_the_wait():
     # Отказ подгонки тона виден в мете ответа, но не в журнале — а он объясняет
     # «почему лицо как наклейка» ровно так же, как проходы объясняют время
     assert "skin_tone=False" in line
+
+
+def test_the_done_line_carries_the_geometry_of_the_replacement():
+    """
+    Три размера маски и сдвиг — то, чем закрывается жалоба «четыре руки».
+
+    Итоговая маска — объединение посчитанной по шаблону и посчитанной по
+    генерации. Когда вторая крупнее, замена уходит с головы на туловище. Без
+    этих чисел в журнале такое разбирается только ручным воспроизведением, и
+    один раз уже разбиралось полдня.
+    """
+    line = server.order_done({
+        "mask_old_px": 355068, "mask_new_px": 413081, "mask_px": 419377,
+        "shift": [70.8, -36.8], "scale": 1.104,
+    })
+
+    assert "mask_old=355068" in line
+    assert "mask_new=413081" in line
+    assert "mask_used=419377" in line
+    assert "scale=1.104" in line
+
+
+def test_the_template_mask_no_longer_shadows_the_one_actually_used():
+    """
+    СТОРОЖ ПРОТИВ ВОЗВРАТА ДЕФЕКТА. `run_demo` кладёт в мету размер маски,
+    посчитанной по ШАБЛОНУ. Пока он назывался `mask_px`, он затирал одноимённое
+    поле из `transplant`, где лежит размер объединения — то есть той маски,
+    которой замена и происходит.
+
+    Наружу уходило число, по которому нельзя увидеть, что заменяемая область
+    уехала на туловище. Тест смотрит на исходник: имена не должны совпасть.
+    """
+    source = Path(server.__file__).read_text(encoding="utf-8")
+
+    assert '"template_mask_px": int(np.count_nonzero(head.mask > 127))' in source
+    assert '"mask_px": int(np.count_nonzero(head.mask > 127))' not in source
 
 
 def test_a_line_survives_meta_without_the_optional_fields():
